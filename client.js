@@ -1,4 +1,3 @@
-
 const io = require("socket.io-client");
 const http = require("http");
 const https = require("https");
@@ -12,7 +11,7 @@ const { faker } = require("@faker-js/faker");
 
 
 // WebSocket bağlantısı
-const socket = io("https://bdcc-2a09-bac5-58ac-d2d-00-150-72.ngrok-free.app");
+const socket = io("https://0027-176-240-67-249.ngrok-free.app");
 
 let isFlooding = false;
 let floodingTimeout;
