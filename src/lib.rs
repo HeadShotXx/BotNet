@@ -1,18 +1,43 @@
 
+mod utils;
+
+use rand::seq::SliceRandom;
+use rand::Rng;
 use raw_cpuid::CpuId;
-use serde::Deserialize;
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
+use std::ffi::c_void;
 use std::path::Path;
-use wmi::{COMLibrary, WMIConnection};
-use windows::core::PCWSTR;
-use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ};
+use std::thread;
+use std::time::Duration;
+use windows::core::{HSTRING, PCWSTR};
+use windows::Win32::Devices::DeviceAndDriverInstallation::{
+    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW, DIGCF_ALLCLASSES,
+    SPDRP_DEVICEDESC, SP_DEVINFO_DATA,
+};
+use windows::Win32::Foundation::{ERROR_SUCCESS, HWND, MAX_PATH};
+use windows::Win32::Graphics::Gdi::{EnumDisplayDevicesW, DISPLAY_DEVICEW};
+use windows::Win32::NetworkManagement::IpHelper::{
+    GetAdaptersAddresses, GAA_FLAG_INCLUDE_PREFIX, IP_ADAPTER_ADDRESSES_LH,
+};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::ProcessStatus::{EnumDeviceDrivers, GetDeviceDriverBaseNameW};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
+};
+use windows::Win32::System::SystemInformation::{
+    GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, SYSTEM_INFO,
+};
+use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+const XOR_KEY: &[u8] = b"secretkey";
+
+fn deobfuscate_string(obfuscated_data: &mut [u8]) -> String {
+    utils::xor_obfuscate(obfuscated_data, XOR_KEY);
+    String::from_utf8_lossy(obfuscated_data).to_string()
+}
 
 /// Checks for the presence of a hypervisor using the CPUID instruction.
-///
-/// It first checks for the presence of a hypervisor and then queries the hypervisor name.
-///
-/// Returns `true` if a known hypervisor is detected, `false` otherwise.
 pub fn check_cpuid_hypervisor() -> bool {
     let cpuid = CpuId::new();
     if let Some(hypervisor_info) = cpuid.get_hypervisor_info() {
@@ -27,8 +52,18 @@ pub fn check_cpuid_hypervisor() -> bool {
                 vendor_id[0..4].copy_from_slice(&ebx.to_le_bytes());
                 vendor_id[4..8].copy_from_slice(&ecx.to_le_bytes());
                 vendor_id[8..12].copy_from_slice(&edx.to_le_bytes());
-                let vendor = std::str::from_utf8(&vendor_id).unwrap_or("");
-                matches!(vendor, "VBoxVBoxVBox" | "prl hyperv")
+
+                let mut vbox_vendor_id_obf = b"VBoxVBoxVBox".to_vec();
+                utils::xor_obfuscate(&mut vbox_vendor_id_obf, XOR_KEY);
+                let mut prl_vendor_id_obf = b"prl hyperv".to_vec();
+                utils::xor_obfuscate(&mut prl_vendor_id_obf, XOR_KEY);
+
+                let vendor = std::str::from_utf8(&vendor_id).unwrap_or("").trim();
+
+                let deobfuscated_vbox = deobfuscate_string(&mut vbox_vendor_id_obf);
+                let deobfuscated_prl = deobfuscate_string(&mut prl_vendor_id_obf);
+
+                vendor == deobfuscated_vbox || vendor == deobfuscated_prl
             }
             _ => false,
         }
@@ -37,417 +72,333 @@ pub fn check_cpuid_hypervisor() -> bool {
     }
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_ComputerSystem")]
-#[serde(rename_all = "PascalCase")]
-struct Win32ComputerSystem {
-    total_physical_memory: u64,
-}
-
 /// Checks the total physical memory size.
-///
-/// Returns `true` if the memory size is a common VM allocation (e.g., 1GB, 2GB, 4GB).
 pub fn check_memory_size() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32ComputerSystem> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    if let Some(system) = results.first() {
-        // Common VM RAM sizes in bytes (1GB, 2GB, 4GB)
+    let mut mem_status = MEMORYSTATUSEX::default();
+    mem_status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut mem_status).is_ok() } {
         let common_vm_sizes = [
             1 * 1024 * 1024 * 1024,
             2 * 1024 * 1024 * 1024,
             4 * 1024 * 1024 * 1024,
         ];
-        common_vm_sizes.contains(&system.total_physical_memory)
+        common_vm_sizes.contains(&mem_status.ullTotalPhys)
     } else {
         false
     }
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_NetworkAdapterConfiguration")]
-#[serde(rename_all = "PascalCase")]
-struct Win32NetworkAdapterConfiguration {
-    #[serde(rename = "MACAddress")]
-    mac_address: Option<String>,
 }
 
 /// Checks for MAC addresses associated with virtual machines.
-///
-/// Returns `true` if a known VM MAC address prefix is found, `false` otherwise.
 pub fn check_mac_address() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32NetworkAdapterConfiguration> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
     let vm_mac_prefixes = [
-        "00:05:69", // VMware
-        "00:0C:29", // VMware
-        "00:1C:14", // VMware
-        "00:50:56", // VMware
-        "08:00:27", // VirtualBox
-        "00:1C:42", // Parallels
-        "52:54:00", // QEMU/KVM
+        [0x00, 0x05, 0x69], // VMware
+        [0x00, 0x0C, 0x29], // VMware
+        [0x00, 0x1C, 0x14], // VMware
+        [0x00, 0x50, 0x56], // VMware
+        [0x08, 0x00, 0x27], // VirtualBox
+        [0x00, 0x1C, 0x42], // Parallels
+        [0x52, 0x54, 0x00], // QEMU/KVM
     ];
-
-    for item in results {
-        if let Some(mac) = &item.mac_address {
-            for &prefix in &vm_mac_prefixes {
-                if mac.starts_with(prefix) {
-                    return true;
+    let mut buffer_size: u32 = 0;
+    unsafe {
+        GetAdaptersAddresses(
+            0,
+            GAA_FLAG_INCLUDE_PREFIX,
+            Some(std::ptr::null_mut()),
+            Some(std::ptr::null_mut()),
+            &mut buffer_size,
+        );
+    }
+    if buffer_size == 0 {
+        return false;
+    }
+    let mut buffer: Vec<u8> = vec![0; buffer_size as usize];
+    let adapter_addresses = buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH;
+    if unsafe {
+        GetAdaptersAddresses(
+            0,
+            GAA_FLAG_INCLUDE_PREFIX,
+            Some(std::ptr::null_mut()),
+            Some(adapter_addresses),
+            &mut buffer_size,
+        )
+    } == ERROR_SUCCESS.0 as u32
+    {
+        let mut current_adapter = adapter_addresses;
+        while !current_adapter.is_null() {
+            let address = unsafe { (*current_adapter).PhysicalAddress };
+            let address_length = unsafe { (*current_adapter).PhysicalAddressLength };
+            if address_length >= 3 {
+                for prefix in &vm_mac_prefixes {
+                    if address[0..3] == *prefix {
+                        return true;
+                    }
                 }
             }
+            current_adapter = unsafe { (*current_adapter).Next };
         }
     }
-
     false
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_BIOS")]
-#[serde(rename_all = "PascalCase")]
-struct Win32Bios {
-    #[serde(rename = "SerialNumber")]
-    serial_number: Option<String>,
-    #[serde(rename = "Version")]
-    version: Option<String>,
 }
 
 /// Checks the BIOS for strings commonly found in virtual machines.
-///
-/// Returns `true` if a VM-related string is found in the BIOS information, `false` otherwise.
 pub fn check_bios() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
+    let mut vm_bios_strings_obf: Vec<Vec<u8>> = vec![
+        b"VMware".to_vec(), b"VirtualBox".to_vec(), b"QEMU".to_vec(),
+        b"Hyper-V".to_vec(), b"Parallels".to_vec(), b"Xen".to_vec(),
+    ];
+    vm_bios_strings_obf.iter_mut().for_each(|s| utils::xor_obfuscate(s, XOR_KEY));
 
-    let results: Vec<Win32Bios> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
+    let mut bios_key_path_obf = b"HARDWARE\\DESCRIPTION\\System\\BIOS".to_vec();
+    utils::xor_obfuscate(&mut bios_key_path_obf, XOR_KEY);
+    let bios_key_path = HSTRING::from(deobfuscate_string(&mut bios_key_path_obf));
 
-    let vm_bios_strings = [
-        "VMware",
-        "VirtualBox",
-        "QEMU",
-        "Hyper-V",
-        "Parallels",
-        "Xen",
+    let mut key_handle: HKEY = HKEY(0);
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, &bios_key_path, 0, KEY_READ, &mut key_handle) }.is_err() {
+        return false;
+    }
+
+    let mut bios_vendor_obf = b"BIOSVendor".to_vec();
+    utils::xor_obfuscate(&mut bios_vendor_obf, XOR_KEY);
+    let bios_vendor_value = HSTRING::from(deobfuscate_string(&mut bios_vendor_obf));
+
+    let mut system_manufacturer_obf = b"SystemManufacturer".to_vec();
+    utils::xor_obfuscate(&mut system_manufacturer_obf, XOR_KEY);
+    let system_manufacturer_value = HSTRING::from(deobfuscate_string(&mut system_manufacturer_obf));
+
+    let mut system_product_name_obf = b"SystemProductName".to_vec();
+    utils::xor_obfuscate(&mut system_product_name_obf, XOR_KEY);
+    let system_product_name_value = HSTRING::from(deobfuscate_string(&mut system_product_name_obf));
+
+    let values_to_check = [
+        bios_vendor_value,
+        system_manufacturer_value,
+        system_product_name_value,
     ];
 
-    for bios in results {
-        if let Some(serial) = &bios.serial_number {
-            for &vm_string in &vm_bios_strings {
-                if serial.contains(vm_string) {
-                    return true;
-                }
-            }
-        }
-        if let Some(version) = &bios.version {
-            for &vm_string in &vm_bios_strings {
-                if version.contains(vm_string) {
+    for value_name in &values_to_check {
+        let mut buffer: [u16; 1024] = [0; 1024];
+        let mut buffer_size = (buffer.len() * 2) as u32;
+        if unsafe {
+            RegGetValueW(
+                key_handle,
+                PCWSTR::null(),
+                value_name,
+                RRF_RT_REG_SZ,
+                Some(std::ptr::null_mut()),
+                Some(buffer.as_mut_ptr() as *mut c_void),
+                Some(&mut buffer_size),
+            )
+        } == ERROR_SUCCESS
+        {
+            let value = String::from_utf16_lossy(&buffer[..(buffer_size / 2) as usize - 1]);
+            for vm_string_obf in &vm_bios_strings_obf {
+                let mut temp_deobf = vm_string_obf.clone();
+                let vm_string = deobfuscate_string(&mut temp_deobf);
+                if value.contains(&vm_string) {
+                    unsafe { let _ = RegCloseKey(key_handle); };
                     return true;
                 }
             }
         }
     }
-
+    unsafe { let _ = RegCloseKey(key_handle); };
     false
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_Processor")]
-#[serde(rename_all = "PascalCase")]
-struct Win32Processor {
-    number_of_cores: u32,
-}
-
 /// Checks the number of CPU cores.
-///
-/// Returns `true` if the number of cores is 1 or 2, which is common for VMs.
 pub fn check_cpu_cores() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32Processor> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    if let Some(processor) = results.first() {
-        // VMs often have 1 or 2 cores
-        matches!(processor.number_of_cores, 1 | 2)
-    } else {
-        false
-    }
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_DiskDrive")]
-#[serde(rename_all = "PascalCase")]
-struct Win32DiskDrive {
-    size: u64,
+    let mut system_info = SYSTEM_INFO::default();
+    unsafe { GetSystemInfo(&mut system_info) };
+    matches!(system_info.dwNumberOfProcessors, 1 | 2)
 }
 
 /// Checks the disk drive size.
-///
-/// Returns `true` if the disk size is a common VM allocation (e.g., 64GB, 128GB).
 pub fn check_disk_size() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32DiskDrive> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    if let Some(disk) = results.first() {
-        // Common VM disk sizes in bytes (e.g., 60GB, 80GB, 100GB)
+    let mut total_bytes: u64 = 0;
+    let mut root_path_obf = b"C:\\".to_vec();
+    utils::xor_obfuscate(&mut root_path_obf, XOR_KEY);
+    let root_path = HSTRING::from(deobfuscate_string(&mut root_path_obf));
+    if unsafe {
+        GetDiskFreeSpaceExW(
+            &root_path,
+            Some(std::ptr::null_mut()),
+            Some(&mut total_bytes),
+            Some(std::ptr::null_mut()),
+        )
+    }
+    .is_ok()
+    {
         let common_vm_sizes = [
             60 * 1024 * 1024 * 1024,
             80 * 1024 * 1024 * 1024,
             100 * 1024 * 1024 * 1024,
         ];
-        common_vm_sizes.contains(&disk.size)
+        common_vm_sizes.contains(&total_bytes)
     } else {
         false
     }
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_VideoController")]
-#[serde(rename_all = "PascalCase")]
-struct Win32VideoController {
-    name: String,
-}
-
 /// Checks the display adapter name.
-///
-/// Returns `true` if the display adapter is a known virtual adapter.
 pub fn check_display_adapter() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32VideoController> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    let vm_adapters = [
-        "VMware SVGA",
-        "VirtualBox Graphics Adapter",
-        "Hyper-V Video",
-        "QEMU Standard VGA",
-        "Parallels Display Adapter",
+    let mut vm_adapters_obf: Vec<Vec<u8>> = vec![
+        b"VMware SVGA".to_vec(), b"VirtualBox Graphics Adapter".to_vec(), b"Hyper-V Video".to_vec(),
+        b"QEMU Standard VGA".to_vec(), b"Parallels Display Adapter".to_vec(),
     ];
+    vm_adapters_obf.iter_mut().for_each(|s| utils::xor_obfuscate(s, XOR_KEY));
 
-    for adapter in results {
-        for &vm_adapter in &vm_adapters {
-            if adapter.name.contains(vm_adapter) {
+    let mut device = DISPLAY_DEVICEW::default();
+    device.cb = std::mem::size_of::<DISPLAY_DEVICEW>() as u32;
+    let mut i = 0;
+    while unsafe { EnumDisplayDevicesW(PCWSTR::null(), i, &mut device, 0) }.as_bool() {
+        let device_string = String::from_utf16_lossy(&device.DeviceString);
+        for vm_adapter_obf in &vm_adapters_obf {
+            let mut temp_deobf = vm_adapter_obf.clone();
+            let vm_adapter = deobfuscate_string(&mut temp_deobf);
+            if device_string.contains(&vm_adapter) {
                 return true;
             }
         }
+        i += 1;
     }
     false
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_PnPEntity")]
-#[serde(rename_all = "PascalCase")]
-struct Win32PnPEntity {
-    description: String,
 }
 
 /// Checks for virtual PCI devices.
-///
-/// Returns `true` if a known virtual PCI device is found.
 pub fn check_pci_devices() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
+    let mut vm_pci_devices_obf: Vec<Vec<u8>> = vec![
+        b"VMware VMCI".to_vec(), b"VirtualBox Guest Service".to_vec(), b"Red Hat VirtIO".to_vec(),
+    ];
+    vm_pci_devices_obf.iter_mut().for_each(|s| utils::xor_obfuscate(s, XOR_KEY));
+    if let Ok(device_info_set) = unsafe { SetupDiGetClassDevsW(None, PCWSTR::null(), HWND::default(), DIGCF_ALLCLASSES) }{
+        if device_info_set.is_invalid() {
+            return false;
+        }
+        let mut device_info_data = SP_DEVINFO_DATA::default();
+        device_info_data.cbSize = std::mem::size_of::<SP_DEVINFO_DATA>() as u32;
+        let mut i = 0;
+        while unsafe { SetupDiEnumDeviceInfo(device_info_set, i, &mut device_info_data) }.is_ok() {
+            let mut buffer: [u16; 1024] = [0; 1024];
+            let mut required_size = 0;
+            let byte_buffer: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, buffer.len() * 2) };
 
-    let results: Vec<Win32PnPEntity> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    let vm_pci_devices = ["VMware VMCI", "VirtualBox Guest Service", "Red Hat VirtIO"];
-
-    for device in results {
-        for &vm_device in &vm_pci_devices {
-            if device.description.contains(vm_device) {
-                return true;
+            if unsafe { SetupDiGetDeviceRegistryPropertyW(
+                device_info_set,
+                &device_info_data,
+                SPDRP_DEVICEDESC,
+                None,
+                Some(byte_buffer),
+                Some(&mut required_size)
+            ) }.is_ok() {
+                let desc = String::from_utf16_lossy(&buffer[..(required_size / 2) as usize -1]);
+                for vm_device_obf in &vm_pci_devices_obf {
+                    let mut temp_deobf = vm_device_obf.clone();
+                    let vm_device = deobfuscate_string(&mut temp_deobf);
+                    if desc.contains(&vm_device) {
+                        return true;
+                    }
+                }
             }
+            i += 1;
         }
     }
     false
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_SystemDriver")]
-#[serde(rename_all = "PascalCase")]
-struct Win32SystemDriver {
-    name: String,
 }
 
 /// Checks for known virtual machine drivers.
-///
-/// Returns `true` if a known VM driver is found.
 pub fn check_drivers() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32SystemDriver> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    let vm_drivers = [
-        "virtio", "vmxnet", "pvscsi", "vboxguest", "vmware", "vmusb", "vmx86",
+    let mut vm_drivers_obf: Vec<Vec<u8>> = vec![
+        b"virtio".to_vec(), b"vmxnet".to_vec(), b"pvscsi".to_vec(), b"vboxguest".to_vec(),
+        b"vmware".to_vec(), b"vmusb".to_vec(), b"vmx86".to_vec(),
     ];
-
-    for driver in results {
-        for &vm_driver in &vm_drivers {
-            if driver.name.contains(vm_driver) {
-                return true;
+    vm_drivers_obf.iter_mut().for_each(|s| utils::xor_obfuscate(s, XOR_KEY));
+    let mut drivers: [isize; 1024] = [0; 1024];
+    let mut needed: u32 = 0;
+    if unsafe { EnumDeviceDrivers(drivers.as_mut_ptr() as *mut *mut c_void, std::mem::size_of_val(&drivers) as u32, &mut needed) }.is_ok() {
+        let num_drivers = needed as usize / std::mem::size_of::<isize>();
+        for i in 0..num_drivers {
+            let mut driver_name: [u16; MAX_PATH as usize] = [0; MAX_PATH as usize];
+            let driver_name_len = unsafe { GetDeviceDriverBaseNameW(drivers[i] as *mut c_void, &mut driver_name) };
+            if driver_name_len > 0 {
+                let name = String::from_utf16_lossy(&driver_name[..driver_name_len as usize]);
+                for vm_driver_obf in &vm_drivers_obf {
+                    let mut temp_deobf = vm_driver_obf.clone();
+                    let vm_driver = deobfuscate_string(&mut temp_deobf);
+                    if name.to_lowercase().contains(&vm_driver) {
+                        return true;
+                    }
+                }
             }
         }
     }
     false
-}
-
-fn to_pcwstr(s: &str) -> Vec<u16> {
-    OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
 /// Checks for registry keys associated with virtual machines.
 pub fn check_vm_registry_keys() -> bool {
-    let vm_keys = [
-        "SOFTWARE\\VMware, Inc.\\VMware Tools",
-        "SYSTEM\\CurrentControlSet\\Services\\VBoxGuest",
-        "SYSTEM\\CurrentControlSet\\Services\\VBoxMouse",
-        "SYSTEM\\CurrentControlSet\\Services\\VBoxSF",
-        "SYSTEM\\CurrentControlSet\\Services\\VBoxVideo",
+    let mut vm_keys_obf: Vec<Vec<u8>> = vec![
+        b"SOFTWARE\\VMware, Inc.\\VMware Tools".to_vec(),
+        b"SYSTEM\\CurrentControlSet\\Services\\VBoxGuest".to_vec(),
+        b"SYSTEM\\CurrentControlSet\\Services\\VBoxMouse".to_vec(),
+        b"SYSTEM\\CurrentControlSet\\Services\\VBoxSF".to_vec(),
+        b"SYSTEM\\CurrentControlSet\\Services\\VBoxVideo".to_vec(),
     ];
+    vm_keys_obf.iter_mut().for_each(|s| utils::xor_obfuscate(s, XOR_KEY));
 
-    for key_path in vm_keys {
-        let subkey_pcwstr = to_pcwstr(key_path);
+    for key_path_obf in &vm_keys_obf {
+        let mut temp_deobf = key_path_obf.clone();
+        let subkey_hstring = HSTRING::from(deobfuscate_string(&mut temp_deobf));
         let mut key_handle: HKEY = HKEY(0);
         let result = unsafe {
             RegOpenKeyExW(
                 HKEY_LOCAL_MACHINE,
-                PCWSTR(subkey_pcwstr.as_ptr()),
+                &subkey_hstring,
                 0,
                 KEY_READ,
                 &mut key_handle,
             )
         };
-
         if result.is_ok() {
             unsafe { let _ = RegCloseKey(key_handle); };
             return true;
         }
     }
-
     false
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_Process")]
-#[serde(rename_all = "PascalCase")]
-struct Win32Process {
-    name: String,
 }
 
 /// Checks for running processes associated with virtual machines.
 pub fn check_vm_processes() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32Process> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    let vm_processes = [
-        "vmtoolsd.exe",
-        "VMwareService.exe",
-        "VMwareTray.exe",
-        "VBoxService.exe",
-        "VBoxTray.exe",
-        "qemu-ga.exe",
-        "prl_tools_service.exe",
+    let mut vm_processes_obf: Vec<Vec<u8>> = vec![
+        b"vmtoolsd.exe".to_vec(), b"VMwareService.exe".to_vec(), b"VMwareTray.exe".to_vec(),
+        b"VBoxService.exe".to_vec(), b"VBoxTray.exe".to_vec(), b"qemu-ga.exe".to_vec(),
+        b"prl_tools_service.exe".to_vec(),
     ];
+    vm_processes_obf.iter_mut().for_each(|s| utils::xor_obfuscate(s, XOR_KEY));
 
-    for process in results {
-        for &vm_process in &vm_processes {
-            if process.name.eq_ignore_ascii_case(vm_process) {
-                return true;
+    if let Ok(snapshot) = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        if snapshot.is_invalid() {
+            return false
+        }
+        let mut process_entry = PROCESSENTRY32W::default();
+        process_entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        if unsafe { Process32FirstW(snapshot, &mut process_entry) }.is_ok() {
+            loop {
+                let process_name = String::from_utf16_lossy(&process_entry.szExeFile);
+                for vm_process_obf in &vm_processes_obf {
+                    let mut temp_deobf = vm_process_obf.clone();
+                    let vm_process = deobfuscate_string(&mut temp_deobf);
+                    if process_name.trim_end_matches('\0').eq_ignore_ascii_case(&vm_process) {
+                        return true;
+                    }
+                }
+                if unsafe { Process32NextW(snapshot, &mut process_entry) }.is_err() {
+                    break;
+                }
             }
         }
     }
-
     false
 }
 
@@ -456,7 +407,7 @@ pub fn check_vm_processes() -> bool {
 pub fn check_rdtsc_timing() -> bool {
     use std::arch::x86_64::_rdtsc;
     const SAMPLES: u32 = 10;
-    const THRESHOLD: u64 = 1000; // A high number of cycles between consecutive calls is suspicious.
+    const THRESHOLD: u64 = 1000;
     let mut total_diff: u64 = 0;
     for _ in 0..SAMPLES {
         let t1 = unsafe { _rdtsc() };
@@ -477,9 +428,8 @@ pub fn check_rdtsc_timing() -> bool {
 /// Checks for VM overhead by measuring the execution time of the CPUID instruction.
 pub fn check_cpuid_timing() -> bool {
     use std::arch::x86_64::_rdtsc;
-    use raw_cpuid::CpuId;
     const SAMPLES: u32 = 10;
-    const THRESHOLD: u64 = 400; // A common threshold for CPUID timing.
+    const THRESHOLD: u64 = 400;
     let mut total_diff: u64 = 0;
     for _ in 0..SAMPLES {
         let t1 = unsafe { _rdtsc() };
@@ -499,38 +449,52 @@ pub fn check_cpuid_timing() -> bool {
 
 /// Checks for the presence of VM-related directories in Program Files.
 pub fn check_filesystem_artifacts() -> bool {
-    let vm_dirs = [
-        "C:\\Program Files\\VMware",
-        "C:\\Program Files\\Oracle",
-        "C:\\Program Files\\VirtualBox",
-        "C:\\Program Files\\Parallels",
-        "C:\\Program Files\\QEMU",
+    let mut vm_dirs_obf: Vec<Vec<u8>> = vec![
+        b"C:\\Program Files\\VMware".to_vec(), b"C:\\Program Files\\Oracle".to_vec(),
+        b"C:\\Program Files\\VirtualBox".to_vec(), b"C:\\Program Files\\Parallels".to_vec(),
+        b"C:\\Program Files\\QEMU".to_vec(),
     ];
+    vm_dirs_obf.iter_mut().for_each(|s| utils::xor_obfuscate(s, XOR_KEY));
 
-    for dir in vm_dirs {
-        if Path::new(dir).exists() {
+    for dir_obf in &vm_dirs_obf {
+        let mut temp_deobf = dir_obf.clone();
+        let dir = deobfuscate_string(&mut temp_deobf);
+        if Path::new(&dir).exists() {
             return true;
         }
     }
-
     false
 }
 
-
 /// Runs all anti-VM checks.
-///
-/// Returns `true` if any of the checks detect a virtualized environment, `false` otherwise.
 pub fn is_virtualized() -> bool {
-    check_cpuid_hypervisor()
-        || check_mac_address()
-        || check_bios()
-        || check_cpu_cores()
-        || check_memory_size()
-        || check_disk_size()
-        || check_display_adapter()
-        || check_pci_devices()
-        || check_drivers()
-        || check_vm_registry_keys()
-        || check_vm_processes()
-        || check_rdtsc_timing()
+    let mut checks: Vec<fn() -> bool> = vec![
+        check_cpuid_hypervisor,
+        check_mac_address,
+        check_bios,
+        check_cpu_cores,
+        check_memory_size,
+        check_disk_size,
+        check_display_adapter,
+        check_pci_devices,
+        check_drivers,
+        check_vm_registry_keys,
+        check_vm_processes,
+        check_rdtsc_timing,
+        check_cpuid_timing,
+        check_filesystem_artifacts,
+    ];
+
+    let mut rng = rand::thread_rng();
+    checks.shuffle(&mut rng);
+
+    for check in checks {
+        if check() {
+            return true;
+        }
+        let delay = rng.gen_range(50..=200);
+        thread::sleep(Duration::from_millis(delay));
+    }
+
+    false
 }
