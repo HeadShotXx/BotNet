@@ -1,12 +1,21 @@
 
 use raw_cpuid::CpuId;
-use serde::Deserialize;
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use wmi::{COMLibrary, WMIConnection};
-use windows::core::PCWSTR;
-use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ};
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::NetworkManagement::IpHelper::{GetAdaptersInfo, IP_ADAPTER_INFO};
+use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+};
+use windows::Win32::System::SystemInformation::{
+    GetPhysicallyInstalledSystemMemory, GetSystemInfo, SYSTEM_INFO,
+};
 
 pub fn check_cpuid_hypervisor() -> bool {
     let cpuid = CpuId::new();
@@ -32,224 +41,161 @@ pub fn check_cpuid_hypervisor() -> bool {
     }
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_ComputerSystem")]
-#[serde(rename_all = "PascalCase")]
-struct Win32ComputerSystem {
-    total_physical_memory: u64,
-}
-
 pub fn check_memory_size() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32ComputerSystem> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    if let Some(system) = results.first() {
-        let common_vm_sizes = [
-            1 * 1024 * 1024 * 1024,
-            2 * 1024 * 1024 * 1024,
-            4 * 1024 * 1024 * 1024,
-        ];
-        common_vm_sizes.contains(&system.total_physical_memory)
+    let mut total_memory_in_kb: u64 = 0;
+    if unsafe { GetPhysicallyInstalledSystemMemory(&mut total_memory_in_kb) }.is_ok() {
+        let total_memory_in_gb = total_memory_in_kb / 1024 / 1024;
+        let common_vm_sizes = [1, 2, 4];
+        common_vm_sizes.contains(&total_memory_in_gb)
     } else {
         false
     }
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_NetworkAdapterConfiguration")]
-#[serde(rename_all = "PascalCase")]
-struct Win32NetworkAdapterConfiguration {
-    #[serde(rename = "MACAddress")]
-    mac_address: Option<String>,
 }
 
 pub fn check_mac_address() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
+    let mut buffer_size: u32 = 0;
+    unsafe {
+        GetAdaptersInfo(None, &mut buffer_size);
+    }
 
-    let results: Vec<Win32NetworkAdapterConfiguration> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
+    if buffer_size == 0 {
+        return false;
+    }
 
-    let vm_mac_prefixes = [
-        "00:05:69",
-        "00:0C:29",
-        "00:1C:14",
-        "00:50:56",
-        "08:00:27",
-        "00:1C:42",
-        "52:54:00",
-    ];
+    let mut adapter_info_buffer: Vec<u8> = vec![0; buffer_size as usize];
+    let adapter_info_ptr = adapter_info_buffer.as_mut_ptr() as *mut IP_ADAPTER_INFO;
 
-    for item in results {
-        if let Some(mac) = &item.mac_address {
-            for &prefix in &vm_mac_prefixes {
-                if mac.starts_with(prefix) {
-                    return true;
+    if unsafe { GetAdaptersInfo(Some(adapter_info_ptr), &mut buffer_size) } == 0 {
+        let vm_mac_prefixes = [
+            "00:05:69", "00:0C:29", "00:1C:14", "00:50:56", "08:00:27", "00:1C:42", "52:54:00",
+        ];
+
+        let mut current_adapter = adapter_info_ptr;
+        while !current_adapter.is_null() {
+            let mac_address_len = unsafe { (*current_adapter).AddressLength } as usize;
+            if mac_address_len == 6 {
+                let mac_address_slice = unsafe { &(*current_adapter).Address[0..mac_address_len] };
+                let mac_address_str = mac_address_slice
+                    .iter()
+                    .map(|&byte| format!("{:02X}", byte))
+                    .collect::<Vec<String>>()
+                    .join(":");
+
+                for &prefix in &vm_mac_prefixes {
+                    if mac_address_str.starts_with(prefix) {
+                        return true;
+                    }
                 }
             }
+            current_adapter = unsafe { (*current_adapter).Next };
         }
     }
 
     false
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_BIOS")]
-#[serde(rename_all = "PascalCase")]
-struct Win32Bios {
-    #[serde(rename = "SerialNumber")]
-    serial_number: Option<String>,
-    #[serde(rename = "Version")]
-    version: Option<String>,
 }
 
 pub fn check_bios() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
+    let mut key_handle: HKEY = HKEY(0);
+    let subkey_pcwstr = to_pcwstr("HARDWARE\\DESCRIPTION\\System");
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(subkey_pcwstr.as_ptr()),
+            0,
+            KEY_READ,
+            &mut key_handle,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
 
-    let results: Vec<Win32Bios> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
+    let vm_bios_strings = ["VMware", "VirtualBox", "QEMU", "Hyper-V", "Parallels", "Xen"];
+    let value_names = ["SystemBiosVersion", "VideoBiosVersion"];
 
-    let vm_bios_strings = [
-        "VMware",
-        "VirtualBox",
-        "QEMU",
-        "Hyper-V",
-        "Parallels",
-        "Xen",
-    ];
-
-    for bios in results {
-        if let Some(serial) = &bios.serial_number {
-            for &vm_string in &vm_bios_strings {
-                if serial.contains(vm_string) {
-                    return true;
-                }
-            }
+    for value_name in &value_names {
+        let mut buffer: [u16; 256] = [0; 256];
+        let mut buffer_size = (buffer.len() * std::mem::size_of::<u16>()) as u32;
+        let value_name_pcwstr = to_pcwstr(value_name);
+        if unsafe {
+            RegQueryValueExW(
+                key_handle,
+                PCWSTR(value_name_pcwstr.as_ptr()),
+                None,
+                None,
+                Some(buffer.as_mut_ptr() as *mut u8),
+                Some(&mut buffer_size),
+            )
         }
-        if let Some(version) = &bios.version {
+        .is_ok()
+        {
+            let value = String::from_utf16_lossy(&buffer[..buffer_size as usize / 2]);
             for &vm_string in &vm_bios_strings {
-                if version.contains(vm_string) {
+                if value.contains(vm_string) {
+                    unsafe {
+                        let _ = RegCloseKey(key_handle);
+                    };
                     return true;
                 }
             }
         }
     }
 
+    unsafe {
+        let _ = RegCloseKey(key_handle);
+    };
     false
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_Processor")]
-#[serde(rename_all = "PascalCase")]
-struct Win32Processor {
-    number_of_cores: u32,
-}
-
 pub fn check_cpu_cores() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32Processor> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    if let Some(processor) = results.first() {
-        matches!(processor.number_of_cores, 1 | 2)
-    } else {
-        false
+    let mut system_info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
+    unsafe {
+        GetSystemInfo(&mut system_info);
     }
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_DiskDrive")]
-#[serde(rename_all = "PascalCase")]
-struct Win32DiskDrive {
-    size: u64,
+    matches!(system_info.dwNumberOfProcessors, 1 | 2)
 }
 
 pub fn check_disk_size() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32DiskDrive> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
-
-    if let Some(disk) = results.first() {
+    let mut total_number_of_bytes: u64 = 0;
+    let root_path = to_pcwstr("C:\\");
+    if unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(root_path.as_ptr()),
+            None,
+            Some(&mut total_number_of_bytes),
+            None,
+        )
+    }
+    .is_ok()
+    {
         let common_vm_sizes = [
             60 * 1024 * 1024 * 1024,
             80 * 1024 * 1024 * 1024,
             100 * 1024 * 1024 * 1024,
         ];
-        common_vm_sizes.contains(&disk.size)
+        common_vm_sizes.contains(&total_number_of_bytes)
     } else {
         false
     }
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_VideoController")]
-#[serde(rename_all = "PascalCase")]
-struct Win32VideoController {
-    name: String,
-}
-
 pub fn check_display_adapter() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32VideoController> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
+    let mut video_key_handle: HKEY = HKEY(0);
+    let video_key_path = to_pcwstr("SYSTEM\\CurrentControlSet\\Control\\Video");
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(video_key_path.as_ptr()),
+            0,
+            KEY_READ,
+            &mut video_key_handle,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
 
     let vm_adapters = [
         "VMware SVGA",
@@ -259,83 +205,272 @@ pub fn check_display_adapter() -> bool {
         "Parallels Display Adapter",
     ];
 
-    for adapter in results {
-        for &vm_adapter in &vm_adapters {
-            if adapter.name.contains(vm_adapter) {
-                return true;
+    let mut i = 0;
+    loop {
+        let mut subkey_name_buffer: [u16; 256] = [0; 256];
+        let mut subkey_name_len = subkey_name_buffer.len() as u32;
+        if unsafe {
+            RegEnumKeyExW(
+                video_key_handle,
+                i,
+                PWSTR(subkey_name_buffer.as_mut_ptr()),
+                &mut subkey_name_len,
+                None,
+                PWSTR(std::ptr::null_mut()),
+                None,
+                None,
+            )
+        }
+        .is_err()
+        {
+            break;
+        }
+        i += 1;
+
+        let subkey_name =
+            String::from_utf16_lossy(&subkey_name_buffer[..subkey_name_len as usize]);
+        let adapter_key_path =
+            format!("SYSTEM\\CurrentControlSet\\Control\\Video\\{}\\0000", subkey_name);
+        let mut adapter_key_handle: HKEY = HKEY(0);
+        let adapter_key_pcwstr = to_pcwstr(&adapter_key_path);
+        if unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(adapter_key_pcwstr.as_ptr()),
+                0,
+                KEY_READ,
+                &mut adapter_key_handle,
+            )
+        }
+        .is_ok()
+        {
+            let value_name = to_pcwstr("DriverDesc");
+            let mut buffer: [u16; 256] = [0; 256];
+            let mut buffer_size = (buffer.len() * std::mem::size_of::<u16>()) as u32;
+            if unsafe {
+                RegQueryValueExW(
+                    adapter_key_handle,
+                    PCWSTR(value_name.as_ptr()),
+                    None,
+                    None,
+                    Some(buffer.as_mut_ptr() as *mut u8),
+                    Some(&mut buffer_size),
+                )
             }
+            .is_ok()
+            {
+                let value = String::from_utf16_lossy(&buffer[..buffer_size as usize / 2]);
+                for &vm_adapter in &vm_adapters {
+                    if value.contains(vm_adapter) {
+                        unsafe {
+                            let _ = RegCloseKey(adapter_key_handle);
+                            let _ = RegCloseKey(video_key_handle);
+                        };
+                        return true;
+                    }
+                }
+            }
+            unsafe {
+                let _ = RegCloseKey(adapter_key_handle);
+            };
         }
     }
-    false
-}
 
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_PnPEntity")]
-#[serde(rename_all = "PascalCase")]
-struct Win32PnPEntity {
-    description: String,
+    unsafe {
+        let _ = RegCloseKey(video_key_handle);
+    };
+    false
 }
 
 pub fn check_pci_devices() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32PnPEntity> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
+    let mut pci_key_handle: HKEY = HKEY(0);
+    let pci_key_path = to_pcwstr("SYSTEM\\CurrentControlSet\\Enum\\PCI");
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(pci_key_path.as_ptr()),
+            0,
+            KEY_READ,
+            &mut pci_key_handle,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
 
     let vm_pci_devices = ["VMware VMCI", "VirtualBox Guest Service", "Red Hat VirtIO"];
 
-    for device in results {
-        for &vm_device in &vm_pci_devices {
-            if device.description.contains(vm_device) {
-                return true;
+    let mut i = 0;
+    loop {
+        let mut subkey_name_buffer: [u16; 256] = [0; 256];
+        let mut subkey_name_len = subkey_name_buffer.len() as u32;
+        if unsafe {
+            RegEnumKeyExW(
+                pci_key_handle,
+                i,
+                PWSTR(subkey_name_buffer.as_mut_ptr()),
+                &mut subkey_name_len,
+                None,
+                PWSTR(std::ptr::null_mut()),
+                None,
+                None,
+            )
+        }
+        .is_err()
+        {
+            break;
+        }
+        i += 1;
+
+        let subkey_name =
+            String::from_utf16_lossy(&subkey_name_buffer[..subkey_name_len as usize]);
+        let device_key_path = format!("SYSTEM\\CurrentControlSet\\Enum\\PCI\\{}", subkey_name);
+        let mut device_key_handle: HKEY = HKEY(0);
+        let device_key_pcwstr = to_pcwstr(&device_key_path);
+        if unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(device_key_pcwstr.as_ptr()),
+                0,
+                KEY_READ,
+                &mut device_key_handle,
+            )
+        }
+        .is_ok()
+        {
+            let value_name = to_pcwstr("DeviceDesc");
+            let mut buffer: [u16; 256] = [0; 256];
+            let mut buffer_size = (buffer.len() * std::mem::size_of::<u16>()) as u32;
+            if unsafe {
+                RegQueryValueExW(
+                    device_key_handle,
+                    PCWSTR(value_name.as_ptr()),
+                    None,
+                    None,
+                    Some(buffer.as_mut_ptr() as *mut u8),
+                    Some(&mut buffer_size),
+                )
             }
+            .is_ok()
+            {
+                let value = String::from_utf16_lossy(&buffer[..buffer_size as usize / 2]);
+                for &vm_device in &vm_pci_devices {
+                    if value.contains(vm_device) {
+                        unsafe {
+                            let _ = RegCloseKey(device_key_handle);
+                            let _ = RegCloseKey(pci_key_handle);
+                        };
+                        return true;
+                    }
+                }
+            }
+            unsafe {
+                let _ = RegCloseKey(device_key_handle);
+            };
         }
     }
+
+    unsafe {
+        let _ = RegCloseKey(pci_key_handle);
+    };
     false
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_SystemDriver")]
-#[serde(rename_all = "PascalCase")]
-struct Win32SystemDriver {
-    name: String,
-}
-
 pub fn check_drivers() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
-        Err(_) => return false,
-    };
-
-    let results: Vec<Win32SystemDriver> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
+    let mut services_key_handle: HKEY = HKEY(0);
+    let services_key_path = to_pcwstr("SYSTEM\\CurrentControlSet\\Services");
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            PCWSTR(services_key_path.as_ptr()),
+            0,
+            KEY_READ,
+            &mut services_key_handle,
+        )
+    }
+    .is_err()
+    {
+        return false;
+    }
 
     let vm_drivers = [
         "virtio", "vmxnet", "pvscsi", "vboxguest", "vmware", "vmusb", "vmx86",
     ];
 
-    for driver in results {
-        for &vm_driver in &vm_drivers {
-            if driver.name.contains(vm_driver) {
-                return true;
+    let mut i = 0;
+    loop {
+        let mut subkey_name_buffer: [u16; 256] = [0; 256];
+        let mut subkey_name_len = subkey_name_buffer.len() as u32;
+        if unsafe {
+            RegEnumKeyExW(
+                services_key_handle,
+                i,
+                PWSTR(subkey_name_buffer.as_mut_ptr()),
+                &mut subkey_name_len,
+                None,
+                PWSTR(std::ptr::null_mut()),
+                None,
+                None,
+            )
+        }
+        .is_err()
+        {
+            break;
+        }
+        i += 1;
+
+        let subkey_name =
+            String::from_utf16_lossy(&subkey_name_buffer[..subkey_name_len as usize]);
+        let service_key_path = format!("SYSTEM\\CurrentControlSet\\Services\\{}", subkey_name);
+        let mut service_key_handle: HKEY = HKEY(0);
+        let service_key_pcwstr = to_pcwstr(&service_key_path);
+        if unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(service_key_pcwstr.as_ptr()),
+                0,
+                KEY_READ,
+                &mut service_key_handle,
+            )
+        }
+        .is_ok()
+        {
+            let value_name = to_pcwstr("ImagePath");
+            let mut buffer: [u16; 256] = [0; 256];
+            let mut buffer_size = (buffer.len() * std::mem::size_of::<u16>()) as u32;
+            if unsafe {
+                RegQueryValueExW(
+                    service_key_handle,
+                    PCWSTR(value_name.as_ptr()),
+                    None,
+                    None,
+                    Some(buffer.as_mut_ptr() as *mut u8),
+                    Some(&mut buffer_size),
+                )
             }
+            .is_ok()
+            {
+                let value = String::from_utf16_lossy(&buffer[..buffer_size as usize / 2]);
+                for &vm_driver in &vm_drivers {
+                    if value.contains(vm_driver) {
+                        unsafe {
+                            let _ = RegCloseKey(service_key_handle);
+                            let _ = RegCloseKey(services_key_handle);
+                        };
+                        return true;
+                    }
+                }
+            }
+            unsafe {
+                let _ = RegCloseKey(service_key_handle);
+            };
         }
     }
+
+    unsafe {
+        let _ = RegCloseKey(services_key_handle);
+    };
     false
 }
 
@@ -366,7 +501,9 @@ pub fn check_vm_registry_keys() -> bool {
         };
 
         if result.is_ok() {
-            unsafe { let _ = RegCloseKey(key_handle); };
+            unsafe {
+                let _ = RegCloseKey(key_handle);
+            };
             return true;
         }
     }
@@ -374,27 +511,25 @@ pub fn check_vm_registry_keys() -> bool {
     false
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(rename = "Win32_Process")]
-#[serde(rename_all = "PascalCase")]
-struct Win32Process {
-    name: String,
-}
-
 pub fn check_vm_processes() -> bool {
-    let com_lib = match COMLibrary::new() {
-        Ok(lib) => lib,
-        Err(_) => return false,
-    };
-    let wmi_con = match WMIConnection::new(com_lib.into()) {
-        Ok(con) => con,
+    let snapshot_handle = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
+        Ok(handle) => handle,
         Err(_) => return false,
     };
 
-    let results: Vec<Win32Process> = match wmi_con.query() {
-        Ok(res) => res,
-        Err(_) => return false,
-    };
+    if snapshot_handle.is_invalid() {
+        return false;
+    }
+
+    let mut process_entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    process_entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+    if unsafe { Process32FirstW(snapshot_handle, &mut process_entry) }.is_err() {
+        unsafe {
+            let _ = CloseHandle(snapshot_handle);
+        };
+        return false;
+    }
 
     let vm_processes = [
         "vmtoolsd.exe",
@@ -406,14 +541,33 @@ pub fn check_vm_processes() -> bool {
         "prl_tools_service.exe",
     ];
 
-    for process in results {
+    loop {
+        let exe_file_slice = {
+            let len = process_entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(process_entry.szExeFile.len());
+            &process_entry.szExeFile[..len]
+        };
+        let process_name = String::from_utf16_lossy(exe_file_slice);
         for &vm_process in &vm_processes {
-            if process.name.eq_ignore_ascii_case(vm_process) {
+            if process_name.eq_ignore_ascii_case(vm_process) {
+                unsafe {
+                    let _ = CloseHandle(snapshot_handle);
+                };
                 return true;
             }
         }
+
+        if unsafe { Process32NextW(snapshot_handle, &mut process_entry) }.is_err() {
+            break;
+        }
     }
 
+    unsafe {
+        let _ = CloseHandle(snapshot_handle);
+    };
     false
 }
 
