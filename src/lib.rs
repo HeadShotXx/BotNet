@@ -8,11 +8,6 @@ use wmi::{COMLibrary, WMIConnection};
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ};
 
-/// Checks for the presence of a hypervisor using the CPUID instruction.
-///
-/// It first checks for the presence of a hypervisor and then queries the hypervisor name.
-///
-/// Returns `true` if a known hypervisor is detected, `false` otherwise.
 pub fn check_cpuid_hypervisor() -> bool {
     let cpuid = CpuId::new();
     if let Some(hypervisor_info) = cpuid.get_hypervisor_info() {
@@ -44,9 +39,6 @@ struct Win32ComputerSystem {
     total_physical_memory: u64,
 }
 
-/// Checks the total physical memory size.
-///
-/// Returns `true` if the memory size is a common VM allocation (e.g., 1GB, 2GB, 4GB).
 pub fn check_memory_size() -> bool {
     let com_lib = match COMLibrary::new() {
         Ok(lib) => lib,
@@ -63,7 +55,6 @@ pub fn check_memory_size() -> bool {
     };
 
     if let Some(system) = results.first() {
-        // Common VM RAM sizes in bytes (1GB, 2GB, 4GB)
         let common_vm_sizes = [
             1 * 1024 * 1024 * 1024,
             2 * 1024 * 1024 * 1024,
@@ -83,9 +74,6 @@ struct Win32NetworkAdapterConfiguration {
     mac_address: Option<String>,
 }
 
-/// Checks for MAC addresses associated with virtual machines.
-///
-/// Returns `true` if a known VM MAC address prefix is found, `false` otherwise.
 pub fn check_mac_address() -> bool {
     let com_lib = match COMLibrary::new() {
         Ok(lib) => lib,
@@ -102,13 +90,13 @@ pub fn check_mac_address() -> bool {
     };
 
     let vm_mac_prefixes = [
-        "00:05:69", // VMware
-        "00:0C:29", // VMware
-        "00:1C:14", // VMware
-        "00:50:56", // VMware
-        "08:00:27", // VirtualBox
-        "00:1C:42", // Parallels
-        "52:54:00", // QEMU/KVM
+        "00:05:69",
+        "00:0C:29",
+        "00:1C:14",
+        "00:50:56",
+        "08:00:27",
+        "00:1C:42",
+        "52:54:00",
     ];
 
     for item in results {
@@ -134,9 +122,6 @@ struct Win32Bios {
     version: Option<String>,
 }
 
-/// Checks the BIOS for strings commonly found in virtual machines.
-///
-/// Returns `true` if a VM-related string is found in the BIOS information, `false` otherwise.
 pub fn check_bios() -> bool {
     let com_lib = match COMLibrary::new() {
         Ok(lib) => lib,
@@ -188,9 +173,6 @@ struct Win32Processor {
     number_of_cores: u32,
 }
 
-/// Checks the number of CPU cores.
-///
-/// Returns `true` if the number of cores is 1 or 2, which is common for VMs.
 pub fn check_cpu_cores() -> bool {
     let com_lib = match COMLibrary::new() {
         Ok(lib) => lib,
@@ -207,7 +189,6 @@ pub fn check_cpu_cores() -> bool {
     };
 
     if let Some(processor) = results.first() {
-        // VMs often have 1 or 2 cores
         matches!(processor.number_of_cores, 1 | 2)
     } else {
         false
@@ -221,9 +202,6 @@ struct Win32DiskDrive {
     size: u64,
 }
 
-/// Checks the disk drive size.
-///
-/// Returns `true` if the disk size is a common VM allocation (e.g., 64GB, 128GB).
 pub fn check_disk_size() -> bool {
     let com_lib = match COMLibrary::new() {
         Ok(lib) => lib,
@@ -240,7 +218,6 @@ pub fn check_disk_size() -> bool {
     };
 
     if let Some(disk) = results.first() {
-        // Common VM disk sizes in bytes (e.g., 60GB, 80GB, 100GB)
         let common_vm_sizes = [
             60 * 1024 * 1024 * 1024,
             80 * 1024 * 1024 * 1024,
@@ -259,9 +236,6 @@ struct Win32VideoController {
     name: String,
 }
 
-/// Checks the display adapter name.
-///
-/// Returns `true` if the display adapter is a known virtual adapter.
 pub fn check_display_adapter() -> bool {
     let com_lib = match COMLibrary::new() {
         Ok(lib) => lib,
@@ -302,9 +276,6 @@ struct Win32PnPEntity {
     description: String,
 }
 
-/// Checks for virtual PCI devices.
-///
-/// Returns `true` if a known virtual PCI device is found.
 pub fn check_pci_devices() -> bool {
     let com_lib = match COMLibrary::new() {
         Ok(lib) => lib,
@@ -339,9 +310,6 @@ struct Win32SystemDriver {
     name: String,
 }
 
-/// Checks for known virtual machine drivers.
-///
-/// Returns `true` if a known VM driver is found.
 pub fn check_drivers() -> bool {
     let com_lib = match COMLibrary::new() {
         Ok(lib) => lib,
@@ -375,7 +343,6 @@ fn to_pcwstr(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
 }
 
-/// Checks for registry keys associated with virtual machines.
 pub fn check_vm_registry_keys() -> bool {
     let vm_keys = [
         "SOFTWARE\\VMware, Inc.\\VMware Tools",
@@ -414,7 +381,6 @@ struct Win32Process {
     name: String,
 }
 
-/// Checks for running processes associated with virtual machines.
 pub fn check_vm_processes() -> bool {
     let com_lib = match COMLibrary::new() {
         Ok(lib) => lib,
@@ -452,11 +418,10 @@ pub fn check_vm_processes() -> bool {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-/// Checks for VM overhead by measuring the execution time of the RDTSC instruction.
 pub fn check_rdtsc_timing() -> bool {
     use std::arch::x86_64::_rdtsc;
     const SAMPLES: u32 = 10;
-    const THRESHOLD: u64 = 1000; // A high number of cycles between consecutive calls is suspicious.
+    const THRESHOLD: u64 = 1000;
     let mut total_diff: u64 = 0;
     for _ in 0..SAMPLES {
         let t1 = unsafe { _rdtsc() };
@@ -474,12 +439,11 @@ pub fn check_rdtsc_timing() -> bool {
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-/// Checks for VM overhead by measuring the execution time of the CPUID instruction.
 pub fn check_cpuid_timing() -> bool {
     use std::arch::x86_64::_rdtsc;
     use raw_cpuid::CpuId;
     const SAMPLES: u32 = 10;
-    const THRESHOLD: u64 = 400; // A common threshold for CPUID timing.
+    const THRESHOLD: u64 = 400;
     let mut total_diff: u64 = 0;
     for _ in 0..SAMPLES {
         let t1 = unsafe { _rdtsc() };
@@ -497,7 +461,6 @@ pub fn check_cpuid_timing() -> bool {
     false
 }
 
-/// Checks for the presence of VM-related directories in Program Files.
 pub fn check_filesystem_artifacts() -> bool {
     let vm_dirs = [
         "C:\\Program Files\\VMware",
@@ -516,10 +479,6 @@ pub fn check_filesystem_artifacts() -> bool {
     false
 }
 
-
-/// Runs all anti-VM checks.
-///
-/// Returns `true` if any of the checks detect a virtualized environment, `false` otherwise.
 pub fn is_virtualized() -> bool {
     check_cpuid_hypervisor()
         || check_mac_address()
