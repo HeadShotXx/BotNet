@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 obfuscator = { path = "./obfuscator" }
 base85 = "2.0"
+base45 = "3.1.0"
