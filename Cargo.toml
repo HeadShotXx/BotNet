@@ -1,0 +1,8 @@
+[package]
+name = "my_project"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+obfuscator = { path = "./obfuscator" }
+base85 = "2.0"
