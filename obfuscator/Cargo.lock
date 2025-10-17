@@ -160,6 +160,7 @@ dependencies = [
  "base85",
  "base91",
  "bs58",
+ "proc-macro2",
  "quote",
  "rand",
  "syn 2.0.106",
