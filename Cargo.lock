@@ -161,6 +161,10 @@ dependencies = [
  "base91",
  "bs58",
  "obfuscator",
+ "proc-macro2",
+ "quote",
+ "rand",
+ "syn 2.0.106",
 ]
 
 [[package]]

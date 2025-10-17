@@ -36,10 +36,10 @@ impl Codec {
 
     pub fn get_decode_logic(&self, data_var: &syn::Ident) -> TokenStream {
         match self {
-            Codec::Base36 => quote! { let #data_var = base36::decode(&String::from_utf8_lossy(&#data_var)).unwrap(); },
+            Codec::Base36 => quote! { let #data_var = base36::decode(&String::from_utf8_lossy(&#data_var).to_lowercase()).unwrap(); },
             Codec::Base45 => quote! { let #data_var = base45::decode(String::from_utf8_lossy(&#data_var).as_ref()).unwrap(); },
             Codec::Base58 => quote! { let #data_var = bs58::decode(String::from_utf8_lossy(&#data_var).as_ref()).into_vec().unwrap(); },
-            Codec::Base85 => quote! { let #data_var = base85::decode(&String::from_utf8_lossy(&#data_var)).unwrap(); },
+            Codec::Base85 => quote! { let #data_var = base85::decode(&String::from_utf8_lossy(&#data_var).replace("{", "_").replace("}", "_")).unwrap(); },
             Codec::Base91 => quote! { let #data_var = base91::slice_decode(&#data_var); },
             Codec::Base122 => quote! { let #data_var = base122_rs::decode(&String::from_utf8_lossy(&#data_var)).unwrap(); },
         }
