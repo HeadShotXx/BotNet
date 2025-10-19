@@ -1,0 +1,21 @@
+[package]
+name = "obfuscator"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = "2.0"
+quote = "1.0"
+proc-macro2 = "1.0"
+base85 = "2.0"
+rand = "0.8"
+base45 = "3.1.0"
+base36 = "0.0.1"
+base91 = "0.1.0"
+base122-rs = "0.1.4"
+bs58 = "0.5.0"
+zeroize = "1.5"
+crc32fast = "1.3"
