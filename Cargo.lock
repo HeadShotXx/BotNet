@@ -169,7 +169,9 @@ dependencies = [
  "base85",
  "base91",
  "bs58",
+ "crc32fast",
  "obfuscator",
+ "zeroize",
 ]
 
 [[package]]
