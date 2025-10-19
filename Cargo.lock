@@ -160,6 +160,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "my_lib"
+version = "0.1.0"
+dependencies = [
+ "base122-rs",
+ "base36",
+ "base45",
+ "base85",
+ "base91",
+ "bs58",
+ "crc32fast",
+ "obfuscator",
+ "zeroize",
+]
+
+[[package]]
 name = "my_project"
 version = "0.1.0"
 dependencies = [
@@ -170,6 +185,7 @@ dependencies = [
  "base91",
  "bs58",
  "crc32fast",
+ "my_lib",
  "obfuscator",
  "zeroize",
 ]
