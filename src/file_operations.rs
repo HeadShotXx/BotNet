@@ -1,10 +1,10 @@
-use crate::syscalls::{Syscalls, SYSCALLS, UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK};
+use crate::syscalls::{SYSCALLS, UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK};
 use std::ffi::{c_void, OsStr};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use rand::{Rng, distributions::Alphanumeric};
+use rand::Rng;
 use winapi::um::winnt::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_DIRECTORY, GENERIC_WRITE, FILE_SHARE_WRITE, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT, SYNCHRONIZE, FILE_LIST_DIRECTORY};
-use obfuscator::obfuscate_string;
+use obfuscator::obfuscate;
 use std::env;
 
 #[obfuscate(garbage = true, control_f = true)]
@@ -17,10 +17,13 @@ fn get_programdata_path() -> Result<String, &'static str> {
 
 #[obfuscate(garbage = true, control_f = true)]
 fn generate_random_name(length: usize) -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(length)
-        .map(char::from)
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::rngs::thread_rng();
+    (0..length)
+        .map(|_| {
+            let idx = rng.gen_range(0..CHARSET.len());
+            CHARSET[idx] as char
+        })
         .collect()
 }
 

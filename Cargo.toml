@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-winapi = { version = "0.3", features = ["memoryapi", "winnt", "libloaderapi", "processthreadsapi", "errhandlingapi"] }
+winapi = { version = "0.3", features = ["memoryapi", "winnt", "libloaderapi", "processthreadsapi", "errhandlingapi", "fileapi"] }
 obfuscator = { path = "obfuscator" }
 zeroize = "1.8.2"
 crc32fast = "1.5.0"
