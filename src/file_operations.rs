@@ -2,8 +2,9 @@ use crate::syscalls::{SYSCALLS, UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLO
 use std::ffi::{c_void, OsStr};
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use rand::Rng;
-use winapi::um::winnt::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_DIRECTORY, GENERIC_WRITE, FILE_SHARE_WRITE, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT, SYNCHRONIZE, FILE_LIST_DIRECTORY};
+use rand::{Rng, thread_rng};
+use winapi::um::winnt::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_DIRECTORY, GENERIC_WRITE, FILE_SHARE_WRITE, SYNCHRONIZE, FILE_LIST_DIRECTORY};
+use winapi::um::fileapi::{FILE_CREATE, FILE_DIRECTORY_FILE, FILE_SYNCHRONOUS_IO_NONALERT};
 use obfuscator::obfuscate;
 use std::env;
 
@@ -18,7 +19,7 @@ fn get_programdata_path() -> Result<String, &'static str> {
 #[obfuscate(garbage = true, control_f = true)]
 fn generate_random_name(length: usize) -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::rngs::thread_rng();
+    let mut rng = thread_rng();
     (0..length)
         .map(|_| {
             let idx = rng.gen_range(0..CHARSET.len());
