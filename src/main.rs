@@ -14,7 +14,7 @@ use std::fs;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{HANDLE, SysAllocString, SysFreeString};
 #[cfg(windows)]
 use winapi::shared::minwindef::{DWORD, HMODULE, LPVOID};
 #[cfg(windows)]
@@ -30,9 +30,10 @@ use winapi::um::winnt::{
 };
 
 #[cfg(windows)]
+use windows_sys::core::IUnknown;
+#[cfg(windows)]
 use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
-    SysAllocString, SysFreeString,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::TaskScheduler::{
@@ -53,7 +54,7 @@ impl<T> Drop for ComPtr<T> {
     fn drop(&mut self) {
         if !self.0.is_null() {
             unsafe {
-                ((*self.0 as *mut windows_sys::core::IUnknown)).Release();
+                ((*self.0 as *mut IUnknown)).Release();
             }
         }
     }
