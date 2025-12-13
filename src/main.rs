@@ -9,18 +9,6 @@ mod persistence;
 #[cfg(windows)]
 use std::{mem, ptr};
 #[cfg(windows)]
-use hex::ToHex;
-#[cfg(windows)]
-use rand::Rng;
-#[cfg(windows)]
-use std::fs;
-#[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_HIDDEN, FILE_SHARE_READ, FILE_SHARE_WRITE,
-};
-#[cfg(windows)]
-use windows_sys::Win32::Foundation::HANDLE;
-#[cfg(windows)]
 use winapi::shared::minwindef::{DWORD, HMODULE, LPVOID};
 #[cfg(windows)]
 use winapi::um::errhandlingapi::GetLastError;
