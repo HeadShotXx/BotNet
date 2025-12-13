@@ -29,7 +29,7 @@ getrandom = "0.3" # locked for consistency with rand 0.9
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 once_cell = "1.21.3"
-windows-sys = { version = "0.61.2", features = ["Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Services", "Win32_System_Variant"] }
+windows-sys = { version = "0.61.2", features = ["Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Services", "Win32_System_Variant", "Win32_System_Ole"] }
 
 [profile.release]
 opt-level = 3

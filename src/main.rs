@@ -42,7 +42,7 @@ use windows_sys::Win32::System::TaskScheduler::{
     TASK_LOGON_INTERACTIVE_TOKEN, TASK_RUNLEVEL_LUA, TASK_TRIGGER_LOGON,
 };
 #[cfg(windows)]
-use windows_sys::Win32::System::Variant::VARIANT;
+use windows_sys::Win32::System::Ole::VARIANT;
 
 
 #[cfg(windows)]
