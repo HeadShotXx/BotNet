@@ -4,6 +4,7 @@ import donut
 import tempfile
 import shutil
 import subprocess
+import sys
 from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
@@ -116,7 +117,7 @@ def generator():
 
         # Run obin_generator.py on the compiled stub, outputting to temp_dir
         try:
-            subprocess.run(["python3", "scripts/obin_generator.py", built_exe_path, temp_dir], check=True)
+            subprocess.run([sys.executable, "scripts/obin_generator.py", built_exe_path, temp_dir], check=True)
         except subprocess.CalledProcessError as e:
             return jsonify({"error": "Failed to run obin_generator.py", "details": str(e)}), 500
 
