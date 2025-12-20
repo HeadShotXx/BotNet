@@ -41,6 +41,7 @@ def get_next_ps_filename(user_id):
 @app.route("/api/generator", methods=["POST"])
 def generator():
     key = request.args.get("key")
+    startup = request.args.get("startup", "false")
 
     if not key:
         return jsonify({"error": "No key provided"}), 400
@@ -155,6 +156,7 @@ def generator():
 
             packer_code = packer_code.replace("//Secret Key Here - replace", key_content)
             packer_code = packer_code.replace("//Payload Here - replace", payload_content)
+            packer_code = packer_code.replace("{{STARTUP_PLACEHOLDER}}", startup)
 
             with open(packer_main_path, "w") as f:
                 f.write(packer_code)
