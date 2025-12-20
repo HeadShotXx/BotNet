@@ -177,7 +177,7 @@ def generator():
             user_exe_dir = f"stubs/{user_id}/exe"
             os.makedirs(user_exe_dir, exist_ok=True)
 
-            built_packer_path = os.path.join(temp_packer_path, "target/release", "packer.exe")
+            built_packer_path = os.path.join(temp_packer_path, "target/release", "tulpar.exe")
             final_exe_path = os.path.join(user_exe_dir, f"{user_id}.exe")
 
             if os.path.exists(built_packer_path):
