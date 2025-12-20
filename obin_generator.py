@@ -8,11 +8,13 @@ def transform_data(data, key):
     return bytes([b ^ key[i % len(key)] for i, b in enumerate(data)])
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <input-file>")
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        print(f"Usage: {sys.argv[0]} <input-file> [output-directory]")
         return
 
     path = sys.argv[1]
+    output_dir = sys.argv[2] if len(sys.argv) == 3 else "."
+    os.makedirs(output_dir, exist_ok=True)
     print(f"[*] Reading file: {path}")
 
     try:
@@ -47,20 +49,22 @@ def main():
         payload_output = payload_output[:-2]
     payload_output += "\n];"
 
+    key_path = os.path.join(output_dir, "key.rs")
     try:
-        with open("key.rs", 'w') as f:
+        with open(key_path, 'w') as f:
             f.write(key_output)
-        print("[+] SECRET_KEY written to key.rs")
+        print(f"[+] SECRET_KEY written to {key_path}")
     except IOError as e:
-        print(f"[✗] Failed to write key.rs: {e}")
+        print(f"[✗] Failed to write {key_path}: {e}")
         return
 
+    payload_path = os.path.join(output_dir, "payload.rs")
     try:
-        with open("payload.rs", 'w') as f:
+        with open(payload_path, 'w') as f:
             f.write(payload_output)
-        print("[+] PAYLOAD written to payload.rs")
+        print(f"[+] PAYLOAD written to {payload_path}")
     except IOError as e:
-        print(f"[✗] Failed to write payload.rs: {e}")
+        print(f"[✗] Failed to write {payload_path}: {e}")
         return
 
     print("\n[+] Successfully generated files. Please copy the contents of key.rs and payload.rs into your tulpar project.")
