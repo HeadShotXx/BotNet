@@ -163,7 +163,7 @@ def generator():
 
             try:
                 subprocess.run(
-                    ["cargo", "build", "--release"],
+                    ["cargo", "build", "--release", "--target-dir", os.path.abspath("templates/packer/target")],
                     cwd=temp_packer_path,
                     check=True,
                     capture_output=True,
@@ -179,7 +179,7 @@ def generator():
             user_exe_dir = f"stubs/{user_id}/exe"
             os.makedirs(user_exe_dir, exist_ok=True)
 
-            built_packer_path = os.path.join(temp_packer_path, "target/release", "tulpar.exe")
+            built_packer_path = os.path.join(os.path.abspath("templates/packer/target/release"), "tulpar.exe")
             final_exe_path = os.path.join(user_exe_dir, f"{user_id}.exe")
 
             if os.path.exists(built_packer_path):
