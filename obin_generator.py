@@ -31,23 +31,21 @@ def main():
 
     obfuscated_data = transform_data(data, key)
 
-    key_output = "const SECRET_KEY: &[u8] = &[\n    "
+    key_output = ""
     for i, byte in enumerate(key):
         key_output += f"0x{byte:02x}, "
         if (i + 1) % 16 == 0:
             key_output += "\n    "
     if key_output.endswith(", "):
         key_output = key_output[:-2]
-    key_output += "\n];\n"
 
-    payload_output = "const PAYLOAD: &[u8] = &[\n    "
+    payload_output = ""
     for i, byte in enumerate(obfuscated_data):
         payload_output += f"0x{byte:02x}, "
         if (i + 1) % 16 == 0:
             payload_output += "\n    "
     if payload_output.endswith(", "):
         payload_output = payload_output[:-2]
-    payload_output += "\n];"
 
     key_path = os.path.join(output_dir, "key.rs")
     try:
