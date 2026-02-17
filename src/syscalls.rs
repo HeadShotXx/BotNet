@@ -218,10 +218,28 @@ pub unsafe fn spoof_syscall(
     let mut result: NTSTATUS;
     let num_args = args.len();
 
-    let mut stack_args = [0usize; 12];
+    // We use a fixed-size array for arguments.
+    // Index 0-3 are for registers R10, RDX, R8, R9.
+    // Index 4+ are for the stack.
+    let mut stack_args = [0usize; 16];
     for i in 0..num_args {
         stack_args[i] = args[i];
     }
+
+    let num_actual_stack_args = if num_args > 4 { num_args - 4 } else { 0 };
+    let mut num_to_push = num_actual_stack_args;
+    let mut arg_offset = 24; // (4 - 1) * 8
+
+    // Ensure 16-byte alignment before shadow space and return address
+    // Total pushed = 32 (regs) + num_to_push * 8 + 32 (shadow) + 8 (ret)
+    // We want (72 + num_to_push * 8) % 16 == 0 => (8 + num_to_push * 8) % 16 == 0
+    // This requires num_to_push to be odd.
+    if num_to_push % 2 == 0 {
+        num_to_push += 1;
+        arg_offset -= 8; // Start from index 3 (which is 0) to add padding
+    }
+
+    let actual_stack_ptr = stack_args.as_ptr() as usize + arg_offset;
 
     asm!(
         "push rsi",
@@ -230,13 +248,12 @@ pub unsafe fn spoof_syscall(
         "push rbp",
         "mov rbp, rsp",
 
-        "cmp {num_args}, 4",
-        "jbe 3f",
+        "test {num_to_push}, {num_to_push}",
+        "jz 3f",
 
-        "mov rcx, {num_args}",
-        "sub rcx, 4",
+        "mov rcx, {num_to_push}",
         "2:",
-        "mov rax, [{stack_args_ptr} + rcx*8 + 24]",
+        "mov rax, [{actual_stack_ptr} + rcx*8]",
         "push rax",
         "sub rcx, 1",
         "jnz 2b",
@@ -260,8 +277,8 @@ pub unsafe fn spoof_syscall(
         "pop rdi",
         "pop rsi",
 
-        num_args = in(reg) num_args,
-        stack_args_ptr = in(reg) stack_args.as_ptr(),
+        num_to_push = in(reg) num_to_push,
+        actual_stack_ptr = in(reg) actual_stack_ptr,
         jmp_rbx = in(reg) jmp_rbx_gadget,
         ssn = in(reg) ssn as usize,
         syscall_gadget = in(reg) syscall_gadget,
