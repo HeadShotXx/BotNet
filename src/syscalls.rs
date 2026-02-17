@@ -101,22 +101,18 @@ pub struct IMAGE_NT_HEADERS64 {
 
 pub unsafe fn get_ntdll_base() -> *mut core::ffi::c_void {
     let peb: *mut u8;
-    unsafe {
-        asm!("mov {}, gs:[0x60]", out(reg) peb);
-    }
+    asm!("mov {}, gs:[0x60]", out(reg) peb);
 
-    let ldr = unsafe { *(peb.add(0x18) as *const *mut PEB_LDR_DATA) };
-    let mut current_entry = unsafe { (*ldr).InLoadOrderModuleList.Flink };
+    let ldr = *(peb.add(0x18) as *const *mut PEB_LDR_DATA);
+    let mut current_entry = (*ldr).InLoadOrderModuleList.Flink;
 
-    while current_entry != unsafe { &mut (*ldr).InLoadOrderModuleList } {
+    while current_entry != &mut (*ldr).InLoadOrderModuleList {
         let table_entry = current_entry as *mut LDR_DATA_TABLE_ENTRY;
 
-        let name_slice = unsafe {
-            std::slice::from_raw_parts(
-                (*table_entry).BaseDllName.Buffer,
-                ((*table_entry).BaseDllName.Length / 2) as usize
-            )
-        };
+        let name_slice = std::slice::from_raw_parts(
+            (*table_entry).BaseDllName.Buffer,
+            ((*table_entry).BaseDllName.Length / 2) as usize
+        );
 
         let target = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let mut match_found = true;
@@ -132,11 +128,11 @@ pub unsafe fn get_ntdll_base() -> *mut core::ffi::c_void {
                 }
             }
             if match_found {
-                return unsafe { (*table_entry).DllBase };
+                return (*table_entry).DllBase;
             }
         }
 
-        current_entry = unsafe { (*current_entry).Flink };
+        current_entry = (*current_entry).Flink;
     }
 
     core::ptr::null_mut()
@@ -144,46 +140,40 @@ pub unsafe fn get_ntdll_base() -> *mut core::ffi::c_void {
 
 pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32> {
     let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
-    if unsafe { (*dos_header).e_magic } != IMAGE_DOS_SIGNATURE {
+    if (*dos_header).e_magic != IMAGE_DOS_SIGNATURE {
         return None;
     }
 
-    let nt_headers = unsafe { ntdll_base.add((*dos_header).e_lfanew as usize) } as *const IMAGE_NT_HEADERS64;
-    let export_dir_entry = unsafe { (*nt_headers).OptionalHeader.DataDirectory[0] };
-    let export_dir = unsafe { ntdll_base.add(export_dir_entry.VirtualAddress as usize) } as *const IMAGE_EXPORT_DIRECTORY;
+    let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
+    let export_dir_entry = (*nt_headers).OptionalHeader.DataDirectory[0];
+    let export_dir = ntdll_base.add(export_dir_entry.VirtualAddress as usize) as *const IMAGE_EXPORT_DIRECTORY;
 
-    let names = unsafe {
-        std::slice::from_raw_parts(
-            ntdll_base.add((*export_dir).AddressOfNames as usize) as *const u32,
-            (*export_dir).NumberOfNames as usize
-        )
-    };
-    let functions = unsafe {
-        std::slice::from_raw_parts(
-            ntdll_base.add((*export_dir).AddressOfFunctions as usize) as *const u32,
-            (*export_dir).NumberOfFunctions as usize
-        )
-    };
-    let ordinals = unsafe {
-        std::slice::from_raw_parts(
-            ntdll_base.add((*export_dir).AddressOfNameOrdinals as usize) as *const u16,
-            (*export_dir).NumberOfNames as usize
-        )
-    };
+    let names = std::slice::from_raw_parts(
+        ntdll_base.add((*export_dir).AddressOfNames as usize) as *const u32,
+        (*export_dir).NumberOfNames as usize
+    );
+    let functions = std::slice::from_raw_parts(
+        ntdll_base.add((*export_dir).AddressOfFunctions as usize) as *const u32,
+        (*export_dir).NumberOfFunctions as usize
+    );
+    let ordinals = std::slice::from_raw_parts(
+        ntdll_base.add((*export_dir).AddressOfNameOrdinals as usize) as *const u16,
+        (*export_dir).NumberOfNames as usize
+    );
 
-    for i in 0..unsafe { (*export_dir).NumberOfNames } as usize {
-        let name_ptr = unsafe { ntdll_base.add(names[i] as usize) } as *const i8;
-        let name = unsafe { std::ffi::CStr::from_ptr(name_ptr).to_str().unwrap_or("") };
+    for i in 0..(*export_dir).NumberOfNames as usize {
+        let name_ptr = ntdll_base.add(names[i] as usize) as *const i8;
+        let name = std::ffi::CStr::from_ptr(name_ptr).to_str().unwrap_or("");
 
         if name == function_name {
             let ordinal = ordinals[i];
-            let function_addr = unsafe { ntdll_base.add(functions[ordinal as usize] as usize) };
+            let function_addr = ntdll_base.add(functions[ordinal as usize] as usize);
 
-            if unsafe { *function_addr == 0x4c && *function_addr.add(1) == 0x8b && *function_addr.add(2) == 0xd1 && *function_addr.add(3) == 0xb8 } {
-                return Some(unsafe { *(function_addr.add(4) as *const u32) });
+            if *function_addr == 0x4c && *function_addr.add(1) == 0x8b && *function_addr.add(2) == 0xd1 && *function_addr.add(3) == 0xb8 {
+                return Some(*(function_addr.add(4) as *const u32));
             }
-            if unsafe { *function_addr == 0xb8 } {
-                return Some(unsafe { *(function_addr.add(1) as *const u32) });
+            if *function_addr == 0xb8 {
+                return Some(*(function_addr.add(1) as *const u32));
             }
         }
     }
@@ -191,48 +181,106 @@ pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32>
     None
 }
 
+pub unsafe fn find_jmp_rbx_gadget(ntdll_base: *const u8) -> Option<*const u8> {
+    let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
+    let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
+    let size_of_image = (*nt_headers).OptionalHeader.SizeOfImage as usize;
+
+    for i in 0..size_of_image - 2 {
+        let ptr = ntdll_base.add(i);
+        if *ptr == 0xFF && *ptr.add(1) == 0xE3 {
+            return Some(ptr);
+        }
+    }
+    None
+}
+
+pub unsafe fn find_syscall_gadget(ntdll_base: *const u8) -> Option<*const u8> {
+    let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
+    let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
+    let size_of_image = (*nt_headers).OptionalHeader.SizeOfImage as usize;
+
+    for i in 0..size_of_image - 3 {
+        let ptr = ntdll_base.add(i);
+        if *ptr == 0x0F && *ptr.add(1) == 0x05 && *ptr.add(2) == 0xC3 {
+            return Some(ptr);
+        }
+    }
+    None
+}
+
+pub unsafe fn spoof_syscall(
+    ssn: u32,
+    syscall_gadget: *const u8,
+    jmp_rbx_gadget: *const u8,
+    args: &[usize],
+) -> NTSTATUS {
+    let mut result: NTSTATUS;
+    let num_args = args.len();
+
+    let mut stack_args = [0usize; 12];
+    for i in 0..num_args {
+        stack_args[i] = args[i];
+    }
+
+    asm!(
+        "push rsi",
+        "push rdi",
+        "push rbx",
+        "push rbp",
+        "mov rbp, rsp",
+
+        "cmp {num_args}, 4",
+        "jbe 3f",
+
+        "mov rcx, {num_args}",
+        "sub rcx, 4",
+        "2:",
+        "mov rax, [{stack_args_ptr} + rcx*8 + 24]",
+        "push rax",
+        "sub rcx, 1",
+        "jnz 2b",
+
+        "3:",
+        "lea rbx, [rip + 4f]", // Real return address
+        "push {jmp_rbx}",     // Fake return address (points to jmp rbx in ntdll)
+        "sub rsp, 0x20",      // Shadow space
+
+        "mov r10, {arg1}",
+        "mov rdx, {arg2}",
+        "mov r8, {arg3}",
+        "mov r9, {arg4}",
+        "mov rax, {ssn}",
+        "jmp {syscall_gadget}",
+
+        "4:",
+        "mov rsp, rbp",
+        "pop rbp",
+        "pop rbx",
+        "pop rdi",
+        "pop rsi",
+
+        num_args = in(reg) num_args,
+        stack_args_ptr = in(reg) stack_args.as_ptr(),
+        jmp_rbx = in(reg) jmp_rbx_gadget,
+        ssn = in(reg) ssn as usize,
+        syscall_gadget = in(reg) syscall_gadget,
+        arg1 = in(reg) stack_args[0],
+        arg2 = in(reg) stack_args[1],
+        arg3 = in(reg) stack_args[2],
+        arg4 = in(reg) stack_args[3],
+        lateout("rax") result,
+    );
+
+    result
+}
+
 #[macro_export]
 macro_rules! syscall {
-    ($ssn:expr, $($arg:expr),*) => {
+    ($ssn:expr, $gadget:expr, $jmp_rbx:expr, $($arg:expr),*) => {
         {
-            let mut result: $crate::syscalls::NTSTATUS;
             let args = [$( $arg as usize ),*];
-            let num_args = args.len();
-
-            match num_args {
-                    0 => {
-                        std::arch::asm!("mov r10, rcx", "syscall", in("rax") $ssn as usize, lateout("rax") result);
-                    }
-                    1 => {
-                        std::arch::asm!("mov r10, rcx", "syscall", in("rax") $ssn as usize, in("rcx") args[0], lateout("rax") result);
-                    }
-                    2 => {
-                        std::arch::asm!("mov r10, rcx", "syscall", in("rax") $ssn as usize, in("rcx") args[0], in("rdx") args[1], lateout("rax") result);
-                    }
-                    3 => {
-                        std::arch::asm!("mov r10, rcx", "syscall", in("rax") $ssn as usize, in("rcx") args[0], in("rdx") args[1], in("r8") args[2], lateout("rax") result);
-                    }
-                    4 => {
-                        std::arch::asm!("mov r10, rcx", "syscall", in("rax") $ssn as usize, in("rcx") args[0], in("rdx") args[1], in("r8") args[2], in("r9") args[3], lateout("rax") result);
-                    }
-                    5 => {
-                        std::arch::asm!("mov r10, rcx", "sub rsp, 0x28", "mov rax, {arg5}", "mov [rsp+0x20], rax", "mov rax, {ssn}", "syscall", "add rsp, 0x28", ssn = in(reg) $ssn as usize, in("rcx") args[0], in("rdx") args[1], in("r8") args[2], in("r9") args[3], arg5 = in(reg) args[4], lateout("rax") result);
-                    }
-                    6 => {
-                        std::arch::asm!("mov r10, rcx", "sub rsp, 0x30", "mov rax, {arg5}", "mov [rsp+0x20], rax", "mov rax, {arg6}", "mov [rsp+0x28], rax", "mov rax, {ssn}", "syscall", "add rsp, 0x30", ssn = in(reg) $ssn as usize, in("rcx") args[0], in("rdx") args[1], in("r8") args[2], in("r9") args[3], arg5 = in(reg) args[4], arg6 = in(reg) args[5], lateout("rax") result);
-                    }
-                    9 => {
-                        std::arch::asm!("mov r10, rcx", "sub rsp, 0x48", "mov rax, {arg5}", "mov [rsp+0x20], rax", "mov rax, {arg6}", "mov [rsp+0x28], rax", "mov rax, {arg7}", "mov [rsp+0x30], rax", "mov rax, {arg8}", "mov [rsp+0x38], rax", "mov rax, {arg9}", "mov [rsp+0x40], rax", "mov rax, {ssn}", "syscall", "add rsp, 0x48", ssn = in(reg) $ssn as usize, in("rcx") args[0], in("rdx") args[1], in("r8") args[2], in("r9") args[3], arg5 = in(reg) args[4], arg6 = in(reg) args[5], arg7 = in(reg) args[6], arg8 = in(reg) args[7], arg9 = in(reg) args[8], lateout("rax") result);
-                    }
-                    10 => {
-                         std::arch::asm!("mov r10, rcx", "sub rsp, 0x50", "mov rax, {arg5}", "mov [rsp+0x20], rax", "mov rax, {arg6}", "mov [rsp+0x28], rax", "mov rax, {arg7}", "mov [rsp+0x30], rax", "mov rax, {arg8}", "mov [rsp+0x38], rax", "mov rax, {arg9}", "mov [rsp+0x40], rax", "mov rax, {arg10}", "mov [rsp+0x48], rax", "mov rax, {ssn}", "syscall", "add rsp, 0x50", ssn = in(reg) $ssn as usize, in("rcx") args[0], in("rdx") args[1], in("r8") args[2], in("r9") args[3], arg5 = in(reg) args[4], arg6 = in(reg) args[5], arg7 = in(reg) args[6], arg8 = in(reg) args[7], arg9 = in(reg) args[8], arg10 = in(reg) args[9], lateout("rax") result);
-                    }
-                    11 => {
-                         std::arch::asm!("mov r10, rcx", "sub rsp, 0x58", "mov rax, {arg5}", "mov [rsp+0x20], rax", "mov rax, {arg6}", "mov [rsp+0x28], rax", "mov rax, {arg7}", "mov [rsp+0x30], rax", "mov rax, {arg8}", "mov [rsp+0x38], rax", "mov rax, {arg9}", "mov [rsp+0x40], rax", "mov rax, {arg10}", "mov [rsp+0x48], rax", "mov rax, {arg11}", "mov [rsp+0x50], rax", "mov rax, {ssn}", "syscall", "add rsp, 0x58", ssn = in(reg) $ssn as usize, in("rcx") args[0], in("rdx") args[1], in("r8") args[2], in("r9") args[3], arg5 = in(reg) args[4], arg6 = in(reg) args[5], arg7 = in(reg) args[6], arg8 = in(reg) args[7], arg9 = in(reg) args[8], arg10 = in(reg) args[9], arg11 = in(reg) args[10], lateout("rax") result);
-                    }
-                    _ => unimplemented!("Unimplemented syscall arity"),
-            }
-            result
+            $crate::syscalls::spoof_syscall($ssn, $gadget, $jmp_rbx, &args)
         }
     };
 }
