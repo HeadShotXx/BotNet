@@ -205,7 +205,8 @@ pub unsafe fn find_gadget(module_base: *const u8, patterns: &[&[u8]]) -> Option<
     let dos_header = module_base as *const IMAGE_DOS_HEADER;
     let nt_headers = module_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
     let num_sections = (*nt_headers).FileHeader.NumberOfSections;
-    let sections = module_base.add((*dos_header).e_lfanew as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+    let optional_header_ptr = &(*nt_headers).OptionalHeader as *const _ as *const u8;
+    let sections = optional_header_ptr.add((*nt_headers).FileHeader.SizeOfOptionalHeader as usize) as *const IMAGE_SECTION_HEADER;
 
     for i in 0..num_sections {
         let section = *sections.add(i as usize);

