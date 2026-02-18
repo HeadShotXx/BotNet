@@ -116,7 +116,7 @@ pub struct IMAGE_SECTION_HEADER {
 
 pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000;
 
-pub unsafe fn get_ntdll_base() -> *mut core::ffi::c_void {
+pub unsafe fn get_module_base(target_name: &[u16]) -> *mut core::ffi::c_void {
     let peb: *mut u8;
     asm!("mov {}, gs:[0x60]", out(reg) peb);
 
@@ -131,15 +131,18 @@ pub unsafe fn get_ntdll_base() -> *mut core::ffi::c_void {
             ((*table_entry).BaseDllName.Length / 2) as usize
         );
 
-        let target = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let mut match_found = true;
-        if name_slice.len() == target.len() {
-            for i in 0..target.len() {
+        if name_slice.len() == target_name.len() {
+            for i in 0..target_name.len() {
                 let mut c = name_slice[i];
                 if c >= 'A' as u16 && c <= 'Z' as u16 {
                     c += 32;
                 }
-                if c != target[i] {
+                let mut t = target_name[i];
+                if t >= 'A' as u16 && t <= 'Z' as u16 {
+                    t += 32;
+                }
+                if c != t {
                     match_found = false;
                     break;
                 }
@@ -198,39 +201,26 @@ pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32>
     None
 }
 
-pub unsafe fn find_jmp_rbx_gadget(ntdll_base: *const u8) -> Option<*const u8> {
-    let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
-    let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
+pub unsafe fn find_gadget(module_base: *const u8, patterns: &[&[u8]]) -> Option<*const u8> {
+    let dos_header = module_base as *const IMAGE_DOS_HEADER;
+    let nt_headers = module_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
     let num_sections = (*nt_headers).FileHeader.NumberOfSections;
-    let sections = ntdll_base.add((*dos_header).e_lfanew as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+    let sections = module_base.add((*dos_header).e_lfanew as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
 
     for i in 0..num_sections {
         let section = *sections.add(i as usize);
         if (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 {
-            for j in 0..section.VirtualSize as usize - 2 {
-                let ptr = ntdll_base.add(section.VirtualAddress as usize + j);
-                if *ptr == 0xFF && *ptr.add(1) == 0xE3 {
-                    return Some(ptr);
-                }
-            }
-        }
-    }
-    None
-}
+            let section_start = module_base.add(section.VirtualAddress as usize);
+            let section_size = section.VirtualSize as usize;
 
-pub unsafe fn find_syscall_gadget(ntdll_base: *const u8) -> Option<*const u8> {
-    let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
-    let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
-    let num_sections = (*nt_headers).FileHeader.NumberOfSections;
-    let sections = ntdll_base.add((*dos_header).e_lfanew as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
-
-    for i in 0..num_sections {
-        let section = *sections.add(i as usize);
-        if (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 {
-            for j in 0..section.VirtualSize as usize - 3 {
-                let ptr = ntdll_base.add(section.VirtualAddress as usize + j);
-                if *ptr == 0x0F && *ptr.add(1) == 0x05 && *ptr.add(2) == 0xC3 {
-                    return Some(ptr);
+            for j in 0..section_size {
+                for pattern in patterns {
+                    if j + pattern.len() <= section_size {
+                        let ptr = section_start.add(j);
+                        if std::slice::from_raw_parts(ptr, pattern.len()) == *pattern {
+                            return Some(ptr);
+                        }
+                    }
                 }
             }
         }
