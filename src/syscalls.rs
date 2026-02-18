@@ -99,6 +99,23 @@ pub struct IMAGE_NT_HEADERS64 {
     pub OptionalHeader: IMAGE_OPTIONAL_HEADER64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct IMAGE_SECTION_HEADER {
+    pub Name: [u8; 8],
+    pub VirtualSize: u32,
+    pub VirtualAddress: u32,
+    pub SizeOfRawData: u32,
+    pub PointerToRawData: u32,
+    pub PointerToRelocations: u32,
+    pub PointerToLinenumbers: u32,
+    pub NumberOfRelocations: u16,
+    pub NumberOfLinenumbers: u16,
+    pub Characteristics: u32,
+}
+
+pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000;
+
 pub unsafe fn get_ntdll_base() -> *mut core::ffi::c_void {
     let peb: *mut u8;
     asm!("mov {}, gs:[0x60]", out(reg) peb);
@@ -184,12 +201,18 @@ pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32>
 pub unsafe fn find_jmp_rbx_gadget(ntdll_base: *const u8) -> Option<*const u8> {
     let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
     let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
-    let size_of_image = (*nt_headers).OptionalHeader.SizeOfImage as usize;
+    let num_sections = (*nt_headers).FileHeader.NumberOfSections;
+    let sections = ntdll_base.add((*dos_header).e_lfanew as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
 
-    for i in 0..size_of_image - 2 {
-        let ptr = ntdll_base.add(i);
-        if *ptr == 0xFF && *ptr.add(1) == 0xE3 {
-            return Some(ptr);
+    for i in 0..num_sections {
+        let section = *sections.add(i as usize);
+        if (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 {
+            for j in 0..section.VirtualSize as usize - 2 {
+                let ptr = ntdll_base.add(section.VirtualAddress as usize + j);
+                if *ptr == 0xFF && *ptr.add(1) == 0xE3 {
+                    return Some(ptr);
+                }
+            }
         }
     }
     None
@@ -198,12 +221,18 @@ pub unsafe fn find_jmp_rbx_gadget(ntdll_base: *const u8) -> Option<*const u8> {
 pub unsafe fn find_syscall_gadget(ntdll_base: *const u8) -> Option<*const u8> {
     let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
     let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
-    let size_of_image = (*nt_headers).OptionalHeader.SizeOfImage as usize;
+    let num_sections = (*nt_headers).FileHeader.NumberOfSections;
+    let sections = ntdll_base.add((*dos_header).e_lfanew as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
 
-    for i in 0..size_of_image - 3 {
-        let ptr = ntdll_base.add(i);
-        if *ptr == 0x0F && *ptr.add(1) == 0x05 && *ptr.add(2) == 0xC3 {
-            return Some(ptr);
+    for i in 0..num_sections {
+        let section = *sections.add(i as usize);
+        if (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 {
+            for j in 0..section.VirtualSize as usize - 3 {
+                let ptr = ntdll_base.add(section.VirtualAddress as usize + j);
+                if *ptr == 0x0F && *ptr.add(1) == 0x05 && *ptr.add(2) == 0xC3 {
+                    return Some(ptr);
+                }
+            }
         }
     }
     None
@@ -218,9 +247,6 @@ pub unsafe fn spoof_syscall(
     let mut result: NTSTATUS;
     let num_args = args.len();
 
-    // We use a fixed-size array for arguments.
-    // Index 0-3 are for registers R10, RDX, R8, R9.
-    // Index 4+ are for the stack.
     let mut stack_args = [0usize; 16];
     for i in 0..num_args {
         stack_args[i] = args[i];
@@ -228,15 +254,11 @@ pub unsafe fn spoof_syscall(
 
     let num_actual_stack_args = if num_args > 4 { num_args - 4 } else { 0 };
     let mut num_to_push = num_actual_stack_args;
-    let mut arg_offset = 24; // (4 - 1) * 8
+    let mut arg_offset = 24;
 
-    // Ensure 16-byte alignment before shadow space and return address
-    // Total pushed = 32 (regs) + num_to_push * 8 + 32 (shadow) + 8 (ret)
-    // We want (72 + num_to_push * 8) % 16 == 0 => (8 + num_to_push * 8) % 16 == 0
-    // This requires num_to_push to be odd.
     if num_to_push % 2 == 0 {
         num_to_push += 1;
-        arg_offset -= 8; // Start from index 3 (which is 0) to add padding
+        arg_offset -= 8;
     }
 
     let actual_stack_ptr = stack_args.as_ptr() as usize + arg_offset;
@@ -259,9 +281,9 @@ pub unsafe fn spoof_syscall(
         "jnz 2b",
 
         "3:",
-        "sub rsp, 0x20",      // Shadow space
-        "lea rbx, [rip + 4f]", // Real return address
-        "push {jmp_rbx}",     // Fake return address (points to jmp rbx in ntdll)
+        "sub rsp, 0x20",
+        "lea rbx, [rip + 4f]",
+        "push {jmp_rbx}",
 
         "mov r10, {arg1}",
         "mov rdx, {arg2}",
