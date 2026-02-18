@@ -104,31 +104,35 @@ pub unsafe fn get_ntdll_base() -> *mut core::ffi::c_void {
     asm!("mov {}, gs:[0x60]", out(reg) peb);
 
     let ldr = *(peb.add(0x18) as *const *mut PEB_LDR_DATA);
-    let mut current_entry = (*ldr).InLoadOrderModuleList.Flink;
+    let head = &mut (*ldr).InLoadOrderModuleList as *mut LIST_ENTRY;
+    let mut current_entry = (*head).Flink;
 
-    while current_entry != &mut (*ldr).InLoadOrderModuleList {
+    while current_entry != head {
         let table_entry = current_entry as *mut LDR_DATA_TABLE_ENTRY;
 
-        let name_slice = std::slice::from_raw_parts(
-            (*table_entry).BaseDllName.Buffer,
-            ((*table_entry).BaseDllName.Length / 2) as usize
-        );
+        let buffer = (*table_entry).BaseDllName.Buffer;
+        if !buffer.is_null() {
+            let length = ((*table_entry).BaseDllName.Length / 2) as usize;
+            let name_slice = std::slice::from_raw_parts(buffer, length);
 
-        let target = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
-        let mut match_found = true;
-        if name_slice.len() == target.len() {
-            for i in 0..target.len() {
-                let mut c = name_slice[i];
-                if c >= 'A' as u16 && c <= 'Z' as u16 {
-                    c += 32;
+            // "ntdll.dll" in lowercase
+            let target = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
+
+            if name_slice.len() == target.len() {
+                let mut match_found = true;
+                for i in 0..target.len() {
+                    let mut c = name_slice[i];
+                    if c >= 'A' as u16 && c <= 'Z' as u16 {
+                        c += 32;
+                    }
+                    if c != target[i] {
+                        match_found = false;
+                        break;
+                    }
                 }
-                if c != target[i] {
-                    match_found = false;
-                    break;
+                if match_found {
+                    return (*table_entry).DllBase;
                 }
-            }
-            if match_found {
-                return (*table_entry).DllBase;
             }
         }
 
@@ -169,6 +173,7 @@ pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32>
             let ordinal = ordinals[i];
             let function_addr = ntdll_base.add(functions[ordinal as usize] as usize);
 
+            // Check for syscall pattern
             if *function_addr == 0x4c && *function_addr.add(1) == 0x8b && *function_addr.add(2) == 0xd1 && *function_addr.add(3) == 0xb8 {
                 return Some(*(function_addr.add(4) as *const u32));
             }
@@ -230,22 +235,26 @@ pub unsafe fn spoof_syscall(
         "push rbp",
         "mov rbp, rsp",
 
-        "cmp {num_args}, 4",
+        "mov r11, {num_args}",
+        "cmp r11, 4",
         "jbe 3f",
 
-        "mov rcx, {num_args}",
-        "sub rcx, 4",
+        "sub r11, 4",
+        // Alignment check: if (num_args - 4) is odd, push an extra value for 16-byte alignment
+        "test r11, 1",
+        "jz 5f",
+        "push 0",
+        "5:",
         "2:",
-        "mov rax, [{stack_args_ptr} + rcx*8 + 24]",
+        "mov rax, [{stack_args_ptr} + r11*8 + 24]",
         "push rax",
-        "sub rcx, 1",
+        "sub r11, 1",
         "jnz 2b",
 
         "3:",
         "sub rsp, 0x20",      // Shadow space (32 bytes)
         "lea rbx, [rip + 4f]", // Real return address
-        "push {jmp_rbx}",     // Fake return address (points to jmp rbx in ntdll).
-                             // Now [RSP] = jmp_rbx, [RSP+8..0x27] = shadow, [RSP+0x28] = arg5
+        "push {jmp_rbx}",     // Fake return address
 
         "mov r10, {arg1}",
         "mov rdx, {arg2}",
@@ -271,8 +280,9 @@ pub unsafe fn spoof_syscall(
         arg3 = in(reg) stack_args[2],
         arg4 = in(reg) stack_args[3],
         lateout("rax") result,
-        out("rcx") _,
         out("r11") _,
+        out("r10") _,
+        out("rcx") _,
     );
 
     result
