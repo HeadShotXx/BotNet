@@ -227,8 +227,11 @@ pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32>
 
 pub unsafe fn find_gadget(module_base: *const u8, patterns: &[&[u8]]) -> Option<*const u8> {
     let dos_header = module_base as *const IMAGE_DOS_HEADER;
+    if (*dos_header).e_magic != IMAGE_DOS_SIGNATURE { return None; }
+
     let nt_headers = module_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
     let num_sections = (*nt_headers).FileHeader.NumberOfSections;
+
     let optional_header_ptr = &(*nt_headers).OptionalHeader as *const _ as *const u8;
     let sections = optional_header_ptr.add((*nt_headers).FileHeader.SizeOfOptionalHeader as usize) as *const IMAGE_SECTION_HEADER;
 
@@ -236,7 +239,7 @@ pub unsafe fn find_gadget(module_base: *const u8, patterns: &[&[u8]]) -> Option<
         let section = *sections.add(i as usize);
         if (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 {
             let section_start = module_base.add(section.VirtualAddress as usize);
-            let section_size = section.VirtualSize as usize;
+            let section_size = if section.VirtualSize > 0 { section.VirtualSize } else { section.SizeOfRawData } as usize;
 
             for j in 0..section_size {
                 for pattern in patterns {
@@ -269,12 +272,8 @@ pub unsafe fn spoof_syscall(
 
     let num_actual_stack_args = if num_args > 4 { num_args - 4 } else { 0 };
     let mut num_to_push = num_actual_stack_args;
-    // Ensure num_to_push is even for 16-byte stack alignment.
-    // RSP at entry: 16n + 8
-    // After 4 pushes (rsi, rdi, rbx, rbp): 16n - 24 (Aligned)
-    // After num_to_push pushes: Aligned if num_to_push is even.
-    // After shadow space (32): Aligned.
-    // After fake ret (8): 16n + 8 (Correct for ret in gadget)
+
+    // RSP alignment for x64
     if num_to_push % 2 != 0 {
         num_to_push += 1;
     }
@@ -300,9 +299,9 @@ pub unsafe fn spoof_syscall(
         "jnz 2b",
 
         "3:",
-        "sub rsp, 0x20",
-        "lea rbx, [rip + 4f]",
-        "push {jmp_rbx}",
+        "sub rsp, 0x20",      // Shadow space
+        "lea rbx, [rip + 4f]", // Real return address
+        "push {jmp_rbx}",     // Fake return address (points to gadget)
 
         "mov r10, {arg1}",
         "mov rdx, {arg2}",

