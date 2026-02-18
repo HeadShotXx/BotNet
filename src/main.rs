@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::Com::{
-    CoInitializeEx, CoCreateInstance, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoInitialize, CoCreateInstance, CLSCTX_ALL,
     IStream, CoTaskMemFree,
 };
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
@@ -171,7 +171,7 @@ fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
 
 fn main() {
     unsafe {
-        CoInitializeEx(null_mut(), COINIT_MULTITHREADED as u32);
+        CoInitialize(null_mut());
 
         let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let ntdll_base = syscalls::get_module_base(&ntdll_name);
@@ -289,7 +289,7 @@ fn main() {
                                         0,
                                         &mut write_io_status as *mut _ as usize,
                                         data_ptr as usize,
-                                        stat.cbSize as usize,
+                                        stat.cbSize as u32,
                                         &mut byte_offset as *mut _ as usize,
                                         0
                                     );

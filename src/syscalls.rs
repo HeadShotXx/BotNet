@@ -269,12 +269,16 @@ pub unsafe fn spoof_syscall(
 
     let num_actual_stack_args = if num_args > 4 { num_args - 4 } else { 0 };
     let mut num_to_push = num_actual_stack_args;
-    let mut arg_offset = 24;
-
-    if num_to_push % 2 == 0 {
+    // Ensure num_to_push is even for 16-byte stack alignment.
+    // RSP at entry: 16n + 8
+    // After 4 pushes (rsi, rdi, rbx, rbp): 16n - 24 (Aligned)
+    // After num_to_push pushes: Aligned if num_to_push is even.
+    // After shadow space (32): Aligned.
+    // After fake ret (8): 16n + 8 (Correct for ret in gadget)
+    if num_to_push % 2 != 0 {
         num_to_push += 1;
-        arg_offset -= 8;
     }
+    let arg_offset = 24;
 
     let actual_stack_ptr = stack_args.as_ptr() as usize + arg_offset;
 
