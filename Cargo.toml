@@ -16,4 +16,6 @@ windows-sys = { version = "0.52.0", features = [
     "Win32_UI_Shell",
     "Win32_System_Ole",
     "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Environment",
 ] }

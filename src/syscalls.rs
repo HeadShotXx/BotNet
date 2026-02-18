@@ -213,11 +213,12 @@ pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32>
             let ordinal = ordinals[i];
             let function_addr = ntdll_base.add(functions[ordinal as usize] as usize);
 
-            if *function_addr == 0x4c && *function_addr.add(1) == 0x8b && *function_addr.add(2) == 0xd1 && *function_addr.add(3) == 0xb8 {
-                return Some(*(function_addr.add(4) as *const u32));
-            }
-            if *function_addr == 0xb8 {
-                return Some(*(function_addr.add(1) as *const u32));
+            // Scan first 16 bytes for mov eax, SSN (b8 XX XX XX XX)
+            // This handles endbr64 and other prefixes
+            for j in 0..16 {
+                if *function_addr.add(j) == 0xb8 {
+                    return Some(*(function_addr.add(j + 1) as *const u32));
+                }
             }
         }
     }
@@ -266,6 +267,17 @@ pub unsafe fn find_gadget(module_base: *const u8, patterns: &[&[u8]]) -> Option<
 
 pub unsafe fn find_gadget_globally(patterns: &[&[u8]]) -> Option<*const u8> {
     let mut found_ptr: Option<*const u8> = None;
+
+    // First try ntdll.dll as it is most likely to have functional gadgets
+    let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
+    let ntdll_base = get_module_base(&ntdll_name);
+    if !ntdll_base.is_null() {
+        if let Some(ptr) = find_gadget(ntdll_base as *const u8, patterns) {
+            return Some(ptr);
+        }
+    }
+
+    // Fallback to other modules
     for_each_module(|base, _| {
         if let Some(ptr) = find_gadget(base as *const u8, patterns) {
             found_ptr = Some(ptr);

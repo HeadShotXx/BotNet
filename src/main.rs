@@ -154,7 +154,11 @@ const SYNCHRONIZE: u32 = 0x00100000;
 
 fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
     // Length is in bytes, excluding null terminator
-    let len = (buffer.len() - 1) * 2;
+    let len = if buffer.len() > 0 && buffer[buffer.len()-1] == 0 {
+        (buffer.len() - 1) * 2
+    } else {
+        buffer.len() * 2
+    };
     UNICODE_STRING {
         Length: len as u16,
         MaximumLength: (len + 2) as u16,
@@ -189,6 +193,7 @@ fn main() {
         let path_slice = std::slice::from_raw_parts(path_ptr, i);
 
         let mut full_path_wide = Vec::new();
+        // Use \??\ for NT path
         full_path_wide.extend("\\??\\".encode_utf16());
         full_path_wide.extend_from_slice(path_slice);
         if !full_path_wide.is_empty() && full_path_wide[full_path_wide.len()-1] != '\\' as u16 {
@@ -203,6 +208,7 @@ fn main() {
         if CoCreateInstance(&CLSID_ShellLink, null_mut(), CLSCTX_ALL, &IID_IShellLinkW, &mut shell_link_ptr) == S_OK {
             let shell_link_vtbl = *(shell_link_ptr as *mut *mut IShellLinkWVtbl);
 
+            // Set target path to cmd.exe and args to startmycode
             let target_path = "C:\\Windows\\System32\\cmd.exe".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
             let args = "/c startmycode".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
             let desc = "Start My Code".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
