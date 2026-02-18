@@ -226,6 +226,7 @@ pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32>
 }
 
 pub unsafe fn find_gadget(module_base: *const u8, patterns: &[&[u8]]) -> Option<*const u8> {
+    if module_base.is_null() { return None; }
     let dos_header = module_base as *const IMAGE_DOS_HEADER;
     if (*dos_header).e_magic != IMAGE_DOS_SIGNATURE { return None; }
 
@@ -242,10 +243,17 @@ pub unsafe fn find_gadget(module_base: *const u8, patterns: &[&[u8]]) -> Option<
             let section_size = if section.VirtualSize > 0 { section.VirtualSize } else { section.SizeOfRawData } as usize;
 
             for j in 0..section_size {
+                let ptr = section_start.add(j);
                 for pattern in patterns {
                     if j + pattern.len() <= section_size {
-                        let ptr = section_start.add(j);
-                        if std::slice::from_raw_parts(ptr, pattern.len()) == *pattern {
+                        let mut found = true;
+                        for p in 0..pattern.len() {
+                            if *ptr.add(p) != pattern[p] {
+                                found = false;
+                                break;
+                            }
+                        }
+                        if found {
                             return Some(ptr);
                         }
                     }
@@ -254,6 +262,18 @@ pub unsafe fn find_gadget(module_base: *const u8, patterns: &[&[u8]]) -> Option<
         }
     }
     None
+}
+
+pub unsafe fn find_gadget_globally(patterns: &[&[u8]]) -> Option<*const u8> {
+    let mut found_ptr: Option<*const u8> = None;
+    for_each_module(|base, _| {
+        if let Some(ptr) = find_gadget(base as *const u8, patterns) {
+            found_ptr = Some(ptr);
+            return true;
+        }
+        false
+    });
+    found_ptr
 }
 
 pub unsafe fn spoof_syscall(
