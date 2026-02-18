@@ -158,6 +158,30 @@ pub unsafe fn get_module_base(target_name: &[u16]) -> *mut core::ffi::c_void {
     core::ptr::null_mut()
 }
 
+pub unsafe fn for_each_module<F>(mut f: F)
+where F: FnMut(*mut core::ffi::c_void, &[u16]) -> bool {
+    let peb: *mut u8;
+    asm!("mov {}, gs:[0x60]", out(reg) peb);
+
+    let ldr = *(peb.add(0x18) as *const *mut PEB_LDR_DATA);
+    let mut current_entry = (*ldr).InLoadOrderModuleList.Flink;
+
+    while current_entry != &mut (*ldr).InLoadOrderModuleList {
+        let table_entry = current_entry as *mut LDR_DATA_TABLE_ENTRY;
+
+        let name_slice = std::slice::from_raw_parts(
+            (*table_entry).BaseDllName.Buffer,
+            ((*table_entry).BaseDllName.Length / 2) as usize
+        );
+
+        if f((*table_entry).DllBase, name_slice) {
+            break;
+        }
+
+        current_entry = (*current_entry).Flink;
+    }
+}
+
 pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32> {
     let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
     if (*dos_header).e_magic != IMAGE_DOS_SIGNATURE {
