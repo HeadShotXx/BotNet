@@ -99,6 +99,23 @@ pub struct IMAGE_NT_HEADERS64 {
     pub OptionalHeader: IMAGE_OPTIONAL_HEADER64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct IMAGE_SECTION_HEADER {
+    pub Name: [u8; 8],
+    pub Misc: u32,
+    pub VirtualAddress: u32,
+    pub SizeOfRawData: u32,
+    pub PointerToRawData: u32,
+    pub PointerToRelocations: u32,
+    pub PointerToLinenumbers: u32,
+    pub NumberOfRelocations: u16,
+    pub NumberOfLinenumbers: u16,
+    pub Characteristics: u32,
+}
+
+pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000;
+
 pub unsafe fn get_ntdll_base() -> *mut core::ffi::c_void {
     let peb: *mut u8;
     asm!("mov {}, gs:[0x60]", out(reg) peb);
@@ -115,7 +132,6 @@ pub unsafe fn get_ntdll_base() -> *mut core::ffi::c_void {
             let length = ((*table_entry).BaseDllName.Length / 2) as usize;
             let name_slice = std::slice::from_raw_parts(buffer, length);
 
-            // "ntdll.dll" in lowercase
             let target = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
 
             if name_slice.len() == target.len() {
@@ -173,7 +189,6 @@ pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32>
             let ordinal = ordinals[i];
             let function_addr = ntdll_base.add(functions[ordinal as usize] as usize);
 
-            // Check for syscall pattern
             if *function_addr == 0x4c && *function_addr.add(1) == 0x8b && *function_addr.add(2) == 0xd1 && *function_addr.add(3) == 0xb8 {
                 return Some(*(function_addr.add(4) as *const u32));
             }
@@ -186,32 +201,40 @@ pub unsafe fn get_ssn(ntdll_base: *const u8, function_name: &str) -> Option<u32>
     None
 }
 
-pub unsafe fn find_jmp_rbx_gadget(ntdll_base: *const u8) -> Option<*const u8> {
+pub unsafe fn find_gadget(ntdll_base: *const u8, pattern: &[u8]) -> Option<*const u8> {
     let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
-    let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
-    let size_of_image = (*nt_headers).OptionalHeader.SizeOfImage as usize;
+    if (*dos_header).e_magic != IMAGE_DOS_SIGNATURE {
+        return None;
+    }
 
-    for i in 0..size_of_image - 2 {
-        let ptr = ntdll_base.add(i);
-        if *ptr == 0xFF && *ptr.add(1) == 0xE3 {
-            return Some(ptr);
+    let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
+    let section_header = (&(*nt_headers).OptionalHeader as *const _ as *const u8)
+        .add((*nt_headers).FileHeader.SizeOfOptionalHeader as usize) as *const IMAGE_SECTION_HEADER;
+
+    for i in 0..(*nt_headers).FileHeader.NumberOfSections as usize {
+        let section = *section_header.add(i);
+        if (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 {
+            let start = ntdll_base.add(section.VirtualAddress as usize);
+            let size = section.Misc as usize; // VirtualSize
+
+            for j in 0..size - pattern.len() {
+                let ptr = start.add(j);
+                let slice = std::slice::from_raw_parts(ptr, pattern.len());
+                if slice == pattern {
+                    return Some(ptr);
+                }
+            }
         }
     }
     None
 }
 
-pub unsafe fn find_syscall_gadget(ntdll_base: *const u8) -> Option<*const u8> {
-    let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
-    let nt_headers = ntdll_base.add((*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
-    let size_of_image = (*nt_headers).OptionalHeader.SizeOfImage as usize;
+pub unsafe fn find_jmp_rbx_gadget(ntdll_base: *const u8) -> Option<*const u8> {
+    find_gadget(ntdll_base, &[0xFF, 0xE3])
+}
 
-    for i in 0..size_of_image - 3 {
-        let ptr = ntdll_base.add(i);
-        if *ptr == 0x0F && *ptr.add(1) == 0x05 && *ptr.add(2) == 0xC3 {
-            return Some(ptr);
-        }
-    }
-    None
+pub unsafe fn find_syscall_gadget(ntdll_base: *const u8) -> Option<*const u8> {
+    find_gadget(ntdll_base, &[0x0F, 0x05, 0xC3])
 }
 
 pub unsafe fn spoof_syscall(
@@ -240,7 +263,6 @@ pub unsafe fn spoof_syscall(
         "jbe 3f",
 
         "sub r11, 4",
-        // Alignment check: if (num_args - 4) is odd, push an extra value for 16-byte alignment
         "test r11, 1",
         "jz 5f",
         "push 0",
@@ -252,9 +274,9 @@ pub unsafe fn spoof_syscall(
         "jnz 2b",
 
         "3:",
-        "sub rsp, 0x20",      // Shadow space (32 bytes)
-        "lea rbx, [rip + 4f]", // Real return address
-        "push {jmp_rbx}",     // Fake return address
+        "sub rsp, 0x20",
+        "lea rbx, [rip + 4f]",
+        "push {jmp_rbx}",
 
         "mov r10, {arg1}",
         "mov rdx, {arg2}",
