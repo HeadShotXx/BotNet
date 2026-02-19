@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::System::Com::{
-    CoInitializeEx, CoCreateInstance, CLSCTX_ALL, IStream, CoTaskMemFree,
+    CoInitializeEx, CoUninitialize, CoCreateInstance, CLSCTX_ALL, IStream, CoTaskMemFree,
     COINIT_APARTMENTTHREADED,
 };
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
@@ -151,6 +151,8 @@ const FILE_OVERWRITE_IF: u32 = 0x00000005;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x00000040;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
 const SYNCHRONIZE: u32 = 0x00100000;
+const FILE_SHARE_READ: u32 = 0x00000001;
+const FILE_SHARE_WRITE: u32 = 0x00000002;
 
 fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
     // Length is in bytes, excluding null terminator
@@ -258,7 +260,7 @@ fn main() {
                                     &mut io_status as *mut _ as usize,
                                     0, // AllocationSize
                                     FILE_ATTRIBUTE_NORMAL as usize,
-                                    0, // ShareAccess
+                                    (FILE_SHARE_READ | FILE_SHARE_WRITE) as usize,
                                     FILE_OVERWRITE_IF as usize,
                                     (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as usize,
                                     0, // EaBuffer
@@ -298,5 +300,6 @@ fn main() {
             ((*shell_unknown_vtbl).Release)(shell_link_ptr);
         }
         CoTaskMemFree(path_ptr as *const _);
+        CoUninitialize();
     }
 }
