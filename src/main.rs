@@ -95,7 +95,6 @@ struct IShellLinkWVtbl {
     SetShowCmd: usize,
     GetIconLocation: usize,
     SetIconLocation: usize,
-    GetRelativePath: usize,
     SetRelativePath: usize,
     Resolve: usize,
     SetPath: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
@@ -266,8 +265,7 @@ fn main() {
 
                                 if status == 0 {
                                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
-                                    let byte_offset: i64 = 0;
-                                    let mut write_byte_offset = byte_offset; // Local copy to be sure
+                                    let mut write_byte_offset: i64 = 0;
                                     crate::syscall!(
                                         nt_write_file_ssn,
                                         syscall_gadget,
