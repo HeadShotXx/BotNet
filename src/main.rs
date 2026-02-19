@@ -122,7 +122,7 @@ struct IStreamVtbl {
     Seek: usize,
     SetSize: usize,
     CopyTo: usize,
-    Commit: usize,
+    Commit: unsafe extern "system" fn(*mut c_void, u32) -> i32,
     Revert: usize,
     LockRegion: usize,
     UnlockRegion: usize,
@@ -229,6 +229,8 @@ fn main() {
                 if CreateStreamOnHGlobal(null_mut(), 1, &mut stream) == S_OK {
                     if ((*persist_stream_vtbl).Save)(persist_stream_ptr, stream, 1) == S_OK {
                         let stream_vtbl = *(stream as *mut *mut IStreamVtbl);
+                        ((*stream_vtbl).Commit)(stream as *mut _, 0);
+
                         let mut stat = std::mem::zeroed::<STATSTG>();
                         if ((*stream_vtbl).Stat)(stream as *mut _, &mut stat, 1) == S_OK {
                             let mut hglobal: *mut c_void = null_mut();

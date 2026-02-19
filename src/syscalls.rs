@@ -309,9 +309,8 @@ pub unsafe fn spoof_syscall(
     if num_to_push % 2 != 0 {
         num_to_push += 1;
     }
-    let arg_offset = 24;
 
-    let actual_stack_ptr = stack_args.as_ptr() as usize + arg_offset;
+    let stack_base = stack_args.as_ptr();
 
     asm!(
         "push rsi",
@@ -320,29 +319,26 @@ pub unsafe fn spoof_syscall(
         "push rbp",
         "mov rbp, rsp",
 
+        // Push stack arguments from index 4 onwards
         "test {num_to_push}, {num_to_push}",
-        "jz 3f",
+        "jz 5f",
 
         "mov r11, {num_to_push}",
         "2:",
-        "mov rax, [{actual_stack_ptr} + r11*8]",
-        "push rax",
+        "mov rsi, [{stack_base} + r11*8 + 24]", // +24 because stack_base[4] is at offset 32 (3*8 + 1*8)
+        "push rsi",
         "sub r11, 1",
         "jnz 2b",
 
-        "3:",
+        "5:",
         "sub rsp, 0x20",      // Shadow space
-        "lea rbx, [rip + 4f]", // Real return address
-        "push {jmp_rbx}",     // Fake return address (points to gadget)
+        "mov rsi, {jmp_rbx}", // Load gadget addr into rsi to avoid rbx collision
+        "lea rbx, [rip + 6f]", // Real return address in rbx (for jmp rbx)
+        "push rsi",           // Push fake return address (gadget)
 
-        "mov r10, {arg1}",
-        "mov rdx, {arg2}",
-        "mov r8, {arg3}",
-        "mov r9, {arg4}",
-        "mov rax, {ssn}",
         "jmp {syscall_gadget}",
 
-        "4:",
+        "6:",
         "mov rsp, rbp",
         "pop rbp",
         "pop rbx",
@@ -350,18 +346,18 @@ pub unsafe fn spoof_syscall(
         "pop rsi",
 
         num_to_push = in(reg) num_to_push,
-        actual_stack_ptr = in(reg) actual_stack_ptr,
+        stack_base = in(reg) stack_base,
         jmp_rbx = in(reg) jmp_rbx_gadget,
-        ssn = in(reg) ssn as usize,
         syscall_gadget = in(reg) syscall_gadget,
-        arg1 = in(reg) stack_args[0],
-        arg2 = in(reg) stack_args[1],
-        arg3 = in(reg) stack_args[2],
-        arg4 = in(reg) stack_args[3],
+        in("rax") ssn as usize,
+        in("r10") stack_args[0],
+        in("rdx") stack_args[1],
+        in("r8") stack_args[2],
+        in("r9") stack_args[3],
         lateout("rax") result,
         out("rcx") _,
         out("r11") _,
-        out("r10") _,
+        out("rsi") _,
     );
 
     result
