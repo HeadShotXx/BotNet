@@ -120,13 +120,13 @@ pub unsafe fn spoof_syscall(
     asm!(
         "mov r10, rcx",
         "sub rsp, 0x60",
-        "mov [rsp + 0x20], {arg5}",
-        "mov [rsp + 0x28], {arg6}",
-        "mov [rsp + 0x30], {arg7}",
-        "mov [rsp + 0x38], {arg8}",
-        "mov [rsp + 0x40], {arg9}",
-        "mov [rsp + 0x48], {arg10}",
-        "mov [rsp + 0x50], {arg11}",
+        "mov [rsp + 0x28], {arg5}",
+        "mov [rsp + 0x30], {arg6}",
+        "mov [rsp + 0x38], {arg7}",
+        "mov [rsp + 0x40], {arg8}",
+        "mov [rsp + 0x48], {arg9}",
+        "mov [rsp + 0x50], {arg10}",
+        "mov [rsp + 0x58], {arg11}",
         "syscall",
         "add rsp, 0x60",
         in("rax") ssn as usize,
@@ -142,6 +142,9 @@ pub unsafe fn spoof_syscall(
         arg10 = in(reg) arg10,
         arg11 = in(reg) arg11,
         lateout("rax") status,
+        lateout("rcx") _,
+        lateout("r11") _,
+        out("r10") _,
     );
 
     status

@@ -19,6 +19,22 @@ const FILE_OVERWRITE_IF: u32 = 0x00000005;
 const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x00000020;
 const OBJ_CASE_INSENSITIVE: u32 = 0x00000040;
 
+#[repr(C)]
+struct OBJECT_ATTRIBUTES {
+    Length: u32,
+    RootDirectory: HANDLE,
+    ObjectName: *const UNICODE_STRING,
+    Attributes: u32,
+    SecurityDescriptor: *const c_void,
+    SecurityQualityOfService: *const c_void,
+}
+
+#[repr(C)]
+struct IO_STATUS_BLOCK {
+    Status: NTSTATUS,
+    Information: usize,
+}
+
 fn get_env_var(name: &str) -> String {
     let name_u16: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut buffer = [0u16; 1024];
@@ -43,22 +59,6 @@ unsafe fn create_unicode_string(path_u16: &[u16]) -> UNICODE_STRING {
         MaximumLength: (len + 2) as u16,
         Buffer: path_u16.as_ptr() as *mut u16,
     }
-}
-
-#[repr(C)]
-struct OBJECT_ATTRIBUTES {
-    Length: u32,
-    RootDirectory: HANDLE,
-    ObjectName: *const UNICODE_STRING,
-    Attributes: u32,
-    SecurityDescriptor: *const c_void,
-    SecurityQualityOfService: *const c_void,
-}
-
-#[repr(C)]
-struct IO_STATUS_BLOCK {
-    Status: NTSTATUS,
-    Information: usize,
 }
 
 fn read_file_syscall(path: &str) -> Vec<u8> {
@@ -90,12 +90,11 @@ fn read_file_syscall(path: &str) -> Vec<u8> {
             FILE_OPEN,
             FILE_SYNCHRONOUS_IO_NONALERT,
             null_mut::<c_void>(),
-            0
+            0u32
         );
 
         if status != 0 {
-            // STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034
-            if status as u32 != 0xC0000034 {
+            if status as u32 != 0xC0000034 { // STATUS_OBJECT_NAME_NOT_FOUND
                 println!("Failed to open file {}: status 0x{:x}", path, status);
             }
             return Vec::new();
@@ -103,6 +102,7 @@ fn read_file_syscall(path: &str) -> Vec<u8> {
 
         let mut data = Vec::new();
         let mut buffer = [0u8; 8192];
+        let mut byte_offset: i64 = 0;
         loop {
             let status = syscall!(
                 "NtReadFile",
@@ -113,7 +113,7 @@ fn read_file_syscall(path: &str) -> Vec<u8> {
                 &mut io_status,
                 buffer.as_mut_ptr(),
                 buffer.len() as u32,
-                null_mut::<c_void>(),
+                &byte_offset,
                 null_mut::<c_void>()
             );
 
@@ -121,7 +121,7 @@ fn read_file_syscall(path: &str) -> Vec<u8> {
                 if status as u32 == 0xC0000011 { // STATUS_END_OF_FILE
                     break;
                 }
-                println!("Error reading file: 0x{:x}", status);
+                println!("Error reading file {}: 0x{:x}", path, status);
                 break;
             }
 
@@ -130,6 +130,7 @@ fn read_file_syscall(path: &str) -> Vec<u8> {
             }
 
             data.extend_from_slice(&buffer[..io_status.Information]);
+            byte_offset += io_status.Information as i64;
 
             if io_status.Information < buffer.len() {
                 break;
@@ -170,7 +171,7 @@ fn write_file_syscall(path: &str, data: &[u8]) -> bool {
             FILE_OVERWRITE_IF,
             FILE_SYNCHRONOUS_IO_NONALERT,
             null_mut::<c_void>(),
-            0
+            0u32
         );
 
         if status != 0 {
@@ -178,6 +179,7 @@ fn write_file_syscall(path: &str, data: &[u8]) -> bool {
             return false;
         }
 
+        let byte_offset: i64 = 0;
         let status = syscall!(
             "NtWriteFile",
             handle,
@@ -187,12 +189,12 @@ fn write_file_syscall(path: &str, data: &[u8]) -> bool {
             &mut io_status,
             data.as_ptr(),
             data.len() as u32,
-            null_mut::<c_void>(),
+            &byte_offset,
             null_mut::<c_void>()
         );
 
         if status != 0 {
-            println!("Error writing file: 0x{:x}", status);
+            println!("Error writing file {}: 0x{:x}", path, status);
         }
 
         syscall!("NtClose", handle);
