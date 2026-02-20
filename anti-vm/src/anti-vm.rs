@@ -23,21 +23,30 @@ use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SM
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_POINTERS};
 
-/// Weights for the scoring system.
-const WEIGHT_RDTSC: u32 = 20;
-const WEIGHT_TSC_DRIFT: u32 = 25;
-const WEIGHT_EXCEPTION_LATENCY: u32 = 20;
-const WEIGHT_ACPI: u32 = 30;
-const WEIGHT_SMBIOS: u32 = 30;
-const WEIGHT_DEVICE_FILES: u32 = 35;
-const WEIGHT_SANDBOX_ENV: u32 = 15;
+/// Weights for the scoring system (Adjusted to reduce False Positives).
+const WEIGHT_RDTSC: u32 = 25;
+const WEIGHT_TSC_DRIFT: u32 = 15;
+const WEIGHT_EXCEPTION_LATENCY: u32 = 15;
+const WEIGHT_ACPI: u32 = 45;
+const WEIGHT_SMBIOS: u32 = 45;
+const WEIGHT_DEVICE_FILES: u32 = 50;
+const WEIGHT_SANDBOX_ENV: u32 = 30;
 const WEIGHT_HARDWARE_FINGERPRINT: u32 = 10;
-const WEIGHT_MOUSE_BEHAVIOR: u32 = 10;
+const WEIGHT_MOUSE_BEHAVIOR: u32 = 5;
 const WEIGHT_SYSTEM32_FOOTPRINT: u32 = 10;
 
-const THRESHOLD_VIRTUALIZED: u32 = 50;
+/// A total score of 60 ensures we need either:
+/// - One high-confidence indicator (Device, ACPI, SMBIOS) + a minor one.
+/// - Multiple medium-confidence timing indicators.
+const THRESHOLD_VIRTUALIZED: u32 = 60;
+
+fn get_median(mut samples: [u64; 50]) -> u64 {
+    samples.sort_unstable();
+    samples[25]
+}
 
 /// 1. Advanced RDTSC timing analysis.
+/// Measures the relative latency of the CPUID instruction using medians to filter noise.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn check_rdtsc_advanced() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -71,10 +80,12 @@ pub fn check_rdtsc_advanced() -> bool {
         }
     }
 
-    let avg_cpuid = cpuid_samples.iter().sum::<u64>() / 50;
-    let avg_nop = nop_samples.iter().sum::<u64>() / 50;
+    let median_cpuid = get_median(cpuid_samples);
+    let median_nop = get_median(nop_samples);
 
-    avg_cpuid > 1000 || (avg_cpuid / avg_nop.max(1)) > 40
+    // Bare metal: CPUID usually < 200 cycles, ratio < 10.
+    // VM: CPUID often > 1000 cycles, ratio > 50.
+    median_cpuid > 1200 || (median_cpuid / median_nop.max(1)) > 50
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -83,6 +94,7 @@ pub fn check_rdtsc_advanced() -> bool {
 }
 
 /// 4. TSC vs. QPC Drift Analysis.
+/// Robust against low-power and high-end hardware.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn check_tsc_drift() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -101,7 +113,7 @@ pub fn check_tsc_drift() -> bool {
         let _ = QueryPerformanceCounter(&mut qpc1);
         let t1 = _rdtsc();
         _mm_lfence();
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(200));
         _mm_lfence();
         let _ = QueryPerformanceCounter(&mut qpc2);
         let t2 = _rdtsc();
@@ -109,7 +121,9 @@ pub fn check_tsc_drift() -> bool {
         let tsc_diff = t2 - t1;
         let qpc_diff = (qpc2 - qpc1) as f64 / qpc_freq as f64;
         let tsc_freq = tsc_diff as f64 / qpc_diff;
-        tsc_freq < 1.5e9 || tsc_freq > 5.5e9
+
+        // Broad range: 0.4 GHz to 8.0 GHz.
+        tsc_freq < 0.4e9 || tsc_freq > 8.0e9
     }
 }
 
@@ -131,30 +145,41 @@ pub fn check_exception_latency() -> bool {
             let context = (*exception_info).ContextRecord;
             #[cfg(target_arch = "x86_64")]
             {
-                (*context).Rip += 2;
+                (*context).Rip += 2; // Advance past ud2
             }
             #[cfg(target_arch = "x86")]
             {
-                (*context).Eip += 2;
+                (*context).Eip += 2; // Advance past ud2
             }
             -1
         }
+
+        let mut samples = [0u64; 10];
 
         unsafe {
             let h = AddVectoredExceptionHandler(1, Some(handler));
             if h.is_null() { return false; }
 
-            _mm_lfence();
-            let t1 = _rdtsc();
-            _mm_lfence();
-            std::arch::asm!("ud2");
-            _mm_lfence();
-            let t2 = _rdtsc();
-            _mm_lfence();
+            for i in 0..10 {
+                _mm_lfence();
+                let t1 = _rdtsc();
+                _mm_lfence();
+                std::arch::asm!("ud2");
+                _mm_lfence();
+                let t2 = _rdtsc();
+                _mm_lfence();
+                samples[i] = t2 - t1;
+            }
 
             RemoveVectoredExceptionHandler(h);
-            (t2 - t1) > 100_000
         }
+
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let median = sorted[5];
+
+        // Typical VM overhead for exception context switching is very high.
+        median > 150_000
     }
     #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
     { false }
@@ -205,7 +230,8 @@ pub fn check_mouse_behavior() -> bool {
     let mut pos1 = windows::Win32::Foundation::POINT::default();
     let mut pos2 = windows::Win32::Foundation::POINT::default();
     unsafe { let _ = GetCursorPos(&mut pos1); }
-    thread::sleep(Duration::from_millis(5000));
+    // 2 seconds is more respectful for a library, but weight is reduced.
+    thread::sleep(Duration::from_millis(2000));
     unsafe { let _ = GetCursorPos(&mut pos2); }
     pos1.x == pos2.x && pos1.y == pos2.y
 }
@@ -234,8 +260,8 @@ pub fn check_sandbox_environment() -> bool {
 pub fn check_system32_footprint() -> bool {
     let sys32_path = "C:\\Windows\\System32";
     if let Ok(entries) = std::fs::read_dir(sys32_path) {
-        let count = entries.take(500).count();
-        return count < 300;
+        let count = entries.take(1000).count();
+        return count < 400;
     }
     false
 }
@@ -283,12 +309,17 @@ pub fn check_hardware_fingerprint() -> bool {
     }
 
     let mut points = 0;
+    // Resolution check: extremely common in sandboxes
     if (width > 0 && width <= 1024 && height > 0 && height <= 768) || (width == 800 && height == 600) { points += 1; }
+    // Single core: very common in CI/sandboxes
     if sys_info.dwNumberOfProcessors < 2 { points += 1; }
+    // Tiny RAM
     if mem_status.ullTotalPhys < (2 * 1024 * 1024 * 1024) { points += 1; }
+    // Tiny Disk
     if total_disk < (60 * 1024 * 1024 * 1024) { points += 1; }
 
-    points >= 2
+    // Require at least 3 indicators for hardware fingerprinting to reduce FPs on older physical PCs
+    points >= 3
 }
 
 /// 4. Enhanced artifact detection (Registry).
