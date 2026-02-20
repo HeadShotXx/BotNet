@@ -30,6 +30,8 @@ features = [
     "Win32_System_WindowsProgramming",
     "Win32_System_Performance",
     "Win32_System_Kernel",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
 ]
 
 [lib]
