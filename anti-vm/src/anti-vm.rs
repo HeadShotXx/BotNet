@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::thread;
 use std::time::{Duration};
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GENERIC_READ};
+use windows::Win32::Foundation::{GENERIC_READ, BOOL};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
 };
@@ -21,23 +21,35 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_POINTERS};
+use windows::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_POINTERS, IsDebuggerPresent, CheckRemoteDebuggerPresent, GetThreadContext, CONTEXT};
+#[cfg(target_arch = "x86_64")]
+use windows::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64 as DEBUG_REG_FLAG;
+#[cfg(target_arch = "x86")]
+use windows::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_X86 as DEBUG_REG_FLAG;
+
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
     IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
     PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
 };
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
 /// Weights for the scoring system.
 const WEIGHT_RDTSC: u32 = 25;
 const WEIGHT_TSC_DRIFT: u32 = 15;
 const WEIGHT_EXCEPTION_LATENCY: u32 = 15;
+const WEIGHT_INTERRUPT_LATENCY: u32 = 20;
 const WEIGHT_ACPI: u32 = 45;
 const WEIGHT_SMBIOS: u32 = 45;
 const WEIGHT_DEVICE_FILES: u32 = 50;
 const WEIGHT_VMWARE_PORT: u32 = 55;
 const WEIGHT_DISK_FINGERPRINT: u32 = 40;
 const WEIGHT_HYPERVISOR_SIG: u32 = 50;
+const WEIGHT_DESCRIPTOR_TABLES: u32 = 35;
+const WEIGHT_DEBUGGER: u32 = 20;
+const WEIGHT_HW_BREAKPOINTS: u32 = 30;
+const WEIGHT_LOADED_MODULES: u32 = 50;
+const WEIGHT_ENV_PURITY: u32 = 25;
 const WEIGHT_SANDBOX_ENV: u32 = 30;
 const WEIGHT_HARDWARE_FINGERPRINT: u32 = 10;
 const WEIGHT_MOUSE_BEHAVIOR: u32 = 5;
@@ -118,10 +130,43 @@ pub fn check_vmware_port() -> bool {
     { false }
 }
 
-/// 3. Disk Fingerprinting.
+/// 3. Descriptor Table Analysis.
+pub fn check_descriptor_tables() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        let mut gdt = [0u8; 10];
+        let mut idt = [0u8; 10];
+        let mut ldt: u16 = 0;
+        unsafe {
+            std::arch::asm!("sgdt [{0}]", in(reg) &mut gdt);
+            std::arch::asm!("sidt [{0}]", in(reg) &mut idt);
+            std::arch::asm!("sldt {0:e}", out(reg) ldt);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let gdt_base = u64::from_le_bytes(gdt[2..10].try_into().unwrap());
+            let idt_base = u64::from_le_bytes(idt[2..10].try_into().unwrap());
+            if gdt_base > 0xFFFFFFFFFFFF0000 || idt_base > 0xFFFFFFFFFFFF0000 || ldt != 0 {
+                return true;
+            }
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            let gdt_base = u32::from_le_bytes(gdt[2..6].try_into().unwrap());
+            let idt_base = u32::from_le_bytes(idt[2..6].try_into().unwrap());
+            if gdt_base > 0xFF000000 || idt_base > 0xFF000000 || ldt != 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 4. Disk Fingerprinting.
 pub fn check_disk_fingerprint() -> bool {
+    let drive_path = "\\\\.\\PhysicalDrive0";
     let h_drive = unsafe {
-        CreateFileW(&HSTRING::from("\\\\.\\PhysicalDrive0"), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+        CreateFileW(&HSTRING::from(drive_path), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
     };
     if let Ok(handle) = h_drive {
         if !handle.is_invalid() {
@@ -146,7 +191,7 @@ pub fn check_disk_fingerprint() -> bool {
     false
 }
 
-/// 4. Hypervisor-specific CPUID Leaf Checks.
+/// 5. Hypervisor-specific CPUID Leaf Checks.
 pub fn check_hypervisor_signature() -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -177,7 +222,7 @@ pub fn check_hypervisor_signature() -> bool {
     false
 }
 
-/// 5. TSC vs. QPC Drift Analysis.
+/// 6. TSC vs. QPC Drift Analysis.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub fn check_tsc_drift() -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -202,7 +247,46 @@ pub fn check_tsc_drift() -> bool {
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 pub fn check_tsc_drift() -> bool { false }
 
-/// 6. Exception Handling Latency Check.
+/// 7. Software Interrupt Latency Analysis.
+pub fn check_interrupt_latency() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        #[cfg(target_arch = "x86_64")]
+        use std::arch::x86_64::{_mm_lfence, _rdtsc};
+        #[cfg(target_arch = "x86")]
+        use std::arch::x86::{_mm_lfence, _rdtsc};
+
+        unsafe extern "system" fn handler(exception_info: *mut EXCEPTION_POINTERS) -> i32 {
+            let record = (*exception_info).ExceptionRecord;
+            if (*record).ExceptionCode.0 == 0x80000003u32 as i32 {
+                let context = (*exception_info).ContextRecord;
+                #[cfg(target_arch = "x86_64")] { (*context).Rip += 1; }
+                #[cfg(target_arch = "x86")] { (*context).Eip += 1; }
+                return -1; // EXCEPTION_CONTINUE_EXECUTION
+            }
+            0 // EXCEPTION_CONTINUE_SEARCH
+        }
+        let mut samples = [0u64; 10];
+        unsafe {
+            let h = AddVectoredExceptionHandler(1, Some(handler));
+            if h.is_null() { return false; }
+            for i in 0..10 {
+                _mm_lfence(); let t1 = _rdtsc(); _mm_lfence();
+                std::arch::asm!("int 3");
+                _mm_lfence(); let t2 = _rdtsc(); _mm_lfence();
+                samples[i] = t2 - t1;
+            }
+            RemoveVectoredExceptionHandler(h);
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        sorted[5] > 200_000
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    { false }
+}
+
+/// 8. Exception Handling Latency Check.
 pub fn check_exception_latency() -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -236,6 +320,54 @@ pub fn check_exception_latency() -> bool {
     { false }
 }
 
+/// 9. Loaded Modules Check.
+pub fn check_loaded_modules() -> bool {
+    let modules = ["snxhk.dll", "cmdvrt64.dll", "SbieDll.dll", "dbghelp.dll", "api_log.dll", "dir_log.dll", "pstorec.dll", "vmcheck.dll", "w03_res.dll"];
+    for m in &modules {
+        let mut name: Vec<u16> = m.encode_utf16().collect();
+        name.push(0);
+        unsafe {
+            if !GetModuleHandleW(PCWSTR(name.as_ptr())).is_err() { return true; }
+        }
+    }
+    false
+}
+
+/// 10. Environment Purity (Empty Folders, Specific files).
+pub fn check_environment_purity() -> bool {
+    if std::path::Path::new("C:\\file.exe").exists() { return true; }
+    let user_profile = std::env::var("USERPROFILE").unwrap_or_default();
+    if !user_profile.is_empty() {
+        let docs = format!("{}\\{}", user_profile, "Documents");
+        if let Ok(entries) = std::fs::read_dir(docs) {
+            if entries.count() < 3 { return true; }
+        }
+    }
+    false
+}
+
+/// 11. Debugger Detection.
+pub fn check_debugger() -> bool {
+    let mut remote_debugger = BOOL(0);
+    unsafe {
+        if IsDebuggerPresent().as_bool() { return true; }
+        let _ = CheckRemoteDebuggerPresent(windows::Win32::System::Threading::GetCurrentProcess(), &mut remote_debugger);
+    }
+    remote_debugger.as_bool()
+}
+
+/// 12. Hardware Breakpoint Detection.
+pub fn check_hw_breakpoints() -> bool {
+    let mut ctx = CONTEXT::default();
+    ctx.ContextFlags = DEBUG_REG_FLAG;
+    unsafe {
+        if GetThreadContext(windows::Win32::System::Threading::GetCurrentThread(), &mut ctx).is_ok() {
+            if ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0 { return true; }
+        }
+    }
+    false
+}
+
 /// 2. ACPI Table Detection.
 pub fn check_acpi_tables() -> bool {
     const ACPI_SIGN: FIRMWARE_TABLE_PROVIDER = FIRMWARE_TABLE_PROVIDER(u32::from_be_bytes(*b"ACPI"));
@@ -252,9 +384,7 @@ pub fn check_acpi_tables() -> bool {
             let mut table_data = vec![0u8; table_size as usize];
             unsafe { GetSystemFirmwareTable(ACPI_SIGN, table_id, Some(&mut table_data)); }
             let table_str = String::from_utf8_lossy(&table_data).to_uppercase();
-            if table_str.contains("VMWARE") || table_str.contains("VBOX") || table_str.contains("BOCHS") || table_str.contains("QEMU") {
-                return true;
-            }
+            if table_str.contains("VMWARE") || table_str.contains("VBOX") || table_str.contains("BOCHS") || table_str.contains("QEMU") { return true; }
         }
     }
     false
@@ -270,9 +400,7 @@ pub fn check_smbios_data() -> bool {
     let data_str = String::from_utf8_lossy(&buffer).to_uppercase();
     let vm_indicators = ["VMWARE", "VIRTUALBOX", "VBOX", "QEMU", "XEN", "PARALLELS", "KVM", "HYPER-V"];
     for indicator in &vm_indicators {
-        if data_str.contains(indicator) {
-            return true;
-        }
+        if data_str.contains(indicator) { return true; }
     }
     false
 }
@@ -296,7 +424,7 @@ pub fn check_sandbox_environment() -> bool {
             String::from_utf16_lossy(&buffer[..size as usize - 1]).to_uppercase()
         } else { String::new() }
     };
-    let sandbox_strings = ["WDAGUtilityAccount", "SANDBOX", "VXPBOX", "CUCKOO"];
+    let sandbox_strings = ["WDAGUtilityAccount", "SANDBOX", "VXPBOX", "CUCKOO", "EMILY", "PETER WILSON", "JOHNSON", "VIRUSTOTAL"];
     for s in &sandbox_strings {
         if username.contains(&s.to_uppercase()) { return true; }
     }
@@ -378,14 +506,20 @@ pub fn is_virtualized() -> bool {
     let checks: Vec<(&str, fn() -> bool, u32)> = vec![
         ("RDTSC Timing", check_rdtsc_advanced, WEIGHT_RDTSC),
         ("VMware Port", check_vmware_port, WEIGHT_VMWARE_PORT),
+        ("Descriptor Tables", check_descriptor_tables, WEIGHT_DESCRIPTOR_TABLES),
+        ("Debugger", check_debugger, WEIGHT_DEBUGGER),
+        ("HW Breakpoints", check_hw_breakpoints, WEIGHT_HW_BREAKPOINTS),
+        ("Loaded Modules", check_loaded_modules, WEIGHT_LOADED_MODULES),
         ("Disk Fingerprint", check_disk_fingerprint, WEIGHT_DISK_FINGERPRINT),
         ("Hypervisor Sig", check_hypervisor_signature, WEIGHT_HYPERVISOR_SIG),
         ("TSC Drift", check_tsc_drift, WEIGHT_TSC_DRIFT),
+        ("Interrupt Latency", check_interrupt_latency, WEIGHT_INTERRUPT_LATENCY),
         ("Exception Latency", check_exception_latency, WEIGHT_EXCEPTION_LATENCY),
         ("ACPI Tables", check_acpi_tables, WEIGHT_ACPI),
         ("SMBIOS Data", check_smbios_data, WEIGHT_SMBIOS),
         ("Mouse Behavior", check_mouse_behavior, WEIGHT_MOUSE_BEHAVIOR),
         ("Sandbox Env", check_sandbox_environment, WEIGHT_SANDBOX_ENV),
+        ("Env Purity", check_environment_purity, WEIGHT_ENV_PURITY),
         ("System32 Footprint", check_system32_footprint, WEIGHT_SYSTEM32_FOOTPRINT),
         ("Device Files", check_device_files, WEIGHT_DEVICE_FILES),
         ("Hardware Fingerprint", check_hardware_fingerprint, WEIGHT_HARDWARE_FINGERPRINT),
