@@ -34,7 +34,7 @@ use windows::Win32::System::Ioctl::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 
-/// Weights for the scoring system.
+/// Weights for the scoring system (Recalibrated for False Positive reduction).
 const WEIGHT_RDTSC: u32 = 25;
 const WEIGHT_TSC_DRIFT: u32 = 15;
 const WEIGHT_EXCEPTION_LATENCY: u32 = 15;
@@ -49,11 +49,11 @@ const WEIGHT_DESCRIPTOR_TABLES: u32 = 35;
 const WEIGHT_DEBUGGER: u32 = 20;
 const WEIGHT_HW_BREAKPOINTS: u32 = 30;
 const WEIGHT_LOADED_MODULES: u32 = 50;
-const WEIGHT_ENV_PURITY: u32 = 25;
+const WEIGHT_ENV_PURITY: u32 = 20;
 const WEIGHT_SANDBOX_ENV: u32 = 30;
-const WEIGHT_HARDWARE_FINGERPRINT: u32 = 10;
 const WEIGHT_MOUSE_BEHAVIOR: u32 = 5;
 const WEIGHT_SYSTEM32_FOOTPRINT: u32 = 10;
+const WEIGHT_REGISTRY_ARTIFACTS: u32 = 45;
 
 const THRESHOLD_VIRTUALIZED: u32 = 60;
 
@@ -86,7 +86,9 @@ pub fn check_rdtsc_advanced() -> bool {
     }
     let median_cpuid = get_median(cpuid_samples);
     let median_nop = get_median(nop_samples);
-    median_cpuid > 1200 || (median_cpuid / median_nop.max(1)) > 50
+    let first = cpuid_samples[0];
+    let all_same = cpuid_samples.iter().all(|&x| x == first && x != 0);
+    all_same || median_cpuid > 1200 || (median_cpuid / median_nop.max(1)) > 50
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -196,19 +198,20 @@ pub fn check_hypervisor_signature() -> bool {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         let mut ebx: u32 = 0; let mut ecx: u32 = 0; let mut edx: u32 = 0;
+        let mut eax_val: u32 = 0x40000000;
         unsafe {
             std::arch::asm!(
                 "push rbx",
-                "mov eax, 0x40000000",
                 "cpuid",
                 "mov {0:e}, ebx",
                 "pop rbx",
                 out(reg) ebx,
-                out("eax") _,
+                inout("eax") eax_val,
                 out("ecx") ecx,
                 out("edx") edx,
             );
         }
+        let _ = eax_val;
         let mut signature = [0u8; 12];
         signature[0..4].copy_from_slice(&ebx.to_le_bytes());
         signature[4..8].copy_from_slice(&ecx.to_le_bytes());
@@ -232,16 +235,21 @@ pub fn check_tsc_drift() -> bool {
     let mut qpc_freq = 0i64;
     unsafe { let _ = QueryPerformanceFrequency(&mut qpc_freq); }
     if qpc_freq == 0 { return false; }
-    let mut qpc1 = 0i64; let mut qpc2 = 0i64;
-    unsafe {
-        _mm_lfence(); let _ = QueryPerformanceCounter(&mut qpc1); let t1 = _rdtsc(); _mm_lfence();
-        thread::sleep(Duration::from_millis(200));
-        _mm_lfence(); let _ = QueryPerformanceCounter(&mut qpc2); let t2 = _rdtsc(); _mm_lfence();
-        let tsc_diff = t2 - t1;
-        let qpc_diff = (qpc2 - qpc1) as f64 / qpc_freq as f64;
-        let tsc_freq = tsc_diff as f64 / qpc_diff;
-        tsc_freq < 0.4e9 || tsc_freq > 8.0e9
+
+    let mut drift_detected = false;
+    for _ in 0..3 {
+        let mut qpc1 = 0i64; let mut qpc2 = 0i64;
+        unsafe {
+            _mm_lfence(); let _ = QueryPerformanceCounter(&mut qpc1); let t1 = _rdtsc(); _mm_lfence();
+            thread::sleep(Duration::from_millis(300));
+            _mm_lfence(); let _ = QueryPerformanceCounter(&mut qpc2); let t2 = _rdtsc(); _mm_lfence();
+            let tsc_diff = t2 - t1;
+            let qpc_diff = (qpc2 - qpc1) as f64 / qpc_freq as f64;
+            let tsc_freq = tsc_diff as f64 / qpc_diff;
+            if tsc_freq < 0.4e9 || tsc_freq > 8.0e9 { drift_detected = true; break; }
+        }
     }
+    drift_detected
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
@@ -335,15 +343,16 @@ pub fn check_loaded_modules() -> bool {
 
 /// 10. Environment Purity (Empty Folders, Specific files).
 pub fn check_environment_purity() -> bool {
-    if std::path::Path::new("C:\\file.exe").exists() { return true; }
+    let mut purity_points = 0;
+    if std::path::Path::new("C:\\file.exe").exists() { purity_points += 2; }
     let user_profile = std::env::var("USERPROFILE").unwrap_or_default();
     if !user_profile.is_empty() {
         let docs = format!("{}\\{}", user_profile, "Documents");
         if let Ok(entries) = std::fs::read_dir(docs) {
-            if entries.count() < 3 { return true; }
+            if entries.count() < 1 { purity_points += 1; }
         }
     }
-    false
+    purity_points >= 2
 }
 
 /// 11. Debugger Detection.
@@ -424,7 +433,7 @@ pub fn check_sandbox_environment() -> bool {
             String::from_utf16_lossy(&buffer[..size as usize - 1]).to_uppercase()
         } else { String::new() }
     };
-    let sandbox_strings = ["WDAGUtilityAccount", "SANDBOX", "VXPBOX", "CUCKOO", "EMILY", "PETER WILSON", "JOHNSON", "VIRUSTOTAL"];
+    let sandbox_strings = ["WDAGUtilityAccount", "SANDBOX", "VIRUSTOTAL"];
     for s in &sandbox_strings {
         if username.contains(&s.to_uppercase()) { return true; }
     }
@@ -434,8 +443,8 @@ pub fn check_sandbox_environment() -> bool {
 /// 2. Check for minimalist environment.
 pub fn check_system32_footprint() -> bool {
     if let Ok(entries) = std::fs::read_dir("C:\\Windows\\System32") {
-        let count = entries.take(1000).count();
-        return count < 400;
+        let count = entries.take(500).count();
+        return count < 250;
     }
     false
 }
@@ -457,8 +466,9 @@ pub fn check_device_files() -> bool {
     false
 }
 
-/// 4. Hardware fingerprinting.
-pub fn check_hardware_fingerprint() -> bool {
+/// 4. Hardware fingerprinting with negative scoring.
+pub fn get_hardware_score() -> i32 {
+    let mut score = 0;
     let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
     let mut sys_info = SYSTEM_INFO::default();
@@ -470,12 +480,14 @@ pub fn check_hardware_fingerprint() -> bool {
         let _ = GlobalMemoryStatusEx(&mut mem_status);
         let _ = GetDiskFreeSpaceExW(&HSTRING::from("C:\\"), None, Some(&mut total_disk), None);
     }
-    let mut points = 0;
-    if (width > 0 && width <= 1024 && height > 0 && height <= 768) || (width == 800 && height == 600) { points += 1; }
-    if sys_info.dwNumberOfProcessors < 2 { points += 1; }
-    if mem_status.ullTotalPhys < (2 * 1024 * 1024 * 1024) { points += 1; }
-    if total_disk < (60 * 1024 * 1024 * 1024) { points += 1; }
-    points >= 3
+    if (width > 0 && width <= 1024 && height > 0 && height <= 768) || (width == 800 && height == 600) { score += 10; }
+    if sys_info.dwNumberOfProcessors < 2 { score += 10; }
+    if mem_status.ullTotalPhys < (2 * 1024 * 1024 * 1024) { score += 10; }
+    if total_disk < (60 * 1024 * 1024 * 1024) { score += 10; }
+    if sys_info.dwNumberOfProcessors >= 8 { score -= 30; }
+    if mem_status.ullTotalPhys >= (16 * 1024 * 1024 * 1024) { score -= 30; }
+    if width > 1920 || height > 1080 { score -= 20; }
+    score
 }
 
 /// 4. Enhanced artifact detection (Registry).
@@ -502,7 +514,7 @@ pub fn check_registry_artifacts() -> bool {
 
 /// Central is_virtualized function using a weighted scoring system.
 pub fn is_virtualized() -> bool {
-    let mut score = 0;
+    let mut score: i32 = get_hardware_score();
     let checks: Vec<(&str, fn() -> bool, u32)> = vec![
         ("RDTSC Timing", check_rdtsc_advanced, WEIGHT_RDTSC),
         ("VMware Port", check_vmware_port, WEIGHT_VMWARE_PORT),
@@ -522,17 +534,16 @@ pub fn is_virtualized() -> bool {
         ("Env Purity", check_environment_purity, WEIGHT_ENV_PURITY),
         ("System32 Footprint", check_system32_footprint, WEIGHT_SYSTEM32_FOOTPRINT),
         ("Device Files", check_device_files, WEIGHT_DEVICE_FILES),
-        ("Hardware Fingerprint", check_hardware_fingerprint, WEIGHT_HARDWARE_FINGERPRINT),
-        ("Registry Artifacts", check_registry_artifacts, WEIGHT_SMBIOS),
+        ("Registry Artifacts", check_registry_artifacts, WEIGHT_REGISTRY_ARTIFACTS),
     ];
     let mut rng = rand::thread_rng();
     let mut indices: Vec<usize> = (0..checks.len()).collect();
     indices.shuffle(&mut rng);
     for i in indices {
         let (_name, check_fn, weight) = checks[i];
-        if check_fn() { score += weight; }
-        if score >= THRESHOLD_VIRTUALIZED { return true; }
-        thread::sleep(Duration::from_millis(rng.gen_range(50..200)));
+        if check_fn() { score += weight as i32; }
+        if score >= THRESHOLD_VIRTUALIZED as i32 { return true; }
+        thread::sleep(Duration::from_millis(rng.gen_range(50..150)));
     }
-    score >= THRESHOLD_VIRTUALIZED
+    score >= THRESHOLD_VIRTUALIZED as i32
 }
