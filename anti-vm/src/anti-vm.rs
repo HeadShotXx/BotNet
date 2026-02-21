@@ -61,6 +61,7 @@ const WEIGHT_INVALID_HANDLE: u32 = 30;
 const WEIGHT_OUTPUT_DEBUG: u32 = 15;
 const WEIGHT_TRAP_FLAG: u32 = 25;
 const WEIGHT_CODE_INTEGRITY: u32 = 40;
+const WEIGHT_MEMORY_BREAKPOINTS: u32 = 45;
 
 const THRESHOLD_VIRTUALIZED: u32 = 60;
 
@@ -527,6 +528,46 @@ pub fn check_output_debug_string() -> bool {
     }
 }
 
+/// 20. Memory Breakpoint Detection (Guard Pages).
+/// Sets a guard page on a memory region. Accessing it should trigger STATUS_GUARD_PAGE_VIOLATION.
+/// If no exception is raised, a debugger is likely intercepting it.
+pub fn check_memory_breakpoints() -> bool {
+    use windows::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_GUARD, MEM_RELEASE, PAGE_PROTECTION_FLAGS};
+
+    unsafe extern "system" fn handler(exception_info: *mut EXCEPTION_POINTERS) -> i32 {
+        if (*(*exception_info).ExceptionRecord).ExceptionCode.0 == 0x80000001u32 as i32 { // STATUS_GUARD_PAGE_VIOLATION
+            unsafe { EXCEPTION_HIT = true; }
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+
+    unsafe {
+        let buffer = VirtualAlloc(None, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if buffer.is_null() { return false; }
+
+        let mut old_protect = PAGE_PROTECTION_FLAGS(0);
+        if VirtualProtect(buffer, 4096, PAGE_READWRITE | PAGE_GUARD, &mut old_protect).is_err() {
+            let _ = VirtualFree(buffer, 0, MEM_RELEASE);
+            return false;
+        }
+
+        EXCEPTION_HIT = false;
+        let h = AddVectoredExceptionHandler(1, Some(handler));
+        if !h.is_null() {
+            // Access the guard page
+            let _val = std::ptr::read_volatile(buffer as *const u8);
+            RemoveVectoredExceptionHandler(h);
+        }
+
+        let _ = VirtualFree(buffer, 0, MEM_RELEASE);
+
+        // If EXCEPTION_HIT is true, the guard page worked correctly.
+        // If false, it was intercepted or failed to trigger.
+        !EXCEPTION_HIT
+    }
+}
+
 /// 18. Trap Flag Detection.
 /// Uses the CPU Trap Flag (TF) to detect single-step debugging.
 pub fn check_trap_flag() -> bool {
@@ -849,6 +890,7 @@ pub fn is_virtualized() -> bool {
         ("Hide Thread", check_thread_hide_from_debugger, 5),
         ("Trap Flag", check_trap_flag, WEIGHT_TRAP_FLAG),
         ("Code Integrity", check_code_integrity, WEIGHT_CODE_INTEGRITY),
+        ("Memory Breakpoints", check_memory_breakpoints, WEIGHT_MEMORY_BREAKPOINTS),
         ("Loaded Modules", check_loaded_modules, WEIGHT_LOADED_MODULES),
         ("Disk Fingerprint", check_disk_fingerprint, WEIGHT_DISK_FINGERPRINT),
         ("Hypervisor Sig", check_hypervisor_signature, WEIGHT_HYPERVISOR_SIG),
