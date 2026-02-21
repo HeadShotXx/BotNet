@@ -54,6 +54,7 @@ const WEIGHT_SANDBOX_ENV: u32 = 30;
 const WEIGHT_MOUSE_BEHAVIOR: u32 = 5;
 const WEIGHT_SYSTEM32_FOOTPRINT: u32 = 10;
 const WEIGHT_REGISTRY_ARTIFACTS: u32 = 45;
+const WEIGHT_TLB_LATENCY: u32 = 40;
 
 const THRESHOLD_VIRTUALIZED: u32 = 60;
 
@@ -449,6 +450,61 @@ pub fn check_system32_footprint() -> bool {
     false
 }
 
+/// 1. TLB Timing Test (Translation Lookaside Buffer).
+/// Measures memory translation latency which is significantly higher in virtualized environments.
+pub fn check_tlb_latency() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        #[cfg(target_arch = "x86_64")]
+        use std::arch::x86_64::{_mm_lfence, _rdtsc};
+        #[cfg(target_arch = "x86")]
+        use std::arch::x86::{_mm_lfence, _rdtsc};
+
+        use windows::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, MEM_RELEASE};
+
+        let page_size = 4096;
+        let num_pages = 1024; // 4MB to ensure spread
+        let buffer_size = num_pages * page_size;
+
+        unsafe {
+            let buffer_ptr = VirtualAlloc(None, buffer_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if buffer_ptr.is_null() { return false; }
+
+            // Warm up / Ensure mapped
+            for i in 0..num_pages {
+                std::ptr::write_volatile(buffer_ptr.cast::<u8>().add(i * page_size), 0);
+            }
+
+            let mut samples = [0u64; 100];
+            let mut rng = rand::thread_rng();
+
+            for i in 0..100 {
+                let page_idx = rng.gen_range(0..num_pages);
+                let offset = page_idx * page_size;
+                _mm_lfence();
+                let t1 = _rdtsc();
+                _mm_lfence();
+                let _val = std::ptr::read_volatile(buffer_ptr.cast::<u8>().add(offset));
+                _mm_lfence();
+                let t2 = _rdtsc();
+                _mm_lfence();
+                samples[i] = t2 - t1;
+            }
+
+            let _ = VirtualFree(buffer_ptr, 0, MEM_RELEASE);
+
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            let median = sorted[50];
+
+            // Real PC: ~50-200 cycles, VM: ~500-2000 cycles
+            median > 450
+        }
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    { false }
+}
+
 /// 3. Device file checks for VMs.
 pub fn check_device_files() -> bool {
     let devices = ["\\\\.\\VBoxGuest", "\\\\.\\VBoxPipe", "\\\\.\\HGFS", "\\\\.\\vmci"];
@@ -535,6 +591,7 @@ pub fn is_virtualized() -> bool {
         ("System32 Footprint", check_system32_footprint, WEIGHT_SYSTEM32_FOOTPRINT),
         ("Device Files", check_device_files, WEIGHT_DEVICE_FILES),
         ("Registry Artifacts", check_registry_artifacts, WEIGHT_REGISTRY_ARTIFACTS),
+        ("TLB Latency", check_tlb_latency, WEIGHT_TLB_LATENCY),
     ];
     let mut rng = rand::thread_rng();
     let mut indices: Vec<usize> = (0..checks.len()).collect();
