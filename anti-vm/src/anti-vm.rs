@@ -59,6 +59,8 @@ const WEIGHT_PEB_DEBUG: u32 = 35;
 const WEIGHT_NT_QUERY_INFO: u32 = 40;
 const WEIGHT_INVALID_HANDLE: u32 = 30;
 const WEIGHT_OUTPUT_DEBUG: u32 = 15;
+const WEIGHT_TRAP_FLAG: u32 = 25;
+const WEIGHT_CODE_INTEGRITY: u32 = 40;
 
 const THRESHOLD_VIRTUALIZED: u32 = 60;
 
@@ -116,16 +118,34 @@ pub fn check_vmware_port() -> bool {
             let h = AddVectoredExceptionHandler(1, Some(handler));
             if h.is_null() { return false; }
             let mut ebx_val: u64 = 0;
+            #[cfg(target_arch = "x86_64")]
             std::arch::asm!(
-                "push rbx",
+                "mov {1}, rbx",
                 "mov eax, 0x564D5868",
-                "mov ebx, 0x0",
+                "xor ebx, ebx",
                 "mov ecx, 0xA",
                 "mov edx, 0x5658",
                 "in eax, dx",
                 "mov {0}, rbx",
-                "pop rbx",
+                "mov rbx, {1}",
                 out(reg) ebx_val,
+                out(reg) _,
+                out("eax") _,
+                out("ecx") _,
+                out("edx") _,
+            );
+            #[cfg(target_arch = "x86")]
+            std::arch::asm!(
+                "mov {1}, ebx",
+                "mov eax, 0x564D5868",
+                "xor ebx, ebx",
+                "mov ecx, 0xA",
+                "mov edx, 0x5658",
+                "in eax, dx",
+                "mov {0}, ebx",
+                "mov ebx, {1}",
+                out(reg) ebx_val,
+                out(reg) _,
                 out("eax") _,
                 out("ecx") _,
                 out("edx") _,
@@ -373,12 +393,18 @@ pub fn check_debugger() -> bool {
 }
 
 /// 12. Hardware Breakpoint Detection.
+/// Inspects DR0-DR3 (addresses), DR6 (status), and DR7 (control).
 pub fn check_hw_breakpoints() -> bool {
     let mut ctx = CONTEXT::default();
     ctx.ContextFlags = DEBUG_REG_FLAG;
     unsafe {
         if GetThreadContext(windows::Win32::System::Threading::GetCurrentThread(), &mut ctx).is_ok() {
-            if ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0 { return true; }
+            // DR0-DR3 are breakpoint addresses.
+            // DR6 is status, DR7 is control.
+            // In a normal system, these should typically be 0.
+            if ctx.Dr0 != 0 || ctx.Dr1 != 0 || ctx.Dr2 != 0 || ctx.Dr3 != 0 || ctx.Dr6 != 0 || (ctx.Dr7 != 0 && ctx.Dr7 != 0x400) {
+                return true;
+            }
         }
     }
     false
@@ -499,6 +525,122 @@ pub fn check_output_debug_string() -> bool {
         OutputDebugStringW(PCWSTR("Anti-Debug\0".encode_utf16().collect::<Vec<u16>>().as_ptr()));
         GetLastError().0 != 0xDEADBEEF
     }
+}
+
+/// 18. Trap Flag Detection.
+/// Uses the CPU Trap Flag (TF) to detect single-step debugging.
+pub fn check_trap_flag() -> bool {
+    unsafe extern "system" fn handler(exception_info: *mut EXCEPTION_POINTERS) -> i32 {
+        if (*(*exception_info).ExceptionRecord).ExceptionCode.0 == 0x80000004u32 as i32 {
+            unsafe { EXCEPTION_HIT = true; }
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+
+    unsafe {
+        EXCEPTION_HIT = false;
+        let h = AddVectoredExceptionHandler(1, Some(handler));
+        if !h.is_null() {
+            #[cfg(target_arch = "x86_64")]
+            std::arch::asm!(
+                "pushfq",
+                "or qword ptr [rsp], 0x100",
+                "popfq",
+                "nop",
+            );
+            #[cfg(target_arch = "x86")]
+            std::arch::asm!(
+                "pushfd",
+                "or dword ptr [esp], 0x100",
+                "popfd",
+                "nop",
+            );
+            RemoveVectoredExceptionHandler(h);
+        }
+        // If EXCEPTION_HIT is true, it means our VEH caught the single-step.
+        // If a debugger intercepted it, EXCEPTION_HIT might be false.
+        !EXCEPTION_HIT
+    }
+}
+
+/// 19. Code Integrity Self-Check.
+/// Detects if a debugger has patched the .text section with software breakpoints (0xCC).
+#[allow(non_snake_case)]
+#[allow(dead_code)]
+pub fn check_code_integrity() -> bool {
+    #[repr(C)]
+    struct IMAGE_DOS_HEADER {
+        e_magic: u16, e_cblp: u16, e_cp: u16, e_crlc: u16, e_cparhdr: u16, e_minalloc: u16, e_maxalloc: u16,
+        e_ss: u16, e_sp: u16, e_csum: u16, e_ip: u16, e_cs: u16, e_lfarlc: u16, e_ovno: u16,
+        e_res: [u16; 4], e_oemid: u16, e_oeminfo: u16, e_res2: [u16; 10], e_lfanew: i32,
+    }
+
+    #[repr(C)]
+    struct IMAGE_FILE_HEADER {
+        Machine: u16, NumberOfSections: u16, TimeDateStamp: u32, PointerToSymbolTable: u32,
+        NumberOfSymbols: u32, SizeOfOptionalHeader: u16, Characteristics: u16,
+    }
+
+    #[repr(C)]
+    struct IMAGE_DATA_DIRECTORY { VirtualAddress: u32, Size: u32 }
+
+    #[repr(C)]
+    struct IMAGE_OPTIONAL_HEADER64 {
+        Magic: u16, MajorLinkerVersion: u8, MinorLinkerVersion: u8, SizeOfCode: u32,
+        SizeOfInitializedData: u32, SizeOfUninitializedData: u32, AddressOfEntryPoint: u32,
+        BaseOfCode: u32, ImageBase: u64, SectionAlignment: u32, FileAlignment: u32,
+        MajorOperatingSystemVersion: u16, MinorOperatingSystemVersion: u16,
+        MajorImageVersion: u16, MinorImageVersion: u16, MajorSubsystemVersion: u16,
+        MinorSubsystemVersion: u16, Win32VersionValue: u32, SizeOfImage: u32,
+        SizeOfHeaders: u32, CheckSum: u32, Subsystem: u16, DllCharacteristics: u16,
+        SizeOfStackReserve: u64, SizeOfStackCommit: u64, SizeOfHeapReserve: u64,
+        SizeOfHeapCommit: u64, LoaderFlags: u32, NumberOfRvaAndSizes: u32,
+        DataDirectory: [IMAGE_DATA_DIRECTORY; 16],
+    }
+
+    #[repr(C)]
+    struct IMAGE_NT_HEADERS64 { Signature: u32, FileHeader: IMAGE_FILE_HEADER, OptionalHeader: IMAGE_OPTIONAL_HEADER64 }
+
+    #[repr(C)]
+    struct IMAGE_SECTION_HEADER {
+        Name: [u8; 8], VirtualSize: u32, VirtualAddress: u32, SizeOfRawData: u32,
+        PointerToRawData: u32, PointerToRelocations: u32, PointerToLinenumbers: u32,
+        NumberOfRelocations: u16, NumberOfLinenumbers: u16, Characteristics: u32,
+    }
+
+    unsafe {
+        let h_module = GetModuleHandleW(None).unwrap_or_default();
+        if h_module.is_invalid() { return false; }
+
+        let base_addr = h_module.0 as *const u8;
+        let dos_header = &*(base_addr as *const IMAGE_DOS_HEADER);
+        if dos_header.e_magic != 0x5A4D { return false; }
+
+        let nt_headers = &*(base_addr.add(dos_header.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
+        if nt_headers.Signature != 0x4550 { return false; }
+
+        let section_header_ptr = base_addr.add(dos_header.e_lfanew as usize + 4 + std::mem::size_of::<IMAGE_FILE_HEADER>() + nt_headers.FileHeader.SizeOfOptionalHeader as usize) as *const IMAGE_SECTION_HEADER;
+        let num_sections = nt_headers.FileHeader.NumberOfSections;
+
+        for i in 0..num_sections {
+            let section = &*(section_header_ptr.add(i as usize));
+            let name = String::from_utf8_lossy(&section.Name).to_string();
+            if name.starts_with(".text") {
+                let start = base_addr.add(section.VirtualAddress as usize);
+                let size = section.VirtualSize as usize;
+
+                let mut int3_count = 0;
+                for j in 0..size {
+                    if *start.add(j) == 0xCC {
+                        int3_count += 1;
+                    }
+                }
+                if int3_count > 0 { return true; }
+            }
+        }
+    }
+    false
 }
 
 /// 2. ACPI Table Detection.
@@ -705,6 +847,8 @@ pub fn is_virtualized() -> bool {
         ("Invalid Handle", check_invalid_handle, WEIGHT_INVALID_HANDLE),
         ("OutputDebugString", check_output_debug_string, WEIGHT_OUTPUT_DEBUG),
         ("Hide Thread", check_thread_hide_from_debugger, 5),
+        ("Trap Flag", check_trap_flag, WEIGHT_TRAP_FLAG),
+        ("Code Integrity", check_code_integrity, WEIGHT_CODE_INTEGRITY),
         ("Loaded Modules", check_loaded_modules, WEIGHT_LOADED_MODULES),
         ("Disk Fingerprint", check_disk_fingerprint, WEIGHT_DISK_FINGERPRINT),
         ("Hypervisor Sig", check_hypervisor_signature, WEIGHT_HYPERVISOR_SIG),
