@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::thread;
 use std::time::{Duration};
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{GENERIC_READ, BOOL};
+use windows::Win32::Foundation::{GENERIC_READ, BOOL, HANDLE, CloseHandle, SetLastError, GetLastError};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ,
 };
@@ -21,7 +21,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_POINTERS, IsDebuggerPresent, CheckRemoteDebuggerPresent, GetThreadContext, CONTEXT};
+use windows::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, RemoveVectoredExceptionHandler, EXCEPTION_POINTERS, IsDebuggerPresent, CheckRemoteDebuggerPresent, GetThreadContext, CONTEXT, OutputDebugStringW};
 #[cfg(target_arch = "x86_64")]
 use windows::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64 as DEBUG_REG_FLAG;
 #[cfg(target_arch = "x86")]
@@ -32,7 +32,7 @@ use windows::Win32::System::Ioctl::{
     IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY, StorageDeviceProperty,
     PropertyStandardQuery, STORAGE_DEVICE_DESCRIPTOR,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 /// Weights for the scoring system (Recalibrated for False Positive reduction).
 const WEIGHT_RDTSC: u32 = 25;
@@ -55,8 +55,14 @@ const WEIGHT_MOUSE_BEHAVIOR: u32 = 5;
 const WEIGHT_SYSTEM32_FOOTPRINT: u32 = 10;
 const WEIGHT_REGISTRY_ARTIFACTS: u32 = 45;
 const WEIGHT_TLB_LATENCY: u32 = 40;
+const WEIGHT_PEB_DEBUG: u32 = 35;
+const WEIGHT_NT_QUERY_INFO: u32 = 40;
+const WEIGHT_INVALID_HANDLE: u32 = 30;
+const WEIGHT_OUTPUT_DEBUG: u32 = 15;
 
 const THRESHOLD_VIRTUALIZED: u32 = 60;
+
+static mut EXCEPTION_HIT: bool = false;
 
 fn get_median(mut samples: [u64; 50]) -> u64 {
     samples.sort_unstable();
@@ -179,7 +185,7 @@ pub fn check_disk_fingerprint() -> bool {
             let success = unsafe {
                 DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, Some(&query as *const _ as *const c_void), std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32, Some(descriptor.as_mut_ptr() as *mut c_void), descriptor.len() as u32, Some(&mut bytes_returned), None)
             };
-            unsafe { let _ = windows::Win32::Foundation::CloseHandle(handle); }
+            unsafe { let _ = CloseHandle(handle); }
             if success.is_ok() {
                 let dev_desc = unsafe { &*(descriptor.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
                 if dev_desc.ProductIdOffset != 0 {
@@ -378,6 +384,123 @@ pub fn check_hw_breakpoints() -> bool {
     false
 }
 
+/// 13. PEB-based Debugger Detection (BeingDebugged & NtGlobalFlag).
+pub fn check_peb_debugger() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut being_debugged: u8 = 0;
+        let mut nt_global_flag: u32 = 0;
+        unsafe {
+            std::arch::asm!(
+                "mov rax, gs:[0x60]",
+                "mov {0}, byte ptr [rax + 0x02]",
+                "mov {1:e}, dword ptr [rax + 0xBC]",
+                out(reg_byte) being_debugged,
+                out(reg) nt_global_flag,
+                out("rax") _,
+            );
+        }
+        if being_debugged != 0 { return true; }
+        // FLG_HEAP_ENABLE_TAIL_CHECK | FLG_HEAP_ENABLE_FREE_CHECK | FLG_HEAP_VALIDATE_PARAMETERS
+        if (nt_global_flag & 0x70) != 0 { return true; }
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        let mut being_debugged: u8 = 0;
+        let mut nt_global_flag: u32 = 0;
+        unsafe {
+            std::arch::asm!(
+                "mov eax, fs:[0x30]",
+                "mov {0}, byte ptr [eax + 0x02]",
+                "mov {1:e}, dword ptr [eax + 0x68]",
+                out(reg_byte) being_debugged,
+                out(reg) nt_global_flag,
+                out("eax") _,
+            );
+        }
+        if being_debugged != 0 { return true; }
+        if (nt_global_flag & 0x70) != 0 { return true; }
+    }
+    false
+}
+
+/// 14. NtQueryInformationProcess checks.
+pub fn check_nt_query_info_process() -> bool {
+    type NtQueryInformationProcessFn = unsafe extern "system" fn(
+        HANDLE, u32, *mut c_void, u32, *mut u32
+    ) -> i32;
+
+    let ntdll = unsafe { GetModuleHandleW(PCWSTR("ntdll.dll\0".encode_utf16().collect::<Vec<u16>>().as_ptr())).unwrap_or_default() };
+    if ntdll.is_invalid() { return false; }
+
+    let nt_query_info_ptr = unsafe { GetProcAddress(ntdll, windows::core::PCSTR("NtQueryInformationProcess\0".as_ptr())) };
+    if let Some(nt_query_info_addr) = nt_query_info_ptr {
+        let nt_query_info: NtQueryInformationProcessFn = unsafe { std::mem::transmute(nt_query_info_addr) };
+
+        let mut debug_port: usize = 0;
+        let mut status = unsafe { nt_query_info(windows::Win32::System::Threading::GetCurrentProcess(), 7, &mut debug_port as *mut _ as *mut c_void, std::mem::size_of::<usize>() as u32, std::ptr::null_mut()) };
+        if status == 0 && debug_port != 0 { return true; }
+
+        let mut debug_object: HANDLE = HANDLE(0);
+        status = unsafe { nt_query_info(windows::Win32::System::Threading::GetCurrentProcess(), 30, &mut debug_object as *mut _ as *mut c_void, std::mem::size_of::<HANDLE>() as u32, std::ptr::null_mut()) };
+        if status == 0 && !debug_object.is_invalid() { return true; }
+
+        let mut debug_flags: u32 = 0;
+        status = unsafe { nt_query_info(windows::Win32::System::Threading::GetCurrentProcess(), 31, &mut debug_flags as *mut _ as *mut c_void, 4, std::ptr::null_mut()) };
+        if status == 0 && debug_flags == 0 { return true; }
+    }
+    false
+}
+
+/// 15. ThreadHideFromDebugger check.
+pub fn check_thread_hide_from_debugger() -> bool {
+    type NtSetInformationThreadFn = unsafe extern "system" fn(
+        HANDLE, u32, *mut c_void, u32
+    ) -> i32;
+
+    let ntdll = unsafe { GetModuleHandleW(PCWSTR("ntdll.dll\0".encode_utf16().collect::<Vec<u16>>().as_ptr())).unwrap_or_default() };
+    if ntdll.is_invalid() { return false; }
+
+    let nt_set_info_ptr = unsafe { GetProcAddress(ntdll, windows::core::PCSTR("NtSetInformationThread\0".as_ptr())) };
+    if let Some(nt_set_info_addr) = nt_set_info_ptr {
+        let nt_set_info: NtSetInformationThreadFn = unsafe { std::mem::transmute(nt_set_info_addr) };
+        // ThreadHideFromDebugger = 0x11
+        let status = unsafe { nt_set_info(windows::Win32::System::Threading::GetCurrentThread(), 0x11, std::ptr::null_mut(), 0) };
+        return status >= 0;
+    }
+    false
+}
+
+/// 16. Invalid Handle check.
+pub fn check_invalid_handle() -> bool {
+    unsafe extern "system" fn handler(exception_info: *mut EXCEPTION_POINTERS) -> i32 {
+        if (*(*exception_info).ExceptionRecord).ExceptionCode.0 == 0xC0000008u32 as i32 {
+            unsafe { EXCEPTION_HIT = true; }
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+
+    unsafe {
+        EXCEPTION_HIT = false;
+        let h = AddVectoredExceptionHandler(1, Some(handler));
+        if !h.is_null() {
+            let _ = CloseHandle(HANDLE(0xBAADF00D));
+            RemoveVectoredExceptionHandler(h);
+        }
+        EXCEPTION_HIT
+    }
+}
+
+/// 17. OutputDebugString check.
+pub fn check_output_debug_string() -> bool {
+    unsafe {
+        SetLastError(windows::Win32::Foundation::WIN32_ERROR(0xDEADBEEF));
+        OutputDebugStringW(PCWSTR("Anti-Debug\0".encode_utf16().collect::<Vec<u16>>().as_ptr()));
+        GetLastError().0 != 0xDEADBEEF
+    }
+}
+
 /// 2. ACPI Table Detection.
 pub fn check_acpi_tables() -> bool {
     const ACPI_SIGN: FIRMWARE_TABLE_PROVIDER = FIRMWARE_TABLE_PROVIDER(u32::from_be_bytes(*b"ACPI"));
@@ -514,7 +637,7 @@ pub fn check_device_files() -> bool {
         };
         if let Ok(handle) = h_file {
             if !handle.is_invalid() {
-                unsafe { let _ = windows::Win32::Foundation::CloseHandle(handle); }
+                unsafe { let _ = CloseHandle(handle); }
                 return true;
             }
         }
@@ -577,6 +700,11 @@ pub fn is_virtualized() -> bool {
         ("Descriptor Tables", check_descriptor_tables, WEIGHT_DESCRIPTOR_TABLES),
         ("Debugger", check_debugger, WEIGHT_DEBUGGER),
         ("HW Breakpoints", check_hw_breakpoints, WEIGHT_HW_BREAKPOINTS),
+        ("PEB Debugger", check_peb_debugger, WEIGHT_PEB_DEBUG),
+        ("NtQueryInfo", check_nt_query_info_process, WEIGHT_NT_QUERY_INFO),
+        ("Invalid Handle", check_invalid_handle, WEIGHT_INVALID_HANDLE),
+        ("OutputDebugString", check_output_debug_string, WEIGHT_OUTPUT_DEBUG),
+        ("Hide Thread", check_thread_hide_from_debugger, 5),
         ("Loaded Modules", check_loaded_modules, WEIGHT_LOADED_MODULES),
         ("Disk Fingerprint", check_disk_fingerprint, WEIGHT_DISK_FINGERPRINT),
         ("Hypervisor Sig", check_hypervisor_signature, WEIGHT_HYPERVISOR_SIG),
