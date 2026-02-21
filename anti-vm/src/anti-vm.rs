@@ -62,6 +62,7 @@ const WEIGHT_OUTPUT_DEBUG: u32 = 15;
 const WEIGHT_TRAP_FLAG: u32 = 25;
 const WEIGHT_CODE_INTEGRITY: u32 = 40;
 const WEIGHT_MEMORY_BREAKPOINTS: u32 = 45;
+const WEIGHT_NTDLL_HOOKS: u32 = 50;
 
 const THRESHOLD_VIRTUALIZED: u32 = 60;
 
@@ -70,6 +71,58 @@ static mut EXCEPTION_HIT: bool = false;
 fn get_median(mut samples: [u64; 50]) -> u64 {
     samples.sort_unstable();
     samples[25]
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+#[allow(dead_code)]
+struct IMAGE_DOS_HEADER {
+    e_magic: u16, e_cblp: u16, e_cp: u16, e_crlc: u16, e_cparhdr: u16, e_minalloc: u16, e_maxalloc: u16,
+    e_ss: u16, e_sp: u16, e_csum: u16, e_ip: u16, e_cs: u16, e_lfarlc: u16, e_ovno: u16,
+    e_res: [u16; 4], e_oemid: u16, e_oeminfo: u16, e_res2: [u16; 10], e_lfanew: i32,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+#[allow(dead_code)]
+struct IMAGE_FILE_HEADER {
+    Machine: u16, NumberOfSections: u16, TimeDateStamp: u32, PointerToSymbolTable: u32,
+    NumberOfSymbols: u32, SizeOfOptionalHeader: u16, Characteristics: u16,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+#[allow(dead_code)]
+struct IMAGE_DATA_DIRECTORY { VirtualAddress: u32, Size: u32 }
+
+#[repr(C)]
+#[allow(non_snake_case)]
+#[allow(dead_code)]
+struct IMAGE_OPTIONAL_HEADER64 {
+    Magic: u16, MajorLinkerVersion: u8, MinorLinkerVersion: u8, SizeOfCode: u32,
+    SizeOfInitializedData: u32, SizeOfUninitializedData: u32, AddressOfEntryPoint: u32,
+    BaseOfCode: u32, ImageBase: u64, SectionAlignment: u32, FileAlignment: u32,
+    MajorOperatingSystemVersion: u16, MinorOperatingSystemVersion: u16,
+    MajorImageVersion: u16, MinorImageVersion: u16, MajorSubsystemVersion: u16,
+    MinorSubsystemVersion: u16, Win32VersionValue: u32, SizeOfImage: u32,
+    SizeOfHeaders: u32, CheckSum: u32, Subsystem: u16, DllCharacteristics: u16,
+    SizeOfStackReserve: u64, SizeOfStackCommit: u64, SizeOfHeapReserve: u64,
+    SizeOfHeapCommit: u64, LoaderFlags: u32, NumberOfRvaAndSizes: u32,
+    DataDirectory: [IMAGE_DATA_DIRECTORY; 16],
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+#[allow(dead_code)]
+struct IMAGE_NT_HEADERS64 { Signature: u32, FileHeader: IMAGE_FILE_HEADER, OptionalHeader: IMAGE_OPTIONAL_HEADER64 }
+
+#[repr(C)]
+#[allow(non_snake_case)]
+#[allow(dead_code)]
+struct IMAGE_SECTION_HEADER {
+    Name: [u8; 8], VirtualSize: u32, VirtualAddress: u32, SizeOfRawData: u32,
+    PointerToRawData: u32, PointerToRelocations: u32, PointerToLinenumbers: u32,
+    NumberOfRelocations: u16, NumberOfLinenumbers: u16, Characteristics: u32,
 }
 
 /// 1. Advanced RDTSC timing analysis.
@@ -528,46 +581,6 @@ pub fn check_output_debug_string() -> bool {
     }
 }
 
-/// 20. Memory Breakpoint Detection (Guard Pages).
-/// Sets a guard page on a memory region. Accessing it should trigger STATUS_GUARD_PAGE_VIOLATION.
-/// If no exception is raised, a debugger is likely intercepting it.
-pub fn check_memory_breakpoints() -> bool {
-    use windows::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_GUARD, MEM_RELEASE, PAGE_PROTECTION_FLAGS};
-
-    unsafe extern "system" fn handler(exception_info: *mut EXCEPTION_POINTERS) -> i32 {
-        if (*(*exception_info).ExceptionRecord).ExceptionCode.0 == 0x80000001u32 as i32 { // STATUS_GUARD_PAGE_VIOLATION
-            unsafe { EXCEPTION_HIT = true; }
-            return -1; // EXCEPTION_CONTINUE_EXECUTION
-        }
-        0 // EXCEPTION_CONTINUE_SEARCH
-    }
-
-    unsafe {
-        let buffer = VirtualAlloc(None, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        if buffer.is_null() { return false; }
-
-        let mut old_protect = PAGE_PROTECTION_FLAGS(0);
-        if VirtualProtect(buffer, 4096, PAGE_READWRITE | PAGE_GUARD, &mut old_protect).is_err() {
-            let _ = VirtualFree(buffer, 0, MEM_RELEASE);
-            return false;
-        }
-
-        EXCEPTION_HIT = false;
-        let h = AddVectoredExceptionHandler(1, Some(handler));
-        if !h.is_null() {
-            // Access the guard page
-            let _val = std::ptr::read_volatile(buffer as *const u8);
-            RemoveVectoredExceptionHandler(h);
-        }
-
-        let _ = VirtualFree(buffer, 0, MEM_RELEASE);
-
-        // If EXCEPTION_HIT is true, the guard page worked correctly.
-        // If false, it was intercepted or failed to trigger.
-        !EXCEPTION_HIT
-    }
-}
-
 /// 18. Trap Flag Detection.
 /// Uses the CPU Trap Flag (TF) to detect single-step debugging.
 pub fn check_trap_flag() -> bool {
@@ -610,46 +623,6 @@ pub fn check_trap_flag() -> bool {
 #[allow(non_snake_case)]
 #[allow(dead_code)]
 pub fn check_code_integrity() -> bool {
-    #[repr(C)]
-    struct IMAGE_DOS_HEADER {
-        e_magic: u16, e_cblp: u16, e_cp: u16, e_crlc: u16, e_cparhdr: u16, e_minalloc: u16, e_maxalloc: u16,
-        e_ss: u16, e_sp: u16, e_csum: u16, e_ip: u16, e_cs: u16, e_lfarlc: u16, e_ovno: u16,
-        e_res: [u16; 4], e_oemid: u16, e_oeminfo: u16, e_res2: [u16; 10], e_lfanew: i32,
-    }
-
-    #[repr(C)]
-    struct IMAGE_FILE_HEADER {
-        Machine: u16, NumberOfSections: u16, TimeDateStamp: u32, PointerToSymbolTable: u32,
-        NumberOfSymbols: u32, SizeOfOptionalHeader: u16, Characteristics: u16,
-    }
-
-    #[repr(C)]
-    struct IMAGE_DATA_DIRECTORY { VirtualAddress: u32, Size: u32 }
-
-    #[repr(C)]
-    struct IMAGE_OPTIONAL_HEADER64 {
-        Magic: u16, MajorLinkerVersion: u8, MinorLinkerVersion: u8, SizeOfCode: u32,
-        SizeOfInitializedData: u32, SizeOfUninitializedData: u32, AddressOfEntryPoint: u32,
-        BaseOfCode: u32, ImageBase: u64, SectionAlignment: u32, FileAlignment: u32,
-        MajorOperatingSystemVersion: u16, MinorOperatingSystemVersion: u16,
-        MajorImageVersion: u16, MinorImageVersion: u16, MajorSubsystemVersion: u16,
-        MinorSubsystemVersion: u16, Win32VersionValue: u32, SizeOfImage: u32,
-        SizeOfHeaders: u32, CheckSum: u32, Subsystem: u16, DllCharacteristics: u16,
-        SizeOfStackReserve: u64, SizeOfStackCommit: u64, SizeOfHeapReserve: u64,
-        SizeOfHeapCommit: u64, LoaderFlags: u32, NumberOfRvaAndSizes: u32,
-        DataDirectory: [IMAGE_DATA_DIRECTORY; 16],
-    }
-
-    #[repr(C)]
-    struct IMAGE_NT_HEADERS64 { Signature: u32, FileHeader: IMAGE_FILE_HEADER, OptionalHeader: IMAGE_OPTIONAL_HEADER64 }
-
-    #[repr(C)]
-    struct IMAGE_SECTION_HEADER {
-        Name: [u8; 8], VirtualSize: u32, VirtualAddress: u32, SizeOfRawData: u32,
-        PointerToRawData: u32, PointerToRelocations: u32, PointerToLinenumbers: u32,
-        NumberOfRelocations: u16, NumberOfLinenumbers: u16, Characteristics: u32,
-    }
-
     unsafe {
         let h_module = GetModuleHandleW(None).unwrap_or_default();
         if h_module.is_invalid() { return false; }
@@ -682,6 +655,109 @@ pub fn check_code_integrity() -> bool {
         }
     }
     false
+}
+
+/// 20. Memory Breakpoint Detection (Guard Pages).
+/// Sets a guard page on a memory region. Accessing it should trigger STATUS_GUARD_PAGE_VIOLATION.
+/// If no exception is raised, a debugger is likely intercepting it.
+pub fn check_memory_breakpoints() -> bool {
+    use windows::Win32::System::Memory::{VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, PAGE_GUARD, MEM_RELEASE, PAGE_PROTECTION_FLAGS};
+
+    unsafe extern "system" fn handler(exception_info: *mut EXCEPTION_POINTERS) -> i32 {
+        if (*(*exception_info).ExceptionRecord).ExceptionCode.0 == 0x80000001u32 as i32 { // STATUS_GUARD_PAGE_VIOLATION
+            unsafe { EXCEPTION_HIT = true; }
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+
+    unsafe {
+        let buffer = VirtualAlloc(None, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if buffer.is_null() { return false; }
+
+        let mut old_protect = PAGE_PROTECTION_FLAGS(0);
+        if VirtualProtect(buffer, 4096, PAGE_READWRITE | PAGE_GUARD, &mut old_protect).is_err() {
+            let _ = VirtualFree(buffer, 0, MEM_RELEASE);
+            return false;
+        }
+
+        EXCEPTION_HIT = false;
+        let h = AddVectoredExceptionHandler(1, Some(handler));
+        if !h.is_null() {
+            // Access the guard page
+            let _val = std::ptr::read_volatile(buffer as *const u8);
+            RemoveVectoredExceptionHandler(h);
+        }
+
+        let _ = VirtualFree(buffer, 0, MEM_RELEASE);
+
+        // If EXCEPTION_HIT is true, the guard page worked correctly.
+        // If false, it was intercepted or failed to trigger.
+        !EXCEPTION_HIT
+    }
+}
+
+/// 21. ntdll Integrity Check (Hook Detection).
+/// Manually walks ntdll exports and checks for JMP/inline hooks on critical syscall stubs.
+#[allow(non_snake_case)]
+pub fn check_ntdll_hooks() -> bool {
+    #[repr(C)]
+    struct IMAGE_EXPORT_DIRECTORY {
+        Characteristics: u32, TimeDateStamp: u32, MajorVersion: u16, MinorVersion: u16,
+        Name: u32, Base: u32, NumberOfFunctions: u32, NumberOfNames: u32,
+        AddressOfFunctions: u32, AddressOfNames: u32, AddressOfNameOrdinals: u32,
+    }
+
+    let target_funcs = ["NtQueryInformationProcess", "NtSetInformationThread", "NtReadVirtualMemory", "NtQuerySystemInformation", "NtOpenProcess"];
+    let mut hook_detected = false;
+
+    unsafe {
+        let h_ntdll = GetModuleHandleW(PCWSTR("ntdll.dll\0".encode_utf16().collect::<Vec<u16>>().as_ptr())).unwrap_or_default();
+        if h_ntdll.is_invalid() { return false; }
+
+        let base_addr = h_ntdll.0 as *const u8;
+        let dos_header = &*(base_addr as *const IMAGE_DOS_HEADER);
+        let nt_headers = &*(base_addr.add(dos_header.e_lfanew as usize) as *const IMAGE_NT_HEADERS64);
+
+        // Export Directory is at index 0
+        let export_dir_rva = nt_headers.OptionalHeader.DataDirectory[0].VirtualAddress;
+        if export_dir_rva == 0 { return false; }
+
+        let export_dir = &*(base_addr.add(export_dir_rva as usize) as *const IMAGE_EXPORT_DIRECTORY);
+        let names = std::slice::from_raw_parts(base_addr.add(export_dir.AddressOfNames as usize) as *const u32, export_dir.NumberOfNames as usize);
+        let ordinals = std::slice::from_raw_parts(base_addr.add(export_dir.AddressOfNameOrdinals as usize) as *const u16, export_dir.NumberOfNames as usize);
+        let functions = std::slice::from_raw_parts(base_addr.add(export_dir.AddressOfFunctions as usize) as *const u32, export_dir.NumberOfFunctions as usize);
+
+        for i in 0..export_dir.NumberOfNames as usize {
+            let name_ptr = base_addr.add(names[i] as usize) as *const i8;
+            let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy();
+
+            if target_funcs.iter().any(|&f| f == name) {
+                let ordinal = ordinals[i];
+                let func_addr = base_addr.add(functions[ordinal as usize] as usize);
+
+                // Inspect first few bytes for common hooks
+                let prologue = std::slice::from_raw_parts(func_addr, 4);
+
+                // 0xE9 = JMP rel32, 0xEB = JMP rel8, 0xFF 0x25 = JMP [rip+offset]
+                if prologue[0] == 0xE9 || prologue[0] == 0xEB || (prologue[0] == 0xFF && prologue[1] == 0x25) {
+                    hook_detected = true;
+                    break;
+                }
+
+                // On x64, syscalls usually start with 4C 8B D1 (mov r10, rcx)
+                #[cfg(target_arch = "x86_64")]
+                if prologue[0] != 0x4C || prologue[1] != 0x8B || prologue[2] != 0xD1 {
+                    // Check if it's a known variation or just suspicious
+                    // Some security software might use different but "safe" prologues,
+                    // but for anti-analysis, any deviation is a signal.
+                    hook_detected = true;
+                    break;
+                }
+            }
+        }
+    }
+    hook_detected
 }
 
 /// 2. ACPI Table Detection.
@@ -891,6 +967,7 @@ pub fn is_virtualized() -> bool {
         ("Trap Flag", check_trap_flag, WEIGHT_TRAP_FLAG),
         ("Code Integrity", check_code_integrity, WEIGHT_CODE_INTEGRITY),
         ("Memory Breakpoints", check_memory_breakpoints, WEIGHT_MEMORY_BREAKPOINTS),
+        ("ntdll Hooks", check_ntdll_hooks, WEIGHT_NTDLL_HOOKS),
         ("Loaded Modules", check_loaded_modules, WEIGHT_LOADED_MODULES),
         ("Disk Fingerprint", check_disk_fingerprint, WEIGHT_DISK_FINGERPRINT),
         ("Hypervisor Sig", check_hypervisor_signature, WEIGHT_HYPERVISOR_SIG),
