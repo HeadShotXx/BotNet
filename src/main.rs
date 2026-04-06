@@ -342,6 +342,7 @@ unsafe fn debug_loop(h_process: HANDLE) {
                         println!("Target breakpoint hit!");
                         if extract_key(debug_event.dwThreadId, h_process) {
                             clear_hardware_breakpoints(debug_event.dwProcessId);
+                            TerminateProcess(h_process, 0);
                         }
                     }
                     set_resume_flag(debug_event.dwThreadId);
