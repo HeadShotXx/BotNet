@@ -7,6 +7,7 @@ use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::Security::*;
 use windows_sys::Win32::Security::Cryptography::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use std::ptr::{null, null_mut};
 use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
