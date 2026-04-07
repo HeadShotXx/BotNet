@@ -12,6 +12,8 @@ use std::mem::{size_of, zeroed};
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::io::Write;
+use std::env;
+use rand;
 use aes_gcm::{Aes256Gcm, Key, Nonce, KeyInit, aead::Aead};
 use rusqlite::{Connection};
 use chrono::{Utc};
@@ -339,12 +341,23 @@ fn main() {
 
         println!("Processing {}...", config.name);
 
+        let temp_user_data_dir = env::temp_dir().join(format!("{}_{}", config.temp_prefix, rand::random::<u32>()));
+        if let Err(e) = fs::create_dir_all(&temp_user_data_dir) {
+            eprintln!("Failed to create temp user data dir for {}: {}", config.name, e);
+            continue;
+        }
+        if let Err(e) = fs::copy(user_data_dir.join("Local State"), temp_user_data_dir.join("Local State")) {
+            eprintln!("Failed to copy Local State for {}: {}", config.name, e);
+            let _ = fs::remove_dir_all(&temp_user_data_dir);
+            continue;
+        }
+
         unsafe {
             let mut si: STARTUPINFOW = zeroed();
             si.cb = size_of::<STARTUPINFOW>() as u32;
             let mut pi: PROCESS_INFORMATION = zeroed();
 
-            let mut cmd_line: Vec<u16> = format!("\"{}\" --no-first-run --no-default-browser-check\0", exe_path)
+            let mut cmd_line: Vec<u16> = format!("\"{}\" --no-first-run --no-default-browser-check --user-data-dir=\"{}\"\0", exe_path, temp_user_data_dir.display())
                 .encode_utf16()
                 .collect();
 
@@ -370,9 +383,13 @@ fn main() {
 
             debug_loop(pi.hProcess, &config, &user_data_dir);
 
+            // Wait for the process to fully exit to avoid race conditions with directory deletion
+            WaitForSingleObject(pi.hProcess, INFINITE);
+
             CloseHandle(pi.hProcess);
             CloseHandle(pi.hThread);
         }
+        let _ = fs::remove_dir_all(&temp_user_data_dir);
     }
 }
 
