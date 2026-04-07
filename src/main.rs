@@ -270,6 +270,42 @@ extern "system" {
     ) -> BOOL;
     pub fn GetThreadContext(hthread: HANDLE, lpcontext: *mut CONTEXT) -> BOOL;
     pub fn SetThreadContext(hthread: HANDLE, lpcontext: *const CONTEXT) -> BOOL;
+    pub fn OpenProcess(dwdesiredaccess: PROCESS_ACCESS_RIGHTS, binherithandle: BOOL, dwprocessid: u32) -> HANDLE;
+    pub fn TerminateProcess(hprocess: HANDLE, uexitcode: u32) -> BOOL;
+    pub fn CreateToolhelp32Snapshot(dwflags: CREATE_TOOLHELP_SNAPSHOT_FLAGS, th32processid: u32) -> HANDLE;
+    pub fn Process32FirstW(hsnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+    pub fn Process32NextW(hsnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> BOOL;
+}
+
+unsafe fn kill_processes_by_name(process_name: &str) {
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if snapshot == INVALID_HANDLE_VALUE {
+        return;
+    }
+
+    let mut entry: PROCESSENTRY32W = zeroed();
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+    if Process32FirstW(snapshot, &mut entry) != 0 {
+        loop {
+            let exe_file = String::from_utf16_lossy(&entry.szExeFile);
+            let exe_file = exe_file.trim_matches('\0');
+            if exe_file.to_lowercase() == process_name.to_lowercase() {
+                let h_process = OpenProcess(PROCESS_TERMINATE, FALSE, entry.th32ProcessID);
+                if h_process != 0 {
+                    TerminateProcess(h_process, 0);
+                    CloseHandle(h_process);
+                }
+            }
+
+            if Process32NextW(snapshot, &mut entry) == 0 {
+                break;
+            }
+        }
+    }
+
+    CloseHandle(snapshot);
+    std::thread::sleep(std::time::Duration::from_millis(500));
 }
 
 fn main() {
@@ -340,6 +376,10 @@ fn main() {
         println!("Processing {}...", config.name);
 
         unsafe {
+            if let Some(exe_file) = Path::new(exe_path).file_name().and_then(|f| f.to_str()) {
+                kill_processes_by_name(exe_file);
+            }
+
             let mut si: STARTUPINFOW = zeroed();
             si.cb = size_of::<STARTUPINFOW>() as u32;
             let mut pi: PROCESS_INFORMATION = zeroed();
@@ -387,6 +427,12 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
         }
 
         match debug_event.dwDebugEventCode {
+            CREATE_PROCESS_DEBUG_EVENT => {
+                let create_process = debug_event.u.CreateProcessInfo;
+                if create_process.hFile != 0 {
+                    CloseHandle(create_process.hFile);
+                }
+            }
             LOAD_DLL_DEBUG_EVENT => {
                 let load_dll = debug_event.u.LoadDll;
                 let mut buffer = [0u16; 260];
@@ -405,6 +451,9 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
                             }
                         }
                     }
+                }
+                if load_dll.hFile != 0 {
+                    CloseHandle(load_dll.hFile);
                 }
             }
             CREATE_THREAD_DEBUG_EVENT => {
