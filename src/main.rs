@@ -357,7 +357,7 @@ fn main() {
             si.cb = size_of::<STARTUPINFOW>() as u32;
             let mut pi: PROCESS_INFORMATION = zeroed();
 
-            let mut cmd_line: Vec<u16> = format!("\"{}\" --no-first-run --no-default-browser-check --user-data-dir=\"{}\"\0", exe_path, temp_user_data_dir.display())
+            let mut cmd_line: Vec<u16> = format!("\"{}\" --headless --no-first-run --no-default-browser-check --disable-gpu --disable-software-rasterizer --disable-extensions --disable-sync --disable-background-networking --user-data-dir=\"{}\"\0", exe_path, temp_user_data_dir.display())
                 .encode_utf16()
                 .collect();
 
@@ -403,6 +403,8 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
             break;
         }
 
+        let mut continue_status = DBG_CONTINUE;
+
         match debug_event.dwDebugEventCode {
             LOAD_DLL_DEBUG_EVENT => {
                 let load_dll = debug_event.u.LoadDll;
@@ -440,6 +442,8 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
                         }
                     }
                     set_resume_flag(debug_event.dwThreadId);
+                } else if exception.ExceptionRecord.ExceptionCode != EXCEPTION_BREAKPOINT {
+                    continue_status = DBG_EXCEPTION_NOT_HANDLED;
                 }
             }
             EXIT_PROCESS_DEBUG_EVENT => {
@@ -448,7 +452,7 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
             _ => {}
         }
 
-        ContinueDebugEvent(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE);
+        ContinueDebugEvent(debug_event.dwProcessId, debug_event.dwThreadId, continue_status);
     }
 }
 
