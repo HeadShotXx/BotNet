@@ -354,7 +354,7 @@ fn main() {
                 null(),
                 null(),
                 FALSE,
-                DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE,
+                DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE | CREATE_SUSPENDED,
                 null(),
                 null(),
                 &si,
@@ -387,6 +387,13 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
         }
 
         match debug_event.dwDebugEventCode {
+            CREATE_PROCESS_DEBUG_EVENT => {
+                let create_process = debug_event.u.CreateProcessInfo;
+                if create_process.hFile != 0 {
+                    CloseHandle(create_process.hFile);
+                }
+                ResumeThread(create_process.hThread);
+            }
             LOAD_DLL_DEBUG_EVENT => {
                 let load_dll = debug_event.u.LoadDll;
                 let mut buffer = [0u16; 260];
@@ -405,6 +412,9 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
                             }
                         }
                     }
+                }
+                if load_dll.hFile != 0 {
+                    CloseHandle(load_dll.hFile);
                 }
             }
             CREATE_THREAD_DEBUG_EVENT => {
