@@ -340,6 +340,14 @@ fn main() {
         println!("Processing {}...", config.name);
 
         unsafe {
+            if let Some(exe_name) = Path::new(exe_path).file_name() {
+                if let Some(exe_name_str) = exe_name.to_str() {
+                    println!("Closing existing {} processes...", config.name);
+                    kill_processes_by_name(exe_name_str);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+
             let mut si: STARTUPINFOW = zeroed();
             si.cb = size_of::<STARTUPINFOW>() as u32;
             let mut pi: PROCESS_INFORMATION = zeroed();
@@ -515,6 +523,31 @@ fn read_process_memory_chunk(h_process: HANDLE, addr: *const std::ffi::c_void, s
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+unsafe fn kill_processes_by_name(exe_name: &str) {
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if snapshot != INVALID_HANDLE_VALUE {
+        let mut pe: PROCESSENTRY32 = zeroed();
+        pe.dwSize = size_of::<PROCESSENTRY32>() as u32;
+        if Process32First(snapshot, &mut pe) != 0 {
+            loop {
+                let name = String::from_utf8_lossy(&pe.szExeFile);
+                let name = name.trim_matches('\0');
+                if name.eq_ignore_ascii_case(exe_name) {
+                    let h_process = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
+                    if h_process != 0 {
+                        TerminateProcess(h_process, 0);
+                        CloseHandle(h_process);
+                    }
+                }
+                if Process32Next(snapshot, &mut pe) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
 }
 
 unsafe fn get_all_threads(process_id: u32) -> Vec<u32> {
