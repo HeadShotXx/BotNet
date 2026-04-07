@@ -304,7 +304,7 @@ fn main() {
                 "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
                 "C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
             ],
-            dll_name: "brave.dll",
+            dll_name: "chrome.dll",
             user_data_subdir: &["BraveSoftware", "Brave-Browser", "User Data"],
             output_dir: "brave_extract",
             temp_prefix: "brave_tmp",
