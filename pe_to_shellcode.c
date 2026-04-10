@@ -141,7 +141,7 @@ int main(int argc, char* argv[]) {
         fread(stub_data, 1, stub_size, s_fp);
         fclose(s_fp);
     } else {
-        printf("Warning: stub.bin not found. Generated shellcode will have no PIC stub.\n");
+        printf("Warning: %s not found. Generated shellcode will have no PIC stub.\n", stub_path);
     }
 
     IMAGE_DOS_HEADER* dos_header = (IMAGE_DOS_HEADER*)file_data;
@@ -159,9 +159,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    unsigned long long marker = 0xDEADBEEFCAFEBABEULL;
+
     FILE* bin_fp = fopen("final_shellcode.bin", "wb");
     if (bin_fp) {
         if (stub_data) fwrite(stub_data, 1, stub_size, bin_fp);
+        fwrite(&marker, 1, sizeof(marker), bin_fp);
         fwrite(mapped_image, 1, size_of_image, bin_fp);
         fclose(bin_fp);
     }
@@ -174,8 +177,11 @@ int main(int argc, char* argv[]) {
                 fprintf(c_fp, "0x%02X, ", stub_data[i]);
                 if ((i + 1) % 12 == 0) fprintf(c_fp, "\n");
             }
-            fprintf(c_fp, "\n// --- PE Blob ---\n");
         }
+        fprintf(c_fp, "\n// --- Marker ---\n");
+        unsigned char* m = (unsigned char*)&marker;
+        for (int i = 0; i < 8; i++) fprintf(c_fp, "0x%02X, ", m[i]);
+        fprintf(c_fp, "\n// --- PE Blob ---\n");
         for (size_t i = 0; i < size_of_image; i++) {
             fprintf(c_fp, "0x%02X%s", mapped_image[i], (i == size_of_image - 1) ? "" : ", ");
             if ((i + 1) % 12 == 0) fprintf(c_fp, "\n");

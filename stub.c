@@ -1,55 +1,12 @@
 #include <windows.h>
 #include <winternl.h>
 
-// Helper to find kernel32.dll and functions without using strings
-typedef struct _API_TABLE {
-    FARPROC pGetProcAddress;
-    FARPROC pLoadLibraryA;
-    FARPROC pVirtualAlloc;
-} API_TABLE;
+// Forward declarations of helpers to be placed AFTER the entry point
+static inline ULONG_PTR get_kernel32();
+static inline FARPROC get_proc_addr(ULONG_PTR base, const char* name);
 
-__attribute__((section(".text")))
-ULONG_PTR get_kernel32() {
-    PPEB peb;
-#ifdef _WIN64
-    __asm__ ("movq %%gs:0x60, %0" : "=r" (peb));
-#else
-    __asm__ ("movl %%fs:0x30, %0" : "=r" (peb));
-#endif
-    PLIST_ENTRY list = &peb->Ldr->InMemoryOrderModuleList;
-    PLIST_ENTRY entry = list->Flink; // exe
-    entry = entry->Flink; // ntdll
-    entry = entry->Flink; // kernel32
-
-    LDR_DATA_TABLE_ENTRY* data_entry = (LDR_DATA_TABLE_ENTRY*)((char*)entry - sizeof(LIST_ENTRY));
-    return (ULONG_PTR)data_entry->DllBase;
-}
-
-__attribute__((section(".text")))
-FARPROC get_proc_addr(ULONG_PTR base, const char* name) {
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
-    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
-    PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)(base + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-
-    DWORD* names = (DWORD*)(base + exports->AddressOfNames);
-    DWORD* funcs = (DWORD*)(base + exports->AddressOfFunctions);
-    WORD* ordinals = (WORD*)(base + exports->AddressOfNameOrdinals);
-
-    for (DWORD i = 0; i < exports->NumberOfNames; i++) {
-        char* n = (char*)(base + names[i]);
-        int match = 1;
-        for (int j = 0; name[j] != 0; j++) {
-            if (n[j] != name[j]) { match = 0; break; }
-        }
-        if (match && n[strlen(name)] == 0) {
-            return (FARPROC)(base + funcs[ordinals[i]]);
-        }
-    }
-    return NULL;
-}
-
-// The entry point of the stub
-__attribute__((section(".text")))
+// The entry point of the stub MUST be at the top
+__attribute__((section(".text.prologue")))
 void stub_entry() {
     ULONG_PTR k32 = get_kernel32();
 
@@ -67,13 +24,20 @@ void stub_entry() {
     VA pVA = (VA)pGPA((HMODULE)k32, sVirtualAlloc);
 
     // Find PE blob. It follows the stub.
-    // We need RIP-relative addressing here.
-    ULONG_PTR current_rip;
-    __asm__ ("lea (%%rip), %0" : "=r" (current_rip));
+    // We'll use a unique marker to avoid matching instruction bytes.
+    // Marker: 0xDEADBEEFCAFEBABE
+    ULONG_PTR current_ptr;
+    __asm__ ("lea (%%rip), %0" : "=r" (current_ptr));
 
-    // Assume PE starts at some offset. For simplicity, we search for MZ marker.
-    char* search = (char*)current_rip;
-    while (*(unsigned short*)search != 0x5A4D) search++;
+    unsigned long long marker = 0xCAFEBABE00000000ULL | 0xDEADBEEF; // Split to avoid immediate match
+    char* search = (char*)current_ptr;
+    while (1) {
+        if (*(unsigned long long*)search == 0xDEADBEEFCAFEBABEULL) {
+            search += 8; // Move past marker
+            break;
+        }
+        search++;
+    }
 
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)search;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((char*)search + dos->e_lfanew);
@@ -87,8 +51,7 @@ void stub_entry() {
     PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt);
     for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         char* dest = (char*)base + sections[i].VirtualAddress;
-        char* src = (char*)search + sections[i].VirtualAddress; // If already mapped in shellcode
-        // Wait, pe_to_shellcode maps the sections. So we can just copy from mapped offsets.
+        char* src = (char*)search + sections[i].VirtualAddress;
         for (DWORD j = 0; j < sections[i].SizeOfRawData; j++) dest[j] = src[j];
     }
 
@@ -135,4 +98,43 @@ void stub_entry() {
 
     // Jump
     ((void(*)())((char*)base + new_nt->OptionalHeader.AddressOfEntryPoint))();
+}
+
+static inline ULONG_PTR get_kernel32() {
+    PPEB peb;
+#ifdef _WIN64
+    __asm__ ("movq %%gs:0x60, %0" : "=r" (peb));
+#else
+    __asm__ ("movl %%fs:0x30, %0" : "=r" (peb));
+#endif
+    PLIST_ENTRY list = &peb->Ldr->InMemoryOrderModuleList;
+    PLIST_ENTRY entry = list->Flink; // exe
+    entry = entry->Flink; // ntdll
+    entry = entry->Flink; // kernel32
+
+    LDR_DATA_TABLE_ENTRY* data_entry = (LDR_DATA_TABLE_ENTRY*)((char*)entry - sizeof(LIST_ENTRY));
+    return (ULONG_PTR)data_entry->DllBase;
+}
+
+static inline FARPROC get_proc_addr(ULONG_PTR base, const char* name) {
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)base;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(base + dos->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)(base + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    DWORD* names = (DWORD*)(base + exports->AddressOfNames);
+    DWORD* funcs = (DWORD*)(base + exports->AddressOfFunctions);
+    WORD* ordinals = (WORD*)(base + exports->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < exports->NumberOfNames; i++) {
+        char* n = (char*)(base + names[i]);
+        int match = 1;
+        int j = 0;
+        for (j = 0; name[j] != 0; j++) {
+            if (n[j] != name[j]) { match = 0; break; }
+        }
+        if (match && n[j] == 0) {
+            return (FARPROC)(base + funcs[ordinals[i]]);
+        }
+    }
+    return NULL;
 }
