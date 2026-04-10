@@ -1,23 +1,32 @@
 #!/bin/bash
-# Windows PIC Shellcode Loader Build Script
-# This script compiles loader.c and extracts the raw shellcode.
+# Windows PIC Shellcode Loader Build & Test Script
 
-# 1. Compile loader.c to an object file
-# -target x86_64-pc-windows-msvc: Target Windows x64
-# -ffreestanding: Do not assume standard library
-# -fno-stack-protector: Disable stack canaries for PIC
-# -O2: Optimize for size/speed
+set -e
+
+echo "[*] Compiling Loader..."
+# Compile loader.c to Windows x64 PIC
 clang -target x86_64-pc-windows-msvc -ffreestanding -fno-stack-protector -O2 -c loader.c -o loader.o
-
-# 2. Extract the .text section (code) as a raw binary
 objcopy -O binary --only-section=.text loader.o loader.bin
 
-echo "[+] Loader shellcode generated: loader.bin"
+echo "[*] Compiling Sample Payload..."
+# Compile sample_payload.c to Windows x64 PIC
+clang -target x86_64-pc-windows-msvc -ffreestanding -fno-stack-protector -O2 -c sample_payload.c -o payload.o
+objcopy -O binary --only-section=.text payload.o payload.bin
 
-# 3. Instruction for adding a payload:
-# To add a base64 encoded payload:
-#   echo -n "PLDB64:$(base64 -w 0 your_executable_shellcode.bin)" >> loader.bin
-# Then the resulting loader.bin is ready for execution in a remote process.
+echo "[*] Encoding and Appending Payload..."
+# Create the final shellcode by appending the marker and the base64 encoded payload
+PAYLOAD_B64=$(base64 -w 0 payload.bin)
+cp loader.bin final_shellcode.bin
+echo -n "PLDB64:${PAYLOAD_B64}" >> final_shellcode.bin
 
-# Cleanup
-rm loader.o
+echo "[+] Success!"
+echo "    Loader binary: loader.bin"
+echo "    Sample payload binary: payload.bin"
+echo "    Final combined shellcode: final_shellcode.bin"
+echo ""
+echo "To use:"
+echo "1. Inject 'final_shellcode.bin' into a Windows x64 process."
+echo "2. The loader will find the 'PLDB64:' marker, decode the payload, and execute it."
+
+# Cleanup intermediate files
+rm loader.o payload.o
