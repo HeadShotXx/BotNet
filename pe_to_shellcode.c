@@ -121,6 +121,7 @@ int main(int argc, char* argv[]) {
     const char* loader_path = argv[1];
     const char* stub_path = (argc > 2) ? argv[2] : "stub.bin";
 
+    // Read Loader EXE
     FILE* fp = fopen(loader_path, "rb");
     if (!fp) { perror("fopen loader"); return 1; }
     fseek(fp, 0, SEEK_END);
@@ -130,6 +131,7 @@ int main(int argc, char* argv[]) {
     fread(file_data, 1, file_size, fp);
     fclose(fp);
 
+    // Read Stub Binary
     FILE* s_fp = fopen(stub_path, "rb");
     uint8_t* stub_data = NULL;
     size_t stub_size = 0;
@@ -141,9 +143,12 @@ int main(int argc, char* argv[]) {
         fread(stub_data, 1, stub_size, s_fp);
         fclose(s_fp);
     } else {
-        printf("Warning: %s not found. Generated shellcode will have no PIC stub.\n", stub_path);
+        printf("Error: %s not found. Please compile stub.c first.\n", stub_path);
+        free(file_data);
+        return 1;
     }
 
+    // Map PE into virtual memory format
     IMAGE_DOS_HEADER* dos_header = (IMAGE_DOS_HEADER*)file_data;
     IMAGE_NT_HEADERS64* nt_headers = (IMAGE_NT_HEADERS64*)(file_data + dos_header->e_lfanew);
     DWORD size_of_image = nt_headers->OptionalHeader.SizeOfImage;
@@ -159,11 +164,13 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Output final shellcode
+    // Structure: [stub] + [marker] + [mapped PE]
     unsigned long long marker = 0xDEADBEEFCAFEBABEULL;
 
     FILE* bin_fp = fopen("final_shellcode.bin", "wb");
     if (bin_fp) {
-        if (stub_data) fwrite(stub_data, 1, stub_size, bin_fp);
+        fwrite(stub_data, 1, stub_size, bin_fp);
         fwrite(&marker, 1, sizeof(marker), bin_fp);
         fwrite(mapped_image, 1, size_of_image, bin_fp);
         fclose(bin_fp);
@@ -171,16 +178,17 @@ int main(int argc, char* argv[]) {
 
     FILE* c_fp = fopen("shellcode.c", "w");
     if (c_fp) {
-        fprintf(c_fp, "unsigned char shellcode[] = {\n");
-        if (stub_data) {
-            for (size_t i = 0; i < stub_size; i++) {
-                fprintf(c_fp, "0x%02X, ", stub_data[i]);
-                if ((i + 1) % 12 == 0) fprintf(c_fp, "\n");
-            }
+        fprintf(c_fp, "#include <windows.h>\n\nunsigned char shellcode[] = {\n");
+        // Write Stub
+        for (size_t i = 0; i < stub_size; i++) {
+            fprintf(c_fp, "0x%02X, ", stub_data[i]);
+            if ((i + 1) % 12 == 0) fprintf(c_fp, "\n");
         }
+        // Write Marker
         fprintf(c_fp, "\n// --- Marker ---\n");
-        unsigned char* m = (unsigned char*)&marker;
-        for (int i = 0; i < 8; i++) fprintf(c_fp, "0x%02X, ", m[i]);
+        uint8_t* m_ptr = (uint8_t*)&marker;
+        for (int i = 0; i < 8; i++) fprintf(c_fp, "0x%02X, ", m_ptr[i]);
+        // Write PE Blob
         fprintf(c_fp, "\n// --- PE Blob ---\n");
         for (size_t i = 0; i < size_of_image; i++) {
             fprintf(c_fp, "0x%02X%s", mapped_image[i], (i == size_of_image - 1) ? "" : ", ");
@@ -191,6 +199,6 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Generated final_shellcode.bin and shellcode.c successfully.\n");
-    free(file_data); free(mapped_image); if (stub_data) free(stub_data);
+    free(file_data); free(mapped_image); free(stub_data);
     return 0;
 }

@@ -2,73 +2,62 @@
 
 This project provides a multi-stage pipeline to convert a Windows executable (EXE) into position-independent shellcode.
 
+## How it Works
+
+The pipeline consists of three main stages:
+
+1.  **EXE to Embedded Loader**: The `payload.exe` (your target program) is embedded as a raw byte array into `final_loader.c`.
+2.  **Embedded Loader**: When `final_loader.exe` runs, it manually maps the embedded `payload.exe` into its own memory, fixes its imports/relocations, and executes it.
+3.  **PE to Shellcode**: The `final_loader.exe` is mapped into its virtual memory format. A reflective **PIC stub** (`stub.c`) is prepended to it, separated by a 64-bit marker (`0xDEADBEEFCAFEBABE`).
+
+**The Final Shellcode** is: `[PIC Stub] + [Marker] + [Mapped final_loader.exe]`.
+
+When the shellcode is executed:
+1.  The **PIC Stub** runs first. It finds `kernel32.dll` via the PEB.
+2.  It resolves `VirtualAlloc`, `LoadLibraryA`, and `GetProcAddress`.
+3.  It searches memory for the `Marker` to find the start of the `final_loader.exe` blob.
+4.  It maps `final_loader.exe` into a new buffer, fixes its imports/relocations, and jumps to it.
+5.  `final_loader.exe` then repeats the process to load and run the original `payload.exe`.
+
 ## Components
 
-1.  **payload.c**: A simple test payload that displays a MessageBox.
-2.  **exe_to_embedded_loader.c**: A tool that parses an EXE and embeds it into a C loader template.
-3.  **loader_template.c**: A standalone PE loader template that maps the embedded EXE into memory, resolves imports, and fixes relocations.
-4.  **stub.c**: A Position Independent Code (PIC) reflective stub that loads and executes a PE image.
-5.  **pe_to_shellcode.c**: A tool that prepends the PIC stub to the mapped loader EXE, producing the final shellcode.
+*   `payload.c`: Example Windows program.
+*   `exe_to_embedded_loader.c`: Embedding tool.
+*   `loader_template.c`: Base template for the intermediate loader.
+*   `stub.c`: The x64 PIC reflective loader stub.
+*   `pe_to_shellcode.c`: The final shellcode generator.
 
-## Usage Instructions
+## Compilation and Usage
 
-### 1. Prerequisites
+### 1. Build Tools
+```bash
+gcc exe_to_embedded_loader.c -o exe_to_embedded_loader
+gcc pe_to_shellcode.c -o pe_to_shellcode
+```
 
-Ensure you have `gcc` and the `mingw-w64` cross-compiler installed on your system.
+### 2. Prepare Stub
+```bash
+x86_64-w64-mingw32-gcc -c stub.c -o stub.o -fno-stack-protector -fPIC -O2
+x86_64-w64-mingw32-objcopy -O binary --only-section=.text.prologue --only-section=.text stub.o stub.bin
+```
 
-### 2. Step-by-Step Execution
-
-Follow these steps in order to generate the final shellcode:
-
-#### Step A: Prepare the Payload
-Compile the test payload to a Windows executable.
+### 3. Build Payload
 ```bash
 x86_64-w64-mingw32-gcc payload.c -o payload.exe -mwindows
 ```
 
-#### Step B: Build the Embedding Tool
-Compile the host-side tool that will embed the payload into the loader.
-```bash
-gcc exe_to_embedded_loader.c -o exe_to_embedded_loader
-```
-
-#### Step C: Generate the Embedded Loader Source
-Run the embedding tool. This uses `loader_template.c` as a base and produces `final_loader.c`.
+### 4. Generate Intermediate Loader
 ```bash
 ./exe_to_embedded_loader payload.exe
-```
-
-#### Step D: Compile the Embedded Loader
-Compile the generated `final_loader.c` into a Windows executable.
-```bash
 x86_64-w64-mingw32-gcc final_loader.c -o final_loader.exe
 ```
 
-#### Step E: Build the PIC Stub
-Compile the reflective stub and extract its raw binary code.
-```bash
-x86_64-w64-mingw32-gcc -c stub.c -o stub.o -fno-stack-protector -fPIC -O2
-x86_64-w64-mingw32-objcopy -O binary --only-section=.text stub.o stub.bin
-```
-
-#### Step F: Build the Shellcode Generator
-Compile the tool that combines the stub and the loader EXE.
-```bash
-gcc pe_to_shellcode.c -o pe_to_shellcode
-```
-
-#### Step G: Generate Final Shellcode
-Run the final tool to produce the shellcode files.
+### 5. Generate Final Shellcode
 ```bash
 ./pe_to_shellcode final_loader.exe stub.bin
 ```
 
-### 3. Output
+## Results
 
-After completing Step G, you will have two final files:
-*   **final_shellcode.bin**: Raw binary shellcode.
-*   **shellcode.c**: The same shellcode formatted as a C byte array for easy inclusion in other projects.
-
-## Notes
-*   The pipeline is designed for x64 Windows targets.
-*   The final shellcode is position-independent and can be injected into any process.
+*   `final_shellcode.bin`: Raw shellcode binary.
+*   `shellcode.c`: C-style array of the shellcode.
