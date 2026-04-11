@@ -1,63 +1,51 @@
-# EXE to Shellcode Pipeline
+# EXE to Shellcode Pipeline (v4)
 
-This project provides a multi-stage pipeline to convert a Windows executable (EXE) into position-independent shellcode.
+This project provides a multi-stage pipeline to convert almost any Windows executable (EXE) into position-independent shellcode.
 
-## How it Works
+## Core Features
 
-The pipeline consists of three main stages:
+-   **Architecture Aware**: The host tools support both x86 (PE32) and x64 (PE32+) payloads.
+-   **Advanced Reflective Loading**:
+    -   Manual Mapping (Sections, Imports, Relocations).
+    -   x64 Exception Handling (`RtlAddFunctionTable`).
+    -   Thread Local Storage (TLS) Initialization.
+    -   PEB `ImageBaseAddress` Patching (improves compatibility with `GetModuleHandle(NULL)`).
+    -   `ExitProcess` Hooking (prevents host termination).
 
-1.  **EXE to Embedded Loader**: The `payload.exe` (your target program) is embedded as a raw byte array into `final_loader.c`.
-2.  **Embedded Loader**: When `final_loader.exe` runs, it manually maps the embedded `payload.exe` into its own memory, fixes its imports/relocations, and executes it.
-3.  **PE to Shellcode**: The `final_loader.exe` is mapped into its virtual memory format. A reflective **PIC stub** (`stub.c`) is prepended to it, separated by a 64-bit marker (`0xDEADBEEFCAFEBABE`).
+## Multi-Stage Loading Process
 
-**The Final Shellcode** is: `[PIC Stub] + [Marker] + [Mapped final_loader.exe]`.
+1.  **Stub (PIC)**: The entry point. Resolves kernel32/ntdll from the PEB, searches for the marker, and reflectively loads the intermediate loader.
+2.  **Intermediate Loader**: A standalone PE that acts as a wrapper. It reflectively loads the final payload and sets up its environment (PEB, TLS, Exceptions).
+3.  **Payload**: Your target `.exe` file.
 
-When the shellcode is executed:
-1.  The **PIC Stub** runs first. It finds `kernel32.dll` via the PEB.
-2.  It resolves `VirtualAlloc`, `LoadLibraryA`, and `GetProcAddress`.
-3.  It searches memory for the `Marker` to find the start of the `final_loader.exe` blob.
-4.  It maps `final_loader.exe` into a new buffer, fixes its imports/relocations, and jumps to it.
-5.  `final_loader.exe` then repeats the process to load and run the original `payload.exe`.
+## Build Instructions
 
-## Components
-
-*   `payload.c`: Example Windows program.
-*   `exe_to_embedded_loader.c`: Embedding tool.
-*   `loader_template.c`: Base template for the intermediate loader.
-*   `stub.c`: The x64 PIC reflective loader stub.
-*   `pe_to_shellcode.c`: The final shellcode generator.
-
-## Compilation and Usage
-
-### 1. Build Tools
+### 1. Host Utilities
 ```bash
 gcc exe_to_embedded_loader.c -o exe_to_embedded_loader
 gcc pe_to_shellcode.c -o pe_to_shellcode
 ```
 
-### 2. Prepare Stub
+### 2. Reflective Stub
 ```bash
 x86_64-w64-mingw32-gcc -c stub.c -o stub.o -fno-stack-protector -fPIC -O2
 x86_64-w64-mingw32-objcopy -O binary --only-section=.text.prologue --only-section=.text stub.o stub.bin
 ```
 
-### 3. Build Payload
+### 3. Target Payload
+Compile your program as a standard Windows EXE:
 ```bash
-x86_64-w64-mingw32-gcc payload.c -o payload.exe -mwindows
+x86_64-w64-mingw32-gcc my_payload.c -o payload.exe -mwindows -ladvapi32
 ```
 
-### 4. Generate Intermediate Loader
+### 4. Conversion
 ```bash
 ./exe_to_embedded_loader payload.exe
-x86_64-w64-mingw32-gcc final_loader.c -o final_loader.exe
-```
-
-### 5. Generate Final Shellcode
-```bash
+x86_64-w64-mingw32-gcc final_loader.c -o final_loader.exe -mwindows
 ./pe_to_shellcode final_loader.exe stub.bin
 ```
 
-## Results
+## Result
 
-*   `final_shellcode.bin`: Raw shellcode binary.
-*   `shellcode.c`: C-style array of the shellcode.
+-   `final_shellcode.bin`: Injectable position-independent shellcode.
+-   `shellcode.c`: C-formatted shellcode array.

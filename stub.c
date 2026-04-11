@@ -6,135 +6,138 @@
  */
 
 typedef struct _LDR_DATA_TABLE_ENTRY_CUSTOM {
-    LIST_ENTRY InLoadOrderLinks;
-    LIST_ENTRY InMemoryOrderLinks;
-    LIST_ENTRY InInitializationOrderLinks;
-    void* DllBase;
-    void* EntryPoint;
-    ULONG SizeOfImage;
-    UNICODE_STRING FullDllName;
-    UNICODE_STRING BaseDllName;
+    LIST_ENTRY InLoadOrderLinks; LIST_ENTRY InMemoryOrderLinks; LIST_ENTRY InInitializationOrderLinks;
+    void* DllBase; void* EntryPoint; ULONG SizeOfImage; UNICODE_STRING FullDllName; UNICODE_STRING BaseDllName;
 } LDR_DATA_TABLE_ENTRY_CUSTOM, *PLDR_DATA_TABLE_ENTRY_CUSTOM;
 
-static inline void* get_module_base(const char* name);
+static inline void* get_k32_base();
+static inline void* get_ntdll_base();
 static inline void* get_proc_address(void* module, const char* name);
 static inline int strings_equal(const char* s1, const char* s2);
 
 __attribute__((section(".text.prologue")))
 void stub_entry() {
-    void* k32 = get_module_base(NULL); // kernel32
-    if (!k32) return;
+    void* k32 = get_k32_base();
+    void* ntdll = get_ntdll_base();
+    if (!k32 || !ntdll) return;
 
-    char sGetProcAddress[] = {'G','e','t','P','r','o','c','A','d','d','r','e','s','s',0};
-    char sLoadLibraryA[] = {'L','o','a','d','L','i','b','r','a','r','y','A',0};
-    char sVirtualAlloc[] = {'V','i','r','t','u','a','l','A','l','l','o','c',0};
-    char sGetModuleHandleA[] = {'G','e','t','M','o','d','u','l','e','H','a','n','d','l','e','A',0};
+    char sGPA[] = {'G','e','t','P','r','o','c','A','d','d','r','e','s','s',0};
+    char sLLA[] = {'L','o','a','d','L','i','b','r','a','r','y','A',0};
+    char sVA[] = {'V','i','r','t','u','a','l','A','l','l','o','c',0};
+    char sRAFA[] = {'R','t','l','A','d','d','F','u','n','c','t','i','o','n','T','a','b','l','e',0};
+    char sVP[] = {'V','i','r','t','u','a','l','P','r','o','t','e','c','t',0};
 
-    typedef FARPROC (WINAPI *GetProcAddress_t)(HMODULE, LPCSTR);
-    typedef HMODULE (WINAPI *LoadLibraryA_t)(LPCSTR);
-    typedef LPVOID (WINAPI *VirtualAlloc_t)(LPVOID, SIZE_T, DWORD, DWORD);
-    typedef HMODULE (WINAPI *GetModuleHandleA_t)(LPCSTR);
+    typedef FARPROC (WINAPI *GPA)(HMODULE, LPCSTR);
+    typedef HMODULE (WINAPI *LLA)(LPCSTR);
+    typedef LPVOID (WINAPI *VA)(LPVOID, SIZE_T, DWORD, DWORD);
+    typedef BOOL (WINAPI *RAFA)(PRUNTIME_FUNCTION, DWORD, DWORD64);
+    typedef BOOL (WINAPI *VP)(LPVOID, SIZE_T, DWORD, PDWORD);
 
-    GetProcAddress_t pGetProcAddress = (GetProcAddress_t)get_proc_address(k32, sGetProcAddress);
-    LoadLibraryA_t pLoadLibraryA = (LoadLibraryA_t)pGetProcAddress((HMODULE)k32, sLoadLibraryA);
-    VirtualAlloc_t pVirtualAlloc = (VirtualAlloc_t)pGetProcAddress((HMODULE)k32, sVirtualAlloc);
-    GetModuleHandleA_t pGetModuleHandleA = (GetModuleHandleA_t)pGetProcAddress((HMODULE)k32, sGetModuleHandleA);
+    GPA pGPA = (GPA)get_proc_address(k32, sGPA);
+    LLA pLLA = (LLA)pGPA((HMODULE)k32, sLLA);
+    VA pVA = (VA)pGPA((HMODULE)k32, sVA);
+    VP pVP = (VP)pGPA((HMODULE)k32, sVP);
+    RAFA pRAFA = (RAFA)pGPA((HMODULE)ntdll, sRAFA);
 
     unsigned long long marker = 0xDEADBEEFCAFEBABEULL;
-    void* rip_ptr;
-    __asm__ ("lea (%%rip), %0" : "=r" (rip_ptr));
+    void* rip_ptr; __asm__ ("lea (%%rip), %0" : "=r" (rip_ptr));
 
-    char* search = (char*)rip_ptr;
-    int found = 0;
-    for (int i = 0; i < 1024 * 1024; i++) {
-        if (*(unsigned long long*)search == marker) {
-            if (*(unsigned short*)(search + 8) == 0x5A4D) {
-                search += 8; found = 1; break;
-            }
+    char* s = (char*)rip_ptr;
+    int f = 0;
+    for (int i=0; i<1024*1024; i++) {
+        if (*(unsigned long long*)s == marker) {
+            if (*(unsigned short*)(s + 8) == 0x5A4D) { s += 8; f = 1; break; }
         }
-        search++;
+        s++;
     }
-    if (!found) return;
+    if (!f) return;
 
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)search;
-    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(search + dos->e_lfanew);
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)s;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(s + dos->e_lfanew);
+    char* base = (char*)pVA(NULL, nt->OptionalHeader.SizeOfImage, MEM_RESERVE|MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!base) return;
 
-    char* image_base = (char*)pVirtualAlloc(NULL, nt->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    if (!image_base) return;
-
-    for (DWORD i = 0; i < nt->OptionalHeader.SizeOfHeaders; i++) image_base[i] = search[i];
-
-    PIMAGE_SECTION_HEADER sections = (PIMAGE_SECTION_HEADER)((char*)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
-    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
-        char* dest = image_base + sections[i].VirtualAddress;
-        char* src = search + sections[i].VirtualAddress;
-        for (DWORD j = 0; j < sections[i].SizeOfRawData; j++) dest[j] = src[j];
+    for (DWORD i=0; i<nt->OptionalHeader.SizeOfHeaders; i++) base[i] = s[i];
+    PIMAGE_SECTION_HEADER sh = (PIMAGE_SECTION_HEADER)((char*)&nt->OptionalHeader + nt->FileHeader.SizeOfOptionalHeader);
+    for (int i=0; i<nt->FileHeader.NumberOfSections; i++) {
+        char* dest = base + sh[i].VirtualAddress;
+        char* src = s + sh[i].VirtualAddress;
+        for (DWORD j=0; j<sh[i].SizeOfRawData; j++) dest[j] = src[j];
     }
 
-    PIMAGE_NT_HEADERS new_nt = (PIMAGE_NT_HEADERS)(image_base + ((PIMAGE_DOS_HEADER)image_base)->e_lfanew);
-
-    // Fix Imports
-    if (new_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size > 0) {
-        PIMAGE_IMPORT_DESCRIPTOR import_desc = (PIMAGE_IMPORT_DESCRIPTOR)(image_base + new_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-        while (import_desc->Name) {
-            HMODULE hMod = pLoadLibraryA(image_base + import_desc->Name);
-            PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)(image_base + import_desc->FirstThunk);
-            PIMAGE_THUNK_DATA orig_thunk = (PIMAGE_THUNK_DATA)(image_base + import_desc->OriginalFirstThunk);
-            if (!import_desc->OriginalFirstThunk) orig_thunk = thunk;
-            while (orig_thunk->u1.AddressOfData) {
-                if (IMAGE_SNAP_BY_ORDINAL(orig_thunk->u1.Ordinal)) thunk->u1.Function = (ULONG_PTR)pGetProcAddress(hMod, (LPCSTR)IMAGE_ORDINAL(orig_thunk->u1.Ordinal));
-                else thunk->u1.Function = (ULONG_PTR)pGetProcAddress(hMod, ((PIMAGE_IMPORT_BY_NAME)(image_base + orig_thunk->u1.AddressOfData))->Name);
-                thunk++; orig_thunk++;
+    PIMAGE_NT_HEADERS nnt = (PIMAGE_NT_HEADERS)(base + ((PIMAGE_DOS_HEADER)base)->e_lfanew);
+    if (nnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size > 0) {
+        PIMAGE_IMPORT_DESCRIPTOR id = (PIMAGE_IMPORT_DESCRIPTOR)(base + nnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+        while (id->Name) {
+            HMODULE hm = pLLA(base + id->Name);
+            PIMAGE_THUNK_DATA ft = (PIMAGE_THUNK_DATA)(base + id->FirstThunk);
+            PIMAGE_THUNK_DATA ot = (PIMAGE_THUNK_DATA)(base + id->OriginalFirstThunk);
+            if (!id->OriginalFirstThunk) ot = ft;
+            while (ot->u1.AddressOfData) {
+                if (IMAGE_SNAP_BY_ORDINAL(ot->u1.Ordinal)) ft->u1.Function = (ULONG_PTR)pGPA(hm, (LPCSTR)IMAGE_ORDINAL(ot->u1.Ordinal));
+                else ft->u1.Function = (ULONG_PTR)pGPA(hm, ((PIMAGE_IMPORT_BY_NAME)(base + ot->u1.AddressOfData))->Name);
+                ft++; ot++;
             }
-            import_desc++;
+            id++;
         }
     }
 
-    // Fix Relocations
-    ULONG_PTR delta = (ULONG_PTR)image_base - new_nt->OptionalHeader.ImageBase;
-    if (delta != 0 && new_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size > 0) {
-        PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)(image_base + new_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
-        while (reloc->VirtualAddress != 0) {
-            DWORD count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-            WORD* list = (WORD*)((char*)reloc + sizeof(IMAGE_BASE_RELOCATION));
-            for (DWORD i = 0; i < count; i++) {
-                if ((list[i] >> 12) == IMAGE_REL_BASED_DIR64) *(ULONG_PTR*)(image_base + reloc->VirtualAddress + (list[i] & 0xFFF)) += delta;
-                else if ((list[i] >> 12) == IMAGE_REL_BASED_HIGHLOW) *(DWORD*)(image_base + reloc->VirtualAddress + (list[i] & 0xFFF)) += (DWORD)delta;
+    ULONG_PTR de = (ULONG_PTR)base - nnt->OptionalHeader.ImageBase;
+    if (de != 0 && nnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size > 0) {
+        PIMAGE_BASE_RELOCATION re = (PIMAGE_BASE_RELOCATION)(base + nnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+        while (re->VirtualAddress != 0) {
+            DWORD ct = (re->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+            WORD* li = (WORD*)((char*)re + sizeof(IMAGE_BASE_RELOCATION));
+            for (DWORD i=0; i<ct; i++) {
+                if ((li[i] >> 12) == IMAGE_REL_BASED_DIR64) *(ULONG_PTR*)(base + re->VirtualAddress + (li[i] & 0xFFF)) += de;
+                else if ((li[i] >> 12) == IMAGE_REL_BASED_HIGHLOW) *(DWORD*)(base + re->VirtualAddress + (li[i] & 0xFFF)) += (DWORD)de;
             }
-            reloc = (PIMAGE_BASE_RELOCATION)((char*)reloc + reloc->SizeOfBlock);
+            re = (PIMAGE_BASE_RELOCATION)((char*)re + re->SizeOfBlock);
         }
     }
 
-    // x64 Exception Support
-    IMAGE_DATA_DIRECTORY exception_dir = new_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
-    if (exception_dir.Size > 0) {
-        char sNtdll[] = {'n','t','d','l','l','.','d','l','l',0};
-        char sRtlAddFunctionTable[] = {'R','t','l','A','d','d','F','u','n','c','t','i','o','n','T','a','b','l','e',0};
-        typedef BOOL (WINAPI *RAFA)(PRUNTIME_FUNCTION, DWORD, DWORD64);
-        RAFA pRtlAddFunctionTable = (RAFA)pGetProcAddress(pGetModuleHandleA(sNtdll), sRtlAddFunctionTable);
-        if (pRtlAddFunctionTable) pRtlAddFunctionTable((PRUNTIME_FUNCTION)(image_base + exception_dir.VirtualAddress), exception_dir.Size / sizeof(RUNTIME_FUNCTION), (ULONG_PTR)image_base);
+    if (pRAFA && nnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size > 0) {
+        pRAFA((PRUNTIME_FUNCTION)(base + nnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].VirtualAddress), nnt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION].Size / sizeof(RUNTIME_FUNCTION), (ULONG_PTR)base);
     }
 
-    ((void(*)())(image_base + new_nt->OptionalHeader.AddressOfEntryPoint))();
+    // Set protections
+    for (int i=0; i<nnt->FileHeader.NumberOfSections; i++) {
+        DWORD p=0, old;
+        if (sh[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
+            if (sh[i].Characteristics & IMAGE_SCN_MEM_WRITE) p=PAGE_EXECUTE_READWRITE;
+            else p=PAGE_EXECUTE_READ;
+        } else {
+            if (sh[i].Characteristics & IMAGE_SCN_MEM_WRITE) p=PAGE_READWRITE;
+            else p=PAGE_READONLY;
+        }
+        pVP(base + sh[i].VirtualAddress, sh[i].Misc.VirtualSize, p, &old);
+    }
+
+    ((void(*)())(base + nnt->OptionalHeader.AddressOfEntryPoint))();
 }
 
-static inline void* get_module_base(const char* name) {
-    PPEB peb;
-    __asm__ ("movq %%gs:0x60, %0" : "=r" (peb));
-    PLIST_ENTRY list = &peb->Ldr->InMemoryOrderModuleList;
-    PLIST_ENTRY entry = list->Flink; // exe
-    entry = entry->Flink; // ntdll
-    entry = entry->Flink; // kernel32
-    return ((PLDR_DATA_TABLE_ENTRY_CUSTOM)((char*)entry - sizeof(LIST_ENTRY)))->DllBase;
+static inline void* get_k32_base() {
+    PPEB p; __asm__ ("movq %%gs:0x60, %0" : "=r" (p));
+    PLIST_ENTRY l = &p->Ldr->InMemoryOrderModuleList;
+    PLIST_ENTRY e = l->Flink->Flink->Flink;
+    return ((PLDR_DATA_TABLE_ENTRY_CUSTOM)((char*)e - sizeof(LIST_ENTRY)))->DllBase;
 }
 
-static inline void* get_proc_address(void* module, const char* name) {
-    char* base = (char*)module;
-    PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)(base + ((PIMAGE_NT_HEADERS)(base + ((PIMAGE_DOS_HEADER)base)->e_lfanew))->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-    DWORD* names = (DWORD*)(base + exports->AddressOfNames);
-    DWORD* funcs = (DWORD*)(base + exports->AddressOfFunctions);
-    WORD* ordinals = (WORD*)(base + exports->AddressOfNameOrdinals);
-    for (DWORD i = 0; i < exports->NumberOfNames; i++) if (strings_equal(base + names[i], name)) return base + funcs[ordinals[i]];
+static inline void* get_ntdll_base() {
+    PPEB p; __asm__ ("movq %%gs:0x60, %0" : "=r" (p));
+    PLIST_ENTRY l = &p->Ldr->InMemoryOrderModuleList;
+    PLIST_ENTRY e = l->Flink->Flink;
+    return ((PLDR_DATA_TABLE_ENTRY_CUSTOM)((char*)e - sizeof(LIST_ENTRY)))->DllBase;
+}
+
+static inline void* get_proc_address(void* m, const char* n) {
+    char* b = (char*)m;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)(b + ((PIMAGE_DOS_HEADER)b)->e_lfanew);
+    PIMAGE_EXPORT_DIRECTORY ex = (PIMAGE_EXPORT_DIRECTORY)(b + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+    DWORD* ns = (DWORD*)(b + ex->AddressOfNames);
+    DWORD* fs = (DWORD*)(b + ex->AddressOfFunctions);
+    WORD* os = (WORD*)(b + ex->AddressOfNameOrdinals);
+    for (DWORD i=0; i<ex->NumberOfNames; i++) if (strings_equal(b + ns[i], n)) return b + fs[os[i]];
     return 0;
 }
 
