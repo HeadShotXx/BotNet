@@ -37,8 +37,12 @@ gcc pe_to_shellcode.c -o pe_to_shellcode
 
 ### 2. Prepare Stub
 ```bash
+# Compile stub.c. Section naming (.text$00, .text$01) ensures correct order.
 x86_64-w64-mingw32-gcc -c stub.c -o stub.o -fno-stack-protector -fPIC -O2
-x86_64-w64-mingw32-objcopy -O binary --only-section=.text.prologue --only-section=.text stub.o stub.bin
+
+# Link to merge sections and extract final binary
+x86_64-w64-mingw32-ld -T <<<'SECTIONS { .text : { *(.text$00) *(.text$01) *(.text) } }' stub.o -o stub.elf
+x86_64-w64-mingw32-objcopy -O binary --only-section=.text stub.elf stub.bin
 ```
 
 ### 3. Build Payload

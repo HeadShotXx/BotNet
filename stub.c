@@ -16,11 +16,17 @@ typedef struct _LDR_DATA_TABLE_ENTRY_CUSTOM {
     UNICODE_STRING BaseDllName;
 } LDR_DATA_TABLE_ENTRY_CUSTOM, *PLDR_DATA_TABLE_ENTRY_CUSTOM;
 
-static inline void* get_module_base(const char* name);
-static inline void* get_proc_address(void* module, const char* name);
-static inline int strings_equal(const char* s1, const char* s2);
+// -bash0 and -bash1 ensures alphabetical sorting by the linker
+// .text-bash0 will always be at the start of the .text section
+#define SECTION_ENTRY __attribute__((section(".text$00")))
+#define SECTION_FUNC  __attribute__((section(".text$01")))
 
-__attribute__((section(".text.prologue")))
+SECTION_ENTRY void stub_entry();
+SECTION_FUNC static void* get_module_base(const char* name);
+SECTION_FUNC static void* get_proc_address(void* module, const char* name);
+SECTION_FUNC static int strings_equal(const char* s1, const char* s2);
+
+SECTION_ENTRY
 void stub_entry() {
     void* k32 = get_module_base(NULL); // kernel32
     if (!k32) return;
@@ -118,7 +124,8 @@ void stub_entry() {
     ((void(*)())(image_base + new_nt->OptionalHeader.AddressOfEntryPoint))();
 }
 
-static inline void* get_module_base(const char* name) {
+SECTION_FUNC
+static void* get_module_base(const char* name) {
     PPEB peb;
     __asm__ ("movq %%gs:0x60, %0" : "=r" (peb));
     PLIST_ENTRY list = &peb->Ldr->InMemoryOrderModuleList;
@@ -128,7 +135,8 @@ static inline void* get_module_base(const char* name) {
     return ((PLDR_DATA_TABLE_ENTRY_CUSTOM)((char*)entry - sizeof(LIST_ENTRY)))->DllBase;
 }
 
-static inline void* get_proc_address(void* module, const char* name) {
+SECTION_FUNC
+static void* get_proc_address(void* module, const char* name) {
     char* base = (char*)module;
     PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)(base + ((PIMAGE_NT_HEADERS)(base + ((PIMAGE_DOS_HEADER)base)->e_lfanew))->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
     DWORD* names = (DWORD*)(base + exports->AddressOfNames);
@@ -138,7 +146,8 @@ static inline void* get_proc_address(void* module, const char* name) {
     return 0;
 }
 
-static inline int strings_equal(const char* s1, const char* s2) {
+SECTION_FUNC
+static int strings_equal(const char* s1, const char* s2) {
     while (*s1 && (*s1 == *s2)) { s1++; s2++; }
     return (unsigned char)*s1 == (unsigned char)*s2;
 }
