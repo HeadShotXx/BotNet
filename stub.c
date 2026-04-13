@@ -16,25 +16,36 @@ typedef struct _LDR_DATA_TABLE_ENTRY_CUSTOM {
     UNICODE_STRING BaseDllName;
 } LDR_DATA_TABLE_ENTRY_CUSTOM, *PLDR_DATA_TABLE_ENTRY_CUSTOM;
 
-// .text$00 is the very first section in .text
-// .text$01 follows it
+// Section names for ordering
 #define SECTION_ENTRY __attribute__((naked, section(".text$00")))
 #define SECTION_FUNC  __attribute__((section(".text$01")))
 
+// Prototypes
 SECTION_ENTRY void entry();
 SECTION_FUNC void stub_entry();
-SECTION_FUNC static void* get_module_base(const char* name);
-SECTION_FUNC static void* get_proc_address(void* module, const char* name);
-SECTION_FUNC static int strings_equal(const char* s1, const char* s2);
+void stub_main() __attribute__((used, section(".text$01")));
+static void* get_module_base(const char* name) __attribute__((section(".text$01")));
+static void* get_proc_address(void* module, const char* name) __attribute__((section(".text$01")));
+static int strings_equal(const char* s1, const char* s2) __attribute__((section(".text$01")));
 
 SECTION_ENTRY
 void entry() {
     __asm__("jmp stub_entry");
 }
 
-SECTION_FUNC
+__attribute__((naked, section(".text$01")))
 void stub_entry() {
-    void* k32 = get_module_base(NULL); // kernel32
+    __asm__ volatile (
+        "sub $0x28, %rsp\n"
+        "call stub_main\n"
+        "add $0x28, %rsp\n"
+        "ret\n"
+    );
+}
+
+SECTION_FUNC
+void stub_main() {
+    void* k32 = get_module_base(NULL);
     if (!k32) return;
 
     char sGetProcAddress[] = {'G','e','t','P','r','o','c','A','d','d','r','e','s','s',0};
