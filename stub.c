@@ -16,17 +16,23 @@ typedef struct _LDR_DATA_TABLE_ENTRY_CUSTOM {
     UNICODE_STRING BaseDllName;
 } LDR_DATA_TABLE_ENTRY_CUSTOM, *PLDR_DATA_TABLE_ENTRY_CUSTOM;
 
-// -bash0 and -bash1 ensures alphabetical sorting by the linker
-// .text-bash0 will always be at the start of the .text section
-#define SECTION_ENTRY __attribute__((section(".text$00")))
+// .text$00 is the very first section in .text
+// .text$01 follows it
+#define SECTION_ENTRY __attribute__((naked, section(".text$00")))
 #define SECTION_FUNC  __attribute__((section(".text$01")))
 
-SECTION_ENTRY void stub_entry();
+SECTION_ENTRY void entry();
+SECTION_FUNC void stub_entry();
 SECTION_FUNC static void* get_module_base(const char* name);
 SECTION_FUNC static void* get_proc_address(void* module, const char* name);
 SECTION_FUNC static int strings_equal(const char* s1, const char* s2);
 
 SECTION_ENTRY
+void entry() {
+    __asm__("jmp stub_entry");
+}
+
+SECTION_FUNC
 void stub_entry() {
     void* k32 = get_module_base(NULL); // kernel32
     if (!k32) return;
