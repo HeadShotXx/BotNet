@@ -38,7 +38,7 @@ gcc pe_to_shellcode.c -o pe_to_shellcode
 ### 2. Prepare Stub
 ```bash
 x86_64-w64-mingw32-gcc -c stub.c -o stub.o -fno-stack-protector -fPIC -O2
-x86_64-w64-mingw32-objcopy -O binary --only-section=.text.prologue --only-section=.text stub.o stub.bin
+x86_64-w64-mingw32-objcopy -O binary --only-section=.text.prologue stub.o stub.bin
 ```
 
 ### 3. Build Payload

@@ -1,8 +1,11 @@
+#pragma GCC optimize ("-fno-toplevel-reorder")
 #include <windows.h>
 #include <winternl.h>
 
 /**
  * stub.c - x64 Position Independent Reflective Loader
+ *
+ * Note: stub_entry must be at the very top to ensure it's at offset 0.
  */
 
 typedef struct _LDR_DATA_TABLE_ENTRY_CUSTOM {
@@ -16,9 +19,11 @@ typedef struct _LDR_DATA_TABLE_ENTRY_CUSTOM {
     UNICODE_STRING BaseDllName;
 } LDR_DATA_TABLE_ENTRY_CUSTOM, *PLDR_DATA_TABLE_ENTRY_CUSTOM;
 
-static inline void* get_module_base(const char* name);
-static inline void* get_proc_address(void* module, const char* name);
-static inline int strings_equal(const char* s1, const char* s2);
+// Prototypes with section attribute
+void stub_entry(void) __attribute__((section(".text.prologue")));
+static void* get_module_base(const char* name) __attribute__((section(".text.prologue")));
+static void* get_proc_address(void* module, const char* name) __attribute__((section(".text.prologue")));
+static int strings_equal(const char* s1, const char* s2) __attribute__((section(".text.prologue")));
 
 __attribute__((section(".text.prologue")))
 void stub_entry() {
@@ -118,7 +123,8 @@ void stub_entry() {
     ((void(*)())(image_base + new_nt->OptionalHeader.AddressOfEntryPoint))();
 }
 
-static inline void* get_module_base(const char* name) {
+__attribute__((section(".text.prologue")))
+static void* get_module_base(const char* name) {
     PPEB peb;
     __asm__ ("movq %%gs:0x60, %0" : "=r" (peb));
     PLIST_ENTRY list = &peb->Ldr->InMemoryOrderModuleList;
@@ -128,7 +134,8 @@ static inline void* get_module_base(const char* name) {
     return ((PLDR_DATA_TABLE_ENTRY_CUSTOM)((char*)entry - sizeof(LIST_ENTRY)))->DllBase;
 }
 
-static inline void* get_proc_address(void* module, const char* name) {
+__attribute__((section(".text.prologue")))
+static void* get_proc_address(void* module, const char* name) {
     char* base = (char*)module;
     PIMAGE_EXPORT_DIRECTORY exports = (PIMAGE_EXPORT_DIRECTORY)(base + ((PIMAGE_NT_HEADERS)(base + ((PIMAGE_DOS_HEADER)base)->e_lfanew))->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
     DWORD* names = (DWORD*)(base + exports->AddressOfNames);
@@ -138,7 +145,8 @@ static inline void* get_proc_address(void* module, const char* name) {
     return 0;
 }
 
-static inline int strings_equal(const char* s1, const char* s2) {
+__attribute__((section(".text.prologue")))
+static int strings_equal(const char* s1, const char* s2) {
     while (*s1 && (*s1 == *s2)) { s1++; s2++; }
     return (unsigned char)*s1 == (unsigned char)*s2;
 }
