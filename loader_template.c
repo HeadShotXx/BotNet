@@ -8,6 +8,49 @@
 #include <windows.h>
 #include <stdio.h>
 
+typedef LONG NTSTATUS;
+
+typedef struct _UNICODE_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} UNICODE_STRING, *PUNICODE_STRING;
+
+typedef struct _ANSI_STRING {
+    USHORT Length;
+    USHORT MaximumLength;
+    PSTR   Buffer;
+} ANSI_STRING, *PANSI_STRING;
+
+typedef NTSTATUS (NTAPI *pLdrLoadDll)(
+    PWSTR DllPath,
+    PULONG DllCharacteristics,
+    PUNICODE_STRING DllName,
+    PVOID *DllHandle
+);
+
+typedef NTSTATUS (NTAPI *pLdrGetProcedureAddress)(
+    PVOID DllHandle,
+    PANSI_STRING ProcedureName,
+    ULONG ProcedureNumber,
+    PVOID *ProcedureAddress
+);
+
+typedef VOID (NTAPI *pRtlInitAnsiString)(
+    PANSI_STRING DestinationString,
+    PCSZ SourceString
+);
+
+typedef NTSTATUS (NTAPI *pRtlAnsiStringToUnicodeString)(
+    PUNICODE_STRING DestinationString,
+    PANSI_STRING SourceString,
+    BOOLEAN AllocateDestinationString
+);
+
+typedef VOID (NTAPI *pRtlFreeUnicodeString)(
+    PUNICODE_STRING UnicodeString
+);
+
 // PE_BLOB_ARRAY
 unsigned char pe_blob[] = { 0 };
 
@@ -23,6 +66,13 @@ SIZE_T size_of_image = 0;
 typedef BOOL (WINAPI *DllEntryProc)(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved);
 
 void load_pe() {
+    HMODULE h_ntdll = GetModuleHandleA("ntdll.dll");
+    pLdrLoadDll _LdrLoadDll = (pLdrLoadDll)GetProcAddress(h_ntdll, "LdrLoadDll");
+    pLdrGetProcedureAddress _LdrGetProcedureAddress = (pLdrGetProcedureAddress)GetProcAddress(h_ntdll, "LdrGetProcedureAddress");
+    pRtlInitAnsiString _RtlInitAnsiString = (pRtlInitAnsiString)GetProcAddress(h_ntdll, "RtlInitAnsiString");
+    pRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString = (pRtlAnsiStringToUnicodeString)GetProcAddress(h_ntdll, "RtlAnsiStringToUnicodeString");
+    pRtlFreeUnicodeString _RtlFreeUnicodeString = (pRtlFreeUnicodeString)GetProcAddress(h_ntdll, "RtlFreeUnicodeString");
+
     PIMAGE_DOS_HEADER dos_header_raw = (PIMAGE_DOS_HEADER)pe_blob;
     PIMAGE_NT_HEADERS nt_headers_raw = (PIMAGE_NT_HEADERS)((char*)pe_blob + dos_header_raw->e_lfanew);
 
@@ -49,19 +99,31 @@ void load_pe() {
     if (import_dir.Size > 0) {
         PIMAGE_IMPORT_DESCRIPTOR import_desc = (PIMAGE_IMPORT_DESCRIPTOR)((char*)pe_buffer + import_dir.VirtualAddress);
         while (import_desc->Name) {
-            HMODULE h_module = LoadLibraryA((char*)pe_buffer + import_desc->Name);
+            ANSI_STRING ansi_dll;
+            UNICODE_STRING uni_dll;
+            _RtlInitAnsiString(&ansi_dll, (char*)pe_buffer + import_desc->Name);
+            _RtlAnsiStringToUnicodeString(&uni_dll, &ansi_dll, TRUE);
+
+            HANDLE h_module = NULL;
+            _LdrLoadDll(NULL, NULL, &uni_dll, &h_module);
+            _RtlFreeUnicodeString(&uni_dll);
+
             if (h_module) {
                 PIMAGE_THUNK_DATA first_thunk = (PIMAGE_THUNK_DATA)((char*)pe_buffer + import_desc->FirstThunk);
                 PIMAGE_THUNK_DATA original_first_thunk = (PIMAGE_THUNK_DATA)((char*)pe_buffer + import_desc->OriginalFirstThunk);
                 if (!import_desc->OriginalFirstThunk) original_first_thunk = first_thunk;
 
                 while (original_first_thunk->u1.AddressOfData) {
+                    PVOID addr = NULL;
                     if (IMAGE_SNAP_BY_ORDINAL(original_first_thunk->u1.Ordinal)) {
-                        first_thunk->u1.Function = (ULONG_PTR)GetProcAddress(h_module, (LPCSTR)IMAGE_ORDINAL(original_first_thunk->u1.Ordinal));
+                        _LdrGetProcedureAddress(h_module, NULL, (ULONG)IMAGE_ORDINAL(original_first_thunk->u1.Ordinal), &addr);
                     } else {
                         PIMAGE_IMPORT_BY_NAME import_by_name = (PIMAGE_IMPORT_BY_NAME)((char*)pe_buffer + original_first_thunk->u1.AddressOfData);
-                        first_thunk->u1.Function = (ULONG_PTR)GetProcAddress(h_module, import_by_name->Name);
+                        ANSI_STRING ansi_func;
+                        _RtlInitAnsiString(&ansi_func, (PCSZ)import_by_name->Name);
+                        _LdrGetProcedureAddress(h_module, &ansi_func, 0, &addr);
                     }
+                    first_thunk->u1.Function = (ULONG_PTR)addr;
                     first_thunk++;
                     original_first_thunk++;
                 }
