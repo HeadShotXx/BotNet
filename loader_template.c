@@ -50,6 +50,7 @@ typedef DWORD* LPDWORD;
 
 #define MEM_COMMIT 0x00001000
 #define MEM_RESERVE 0x00002000
+#define MEM_RELEASE 0x00008000
 #define PAGE_READWRITE 0x04
 #define PAGE_EXECUTE_READWRITE 0x40
 #define PAGE_EXECUTE_READ 0x20
@@ -376,6 +377,7 @@ typedef VOID (WINABI *fRtlInitAnsiString)(PANSI_STRING, const char*);
 typedef NTSTATUS (WINABI *fRtlAnsiStringToUnicodeString)(PUNICODE_STRING, PANSI_STRING, BOOLEAN);
 typedef VOID (WINABI *fRtlFreeUnicodeString)(PUNICODE_STRING);
 typedef LPVOID (WINABI *fVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
+typedef BOOL (WINABI *fVirtualFree)(LPVOID, SIZE_T, DWORD);
 typedef BOOL (WINABI *fVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
 typedef BOOL (WINABI *fRtlAddFunctionTable)(PRUNTIME_FUNCTION, DWORD, DWORD64);
 typedef VOID (WINABI *PIMAGE_TLS_CALLBACK)(PVOID, DWORD, PVOID);
@@ -424,6 +426,7 @@ static __inline__ PVOID GET_TEB() {
 static PIMAGE_TLS_DIRECTORY g_tls_dir = NULL;
 static DWORD g_tls_index = 0;
 static fVirtualAlloc g_vAlloc = NULL;
+static fVirtualFree g_vFree = NULL;
 static fTlsGetValue g_TlsGetValue = NULL;
 static fTlsSetValue g_TlsSetValue = NULL;
 static HANDLE g_hHeap = NULL;
@@ -596,14 +599,16 @@ static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, 
 // --- TLS Initialization Helper ---
 
 static VOID init_thread_tls() {
-    if (!g_tls_dir) return;
+    if (!g_tls_dir || !g_TlsGetValue || !g_TlsSetValue || !g_vAlloc) return;
+    if (g_TlsGetValue(g_tls_index) != NULL) return;
+
     SIZE_T tls_data_size = (SIZE_T)(g_tls_dir->EndAddressOfRawData - g_tls_dir->StartAddressOfRawData);
     SIZE_T total_tls_size = tls_data_size + g_tls_dir->SizeOfZeroFill;
-    LPVOID thread_tls_data = g_HeapAlloc(g_hHeap, 0, total_tls_size);
+    LPVOID thread_tls_data = g_vAlloc(NULL, total_tls_size, MEM_COMMIT, PAGE_READWRITE);
     if (thread_tls_data) {
         my_memcpy(thread_tls_data, (const void*)g_tls_dir->StartAddressOfRawData, tls_data_size);
         my_memset((char*)thread_tls_data + tls_data_size, 0, g_tls_dir->SizeOfZeroFill);
-        if (g_TlsSetValue) g_TlsSetValue(g_tls_index, thread_tls_data);
+        g_TlsSetValue(g_tls_index, thread_tls_data);
     }
 }
 
@@ -626,6 +631,7 @@ typedef struct _WRAPPER_ARGS {
 } WRAPPER_ARGS, *PWRAPPER_ARGS;
 
 static DWORD WINABI ThreadWrapper(LPVOID lpParam) {
+    if (!lpParam) return 0;
     PWRAPPER_ARGS args = (PWRAPPER_ARGS)lpParam;
     LPVOID func = args->func;
     LPVOID param = args->param;
@@ -635,11 +641,14 @@ static DWORD WINABI ThreadWrapper(LPVOID lpParam) {
     DWORD result = ((DWORD(WINABI*)(LPVOID))func)(param);
     run_tls_callbacks(DLL_THREAD_DETACH);
 
-    if (g_tls_dir && g_TlsGetValue && g_HeapFree) {
+    if (g_tls_dir && g_TlsGetValue && g_TlsSetValue && g_vFree) {
         LPVOID tls_data = g_TlsGetValue(g_tls_index);
-        if (tls_data) g_HeapFree(g_hHeap, 0, tls_data);
+        if (tls_data) {
+            g_vFree(tls_data, 0, MEM_RELEASE);
+            g_TlsSetValue(g_tls_index, NULL);
+        }
     }
-    if (g_HeapFree) g_HeapFree(g_hHeap, 0, args);
+    if (g_hHeap && g_HeapFree) g_HeapFree(g_hHeap, 0, args);
 
     return result;
 }
@@ -672,6 +681,7 @@ void load_pe() {
 
     HMODULE h_kernel32 = get_module_handle_manual("kernel32.dll");
     g_vAlloc = (fVirtualAlloc)get_export_address_manual(h_kernel32, "VirtualAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
+    g_vFree = (fVirtualFree)get_export_address_manual(h_kernel32, "VirtualFree", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
     fVirtualProtect _VirtualProtect = (fVirtualProtect)get_export_address_manual(h_kernel32, "VirtualProtect", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
     fTlsAlloc _TlsAlloc = (fTlsAlloc)get_export_address_manual(h_kernel32, "TlsAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
     g_TlsGetValue = (fTlsGetValue)get_export_address_manual(h_kernel32, "TlsGetValue", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
@@ -717,7 +727,12 @@ void load_pe() {
     if (tls_dir_info.Size > 0) {
         g_tls_dir = (PIMAGE_TLS_DIRECTORY)((char*)pe_buffer + tls_dir_info.VirtualAddress);
         g_tls_index = _TlsAlloc();
-        if (g_tls_dir->AddressOfIndex) *(DWORD*)(g_tls_dir->AddressOfIndex) = g_tls_index;
+        if (g_tls_dir->AddressOfIndex) {
+            if ((ULONG_PTR)g_tls_dir->AddressOfIndex >= (ULONG_PTR)pe_buffer &&
+                (ULONG_PTR)g_tls_dir->AddressOfIndex < (ULONG_PTR)pe_buffer + nt_headers->OptionalHeader.SizeOfImage) {
+                *(DWORD*)(g_tls_dir->AddressOfIndex) = g_tls_index;
+            }
+        }
     }
 
     IMAGE_DATA_DIRECTORY import_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -807,9 +822,12 @@ int main() {
 
     run_tls_callbacks(DLL_PROCESS_DETACH);
 
-    if (g_tls_dir && g_TlsGetValue && g_HeapFree) {
+    if (g_tls_dir && g_TlsGetValue && g_TlsSetValue && g_vFree) {
         LPVOID tls_data = g_TlsGetValue(g_tls_index);
-        if (tls_data) g_HeapFree(g_hHeap, 0, tls_data);
+        if (tls_data) {
+            g_vFree(tls_data, 0, MEM_RELEASE);
+            g_TlsSetValue(g_tls_index, NULL);
+        }
     }
 
     return 0;
