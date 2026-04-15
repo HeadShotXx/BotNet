@@ -1,8 +1,6 @@
 /**
  * loader_template.c - Advanced Reflective Loader (Zero Dependencies)
  * Optimized for Rust and modern Windows environments.
- *
- * This version implements full TLS support for all threads via CreateThread hooking.
  */
 
 #define NULL ((void*)0)
@@ -88,11 +86,7 @@ typedef DWORD* LPDWORD;
 #ifdef _WIN64
 #define WINABI
 #else
-#ifdef _MSC_VER
-#define WINABI __stdcall
-#else
 #define WINABI __attribute__((stdcall))
-#endif
 #endif
 
 // --- Structures ---
@@ -398,19 +392,25 @@ typedef BOOL (WINABI *fReadFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPVOID);
 
 #ifdef _MSC_VER
 #include <intrin.h>
-#define READ_PEB() (PVOID)(sizeof(PVOID) == 8 ? __readgsqword(0x60) : __readfsdword(0x30))
-#define READ_TEB() (PVOID)(sizeof(PVOID) == 8 ? __readgsqword(0x30) : __readfsdword(0x18))
+#define GET_PEB() (PVOID)(sizeof(PVOID) == 8 ? __readgsqword(0x60) : __readfsdword(0x30))
+#define GET_TEB() (PVOID)(sizeof(PVOID) == 8 ? __readgsqword(0x30) : __readfsdword(0x18))
 #else
-static __inline__ PVOID READ_PEB() {
+static __inline__ PVOID GET_PEB() {
     PVOID peb;
-    if (sizeof(PVOID) == 8) __asm__("mov %%gs:0x60, %0" : "=r" (peb));
-    else __asm__("mov %%fs:0x30, %0" : "=r" (peb));
+#ifdef _WIN64
+    __asm__("mov %%gs:0x60, %0" : "=r" (peb));
+#else
+    __asm__("mov %%fs:0x30, %0" : "=r" (peb));
+#endif
     return peb;
 }
-static __inline__ PVOID READ_TEB() {
+static __inline__ PVOID GET_TEB() {
     PVOID teb;
-    if (sizeof(PVOID) == 8) __asm__("mov %%gs:0x30, %0" : "=r" (teb));
-    else __asm__("mov %%fs:0x18, %0" : "=r" (teb));
+#ifdef _WIN64
+    __asm__("mov %%gs:0x30, %0" : "=r" (teb));
+#else
+    __asm__("mov %%fs:0x18, %0" : "=r" (teb));
+#endif
     return teb;
 }
 #endif
@@ -461,7 +461,7 @@ static int my_strncmp(const char* s1, const char* s2, SIZE_T n) {
 // --- Manual Resolution Logic ---
 
 static PVOID get_module_handle_manual(const char* dll_name) {
-    PPEB peb = (PPEB)READ_PEB();
+    PPEB peb = (PPEB)GET_PEB();
     PLIST_ENTRY head = &peb->Ldr->InLoadOrderModuleList;
     PLIST_ENTRY curr = head->Flink;
     while (curr != head) {
@@ -492,7 +492,7 @@ static void resolve_api_set(const char* dll_name, char* out_name) {
         int i = 0; while (dll_name[i]) { out_name[i] = dll_name[i]; i++; } out_name[i] = '\0';
         return;
     }
-    PVOID peb = READ_PEB();
+    PVOID peb = GET_PEB();
     PAPI_SET_NAMESPACE api_set_map = *(PAPI_SET_NAMESPACE*)((char*)peb + (sizeof(PVOID) == 8 ? 0x68 : 0x38));
     if (api_set_map->Version < 6) {
         int i = 0; while (dll_name[i]) { out_name[i] = dll_name[i]; i++; } out_name[i] = '\0';
@@ -570,7 +570,7 @@ static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, 
             char real_dll[MAX_PATH];
             resolve_api_set(dll_name, real_dll);
             HMODULE h_forward = get_module_handle_manual(real_dll);
-            if (!h_forward) {
+            if (!h_forward && _RtlInitAnsiString && _RtlAnsiStringToUnicodeString && _LdrLoadDll && _RtlFreeUnicodeString) {
                 ANSI_STRING a_dll; UNICODE_STRING u_dll;
                 _RtlInitAnsiString(&a_dll, real_dll);
                 _RtlAnsiStringToUnicodeString(&u_dll, &a_dll, TRUE);
@@ -593,9 +593,9 @@ static VOID init_thread_tls() {
     if (thread_tls_data) {
         my_memcpy(thread_tls_data, (const void*)g_tls_dir->StartAddressOfRawData, tls_data_size);
         my_memset((char*)thread_tls_data + tls_data_size, 0, g_tls_dir->SizeOfZeroFill);
-        void** tls_pointer_array = *(void***)((char*)READ_TEB() + (sizeof(PVOID) == 8 ? 0x58 : 0x2C));
-        if (tls_pointer_array) {
-            tls_pointer_array[g_tls_index] = thread_tls_data;
+        void*** tls_pointer_array_ptr = (void***)((char*)GET_TEB() + (sizeof(PVOID) == 8 ? 0x58 : 0x2C));
+        if (*tls_pointer_array_ptr) {
+            (*tls_pointer_array_ptr)[g_tls_index] = thread_tls_data;
         }
     }
 }
@@ -667,13 +667,31 @@ void load_pe() {
     if (!pe_buffer) return;
     g_pe_base = pe_buffer;
     my_memcpy(pe_buffer, pe_blob, nt_headers_raw->OptionalHeader.SizeOfHeaders);
-    PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt_headers_raw);
+    PIMAGE_SECTION_HEADER sections_raw = IMAGE_FIRST_SECTION(nt_headers_raw);
     for (int i = 0; i < nt_headers_raw->FileHeader.NumberOfSections; i++) {
-        if (sections[i].PointerToRawData != 0) {
-            my_memcpy((char*)pe_buffer + sections[i].VirtualAddress, (char*)pe_blob + sections[i].PointerToRawData, sections[i].SizeOfRawData);
+        if (sections_raw[i].PointerToRawData != 0) {
+            my_memcpy((char*)pe_buffer + sections_raw[i].VirtualAddress, (char*)pe_blob + sections_raw[i].PointerToRawData, sections_raw[i].SizeOfRawData);
         }
     }
     PIMAGE_NT_HEADERS nt_headers = (PIMAGE_NT_HEADERS)((char*)pe_buffer + ((PIMAGE_DOS_HEADER)pe_buffer)->e_lfanew);
+
+    ULONG_PTR delta = (ULONG_PTR)pe_buffer - nt_headers->OptionalHeader.ImageBase;
+    if (delta != 0) {
+        IMAGE_DATA_DIRECTORY reloc_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if (reloc_dir.Size > 0) {
+            PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)((char*)pe_buffer + reloc_dir.VirtualAddress);
+            while (reloc->VirtualAddress != 0) {
+                DWORD count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
+                WORD* list = (WORD*)((char*)reloc + sizeof(IMAGE_BASE_RELOCATION));
+                for (DWORD i = 0; i < count; i++) {
+                    WORD type = list[i] >> 12; WORD offset = list[i] & 0xFFF;
+                    if (type == IMAGE_REL_BASED_DIR64) *(ULONG_PTR*)((char*)pe_buffer + reloc->VirtualAddress + offset) += delta;
+                    else if (type == IMAGE_REL_BASED_HIGHLOW) *(DWORD*)((char*)pe_buffer + reloc->VirtualAddress + offset) += (DWORD)delta;
+                }
+                reloc = (PIMAGE_BASE_RELOCATION)((char*)reloc + reloc->SizeOfBlock);
+            }
+        }
+    }
 
     IMAGE_DATA_DIRECTORY tls_dir_info = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     if (tls_dir_info.Size > 0) {
@@ -715,23 +733,7 @@ void load_pe() {
             import_desc++;
         }
     }
-    ULONG_PTR delta = (ULONG_PTR)pe_buffer - nt_headers->OptionalHeader.ImageBase;
-    if (delta != 0) {
-        IMAGE_DATA_DIRECTORY reloc_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
-        if (reloc_dir.Size > 0) {
-            PIMAGE_BASE_RELOCATION reloc = (PIMAGE_BASE_RELOCATION)((char*)pe_buffer + reloc_dir.VirtualAddress);
-            while (reloc->VirtualAddress != 0) {
-                DWORD count = (reloc->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(WORD);
-                WORD* list = (WORD*)((char*)reloc + sizeof(IMAGE_BASE_RELOCATION));
-                for (DWORD i = 0; i < count; i++) {
-                    WORD type = list[i] >> 12; WORD offset = list[i] & 0xFFF;
-                    if (type == IMAGE_REL_BASED_DIR64) *(ULONG_PTR*)((char*)pe_buffer + reloc->VirtualAddress + offset) += delta;
-                    else if (type == IMAGE_REL_BASED_HIGHLOW) *(DWORD*)((char*)pe_buffer + reloc->VirtualAddress + offset) += (DWORD)delta;
-                }
-                reloc = (PIMAGE_BASE_RELOCATION)((char*)reloc + reloc->SizeOfBlock);
-            }
-        }
-    }
+
 #ifdef _WIN64
     IMAGE_DATA_DIRECTORY exception_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (exception_dir.Size > 0) {
@@ -743,7 +745,7 @@ void load_pe() {
     init_thread_tls();
     run_tls_callbacks(DLL_PROCESS_ATTACH);
 
-    sections = IMAGE_FIRST_SECTION(nt_headers);
+    PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt_headers);
     for (int i = 0; i < nt_headers->FileHeader.NumberOfSections; i++) {
         DWORD protection = 0;
         if (sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) {
@@ -764,8 +766,9 @@ int main() {
     load_pe();
 
     HMODULE h_kernel32 = get_module_handle_manual("kernel32.dll");
-    fRtlInitAnsiString _RtlInitAnsiString = (fRtlInitAnsiString)get_export_address_manual(get_module_handle_manual("ntdll.dll"), "RtlInitAnsiString", NULL, NULL, NULL, NULL, NULL);
-    fLdrGetProcedureAddress _LdrGetProcedureAddress = (fLdrGetProcedureAddress)get_export_address_manual(get_module_handle_manual("ntdll.dll"), "LdrGetProcedureAddress", _RtlInitAnsiString, NULL, NULL, NULL, NULL);
+    HMODULE h_ntdll = get_module_handle_manual("ntdll.dll");
+    fRtlInitAnsiString _RtlInitAnsiString = (fRtlInitAnsiString)get_export_address_manual(h_ntdll, "RtlInitAnsiString", NULL, NULL, NULL, NULL, NULL);
+    fLdrGetProcedureAddress _LdrGetProcedureAddress = (fLdrGetProcedureAddress)get_export_address_manual(h_ntdll, "LdrGetProcedureAddress", _RtlInitAnsiString, NULL, NULL, NULL, NULL);
     fGetStdHandle _GetStdHandle = (fGetStdHandle)get_export_address_manual(h_kernel32, "GetStdHandle", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
     fWriteFile _WriteFile = (fWriteFile)get_export_address_manual(h_kernel32, "WriteFile", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
     fReadFile _ReadFile = (fReadFile)get_export_address_manual(h_kernel32, "ReadFile", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
@@ -774,7 +777,7 @@ int main() {
         HANDLE hOut = _GetStdHandle(STD_OUTPUT_HANDLE);
         const char msg[] = "Press Enter to exit...";
         DWORD written;
-        _WriteFile(hOut, (LPVOID)msg, sizeof(msg)-1, &written, NULL);
+        _WriteFile(hOut, (LPVOID)msg, (DWORD)sizeof(msg)-1, &written, NULL);
 
         HANDLE hIn = _GetStdHandle(STD_INPUT_HANDLE);
         char buf[2];
