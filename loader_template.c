@@ -467,10 +467,16 @@ static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, 
     return addr;
 }
 
-// Payload info (Replaced by builder)
-unsigned char pe_blob[1] = { 0 };
+// PE_BLOB_ARRAY
+unsigned char pe_blob[] = { 0 };
+
+// ENTRY_POINT_RVA
 DWORD entry_point_rva = 0;
+
+// IMAGE_BASE
 ULONG_PTR image_base = 0;
+
+// SIZE_OF_IMAGE
 SIZE_T size_of_image = 0;
 
 void load_pe() {
