@@ -8,20 +8,27 @@
 #include <windows.h>
 #include <stdio.h>
 
+#ifndef NTSTATUS
 typedef LONG NTSTATUS;
+#endif
 
+#ifndef UNICODE_STRING
 typedef struct _UNICODE_STRING {
     USHORT Length;
     USHORT MaximumLength;
     PWSTR  Buffer;
 } UNICODE_STRING, *PUNICODE_STRING;
+#endif
 
+#ifndef ANSI_STRING
 typedef struct _ANSI_STRING {
     USHORT Length;
     USHORT MaximumLength;
     PSTR   Buffer;
 } ANSI_STRING, *PANSI_STRING;
+#endif
 
+// We define our own types to avoid conflicts and ensure they are available
 typedef NTSTATUS (NTAPI *pLdrLoadDll)(
     PWSTR DllPath,
     PULONG DllCharacteristics,
@@ -38,7 +45,7 @@ typedef NTSTATUS (NTAPI *pLdrGetProcedureAddress)(
 
 typedef VOID (NTAPI *pRtlInitAnsiString)(
     PANSI_STRING DestinationString,
-    PCSZ SourceString
+    const char* SourceString
 );
 
 typedef NTSTATUS (NTAPI *pRtlAnsiStringToUnicodeString)(
@@ -104,11 +111,12 @@ static __inline__ PVOID READ_PEB() {
 // Helper functions for manual resolution
 static int my_strlen(const char* s) {
     int l = 0;
-    while (s[l]) l++;
+    while (s && s[l]) l++;
     return l;
 }
 
 static int my_strcmp(const char* s1, const char* s2) {
+    if (!s1 || !s2) return -1;
     while (*s1 && (*s1 == *s2)) {
         s1++; s2++;
     }
@@ -116,6 +124,7 @@ static int my_strcmp(const char* s1, const char* s2) {
 }
 
 static int my_strncmp(const char* s1, const char* s2, size_t n) {
+    if (!s1 || !s2) return -1;
     while (n && *s1 && (*s1 == *s2)) {
         s1++; s2++; n--;
     }
@@ -123,6 +132,8 @@ static int my_strncmp(const char* s1, const char* s2, size_t n) {
     return *(unsigned char*)s1 - *(unsigned char*)s2;
 }
 
+// Forward declarations
+void resolve_api_set(const char* dll_name, char* out_name);
 PVOID get_export_address_manual(HMODULE h_module, const char* func_name, pRtlInitAnsiString _RtlInitAnsiString, pLdrGetProcedureAddress _LdrGetProcedureAddress, pLdrLoadDll _LdrLoadDll, pRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString, pRtlFreeUnicodeString _RtlFreeUnicodeString);
 
 void resolve_api_set(const char* dll_name, char* out_name) {
@@ -190,6 +201,7 @@ void resolve_api_set(const char* dll_name, char* out_name) {
 }
 
 PVOID get_export_address_manual(HMODULE h_module, const char* func_name, pRtlInitAnsiString _RtlInitAnsiString, pLdrGetProcedureAddress _LdrGetProcedureAddress, pLdrLoadDll _LdrLoadDll, pRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString, pRtlFreeUnicodeString _RtlFreeUnicodeString) {
+    if (!h_module) return NULL;
     PIMAGE_DOS_HEADER dos_header = (PIMAGE_DOS_HEADER)h_module;
     PIMAGE_NT_HEADERS nt_headers = (PIMAGE_NT_HEADERS)((char*)h_module + dos_header->e_lfanew);
     IMAGE_DATA_DIRECTORY export_dir_info = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -203,7 +215,7 @@ PVOID get_export_address_manual(HMODULE h_module, const char* func_name, pRtlIni
 
     PVOID addr = NULL;
     if (IMAGE_SNAP_BY_ORDINAL((ULONG_PTR)func_name)) {
-        WORD ordinal = IMAGE_ORDINAL((ULONG_PTR)func_name) - (WORD)export_dir->Base;
+        WORD ordinal = (WORD)IMAGE_ORDINAL((ULONG_PTR)func_name) - (WORD)export_dir->Base;
         addr = (PVOID)((char*)h_module + functions[ordinal]);
     } else {
         for (DWORD i = 0; i < export_dir->NumberOfNames; i++) {
