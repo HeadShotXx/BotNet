@@ -101,7 +101,7 @@ __asm__(
     "push %rbp\n"
     "mov %rsp, %rbp\n"
     "and $-16, %rsp\n"
-    "sub $32, %rsp\n"
+    "sub $48, %rsp\n"
     "mov %rcx, %rax\n"        // RAX = func
     "mov %rdx, %rcx\n"        // RCX = p1
     "mov %r8, %rdx\n"         // RDX = p2
@@ -428,6 +428,9 @@ typedef DWORD (WINABI *fTlsAlloc)(VOID);
 typedef LPVOID (WINABI *fTlsGetValue)(DWORD);
 typedef BOOL (WINABI *fTlsSetValue)(DWORD, LPVOID);
 typedef LPVOID (WINABI *fGetProcAddress)(HMODULE, const char*);
+typedef HANDLE (WINABI *fGetProcessHeap)(VOID);
+typedef LPVOID (WINABI *fHeapAlloc)(HANDLE, DWORD, SIZE_T);
+typedef BOOL (WINABI *fHeapFree)(HANDLE, DWORD, LPVOID);
 typedef HANDLE (WINABI *fCreateThread)(LPVOID, SIZE_T, LPVOID, LPVOID, DWORD, LPDWORD);
 typedef HANDLE (WINABI *fGetStdHandle)(DWORD);
 typedef BOOL (WINABI *fWriteFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPVOID);
@@ -463,9 +466,6 @@ static __inline__ PVOID GET_TEB() {
 }
 #endif
 
-// ENTRY_POINT_RVA
-static DWORD entry_point_rva = 0;
-
 // --- Global Variables ---
 static PIMAGE_TLS_DIRECTORY g_tls_dir = NULL;
 static DWORD g_tls_index = 0;
@@ -473,10 +473,14 @@ static fVirtualAlloc g_vAlloc = NULL;
 static fVirtualFree g_vFree = NULL;
 static fTlsGetValue g_fTlsGetValue = NULL;
 static fTlsSetValue g_fTlsSetValue = NULL;
+static fGetProcessHeap g_fGetProcessHeap = NULL;
+static fHeapAlloc g_fHeapAlloc = NULL;
+static fHeapFree g_fHeapFree = NULL;
 static fCreateThread g_origCreateThread = NULL;
 static fGetProcAddress g_origGetProcAddress = NULL;
 static PVOID g_pe_base = NULL;
 static BOOL g_is_dll = FALSE;
+static DWORD g_entry_point_rva = 0;
 
 // --- Helper Functions ---
 
@@ -644,14 +648,32 @@ static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, 
 // --- TLS Initialization Helper ---
 
 static VOID init_thread_tls() {
-    if (!g_tls_dir || !g_fTlsSetValue) return;
+    if (!g_tls_dir || !g_fTlsSetValue || !g_fTlsGetValue || !g_fHeapAlloc || !g_fGetProcessHeap) return;
+
+    // Check if already initialized for this thread to avoid leaks/double-init
+    if (g_fTlsGetValue(g_tls_index) != NULL) return;
+
     SIZE_T tls_data_size = (SIZE_T)(g_tls_dir->EndAddressOfRawData - g_tls_dir->StartAddressOfRawData);
     SIZE_T total_tls_size = tls_data_size + g_tls_dir->SizeOfZeroFill;
-    LPVOID thread_tls_data = g_vAlloc(NULL, total_tls_size, MEM_COMMIT, PAGE_READWRITE);
+
+    // Use HeapAlloc for TLS data block to avoid issues with VirtualFree and align destructors
+    LPVOID thread_tls_data = g_fHeapAlloc(g_fGetProcessHeap(), 0, total_tls_size);
     if (thread_tls_data) {
-        my_memcpy(thread_tls_data, (const void*)g_tls_dir->StartAddressOfRawData, tls_data_size);
-        my_memset((char*)thread_tls_data + tls_data_size, 0, g_tls_dir->SizeOfZeroFill);
+        if (tls_data_size > 0) {
+            my_memcpy(thread_tls_data, (const void*)g_tls_dir->StartAddressOfRawData, tls_data_size);
+        }
+        if (g_tls_dir->SizeOfZeroFill > 0) {
+            my_memset((char*)thread_tls_data + tls_data_size, 0, g_tls_dir->SizeOfZeroFill);
+        }
+
+        // Update the dynamic TLS slot
         g_fTlsSetValue(g_tls_index, thread_tls_data);
+
+        // Update the static TLS pointer array in the TEB
+        void*** tls_pointer_array_ptr = (void***)((char*)GET_TEB() + (sizeof(PVOID) == 8 ? 0x58 : 0x2C));
+        if (*tls_pointer_array_ptr) {
+            (*tls_pointer_array_ptr)[g_tls_index] = thread_tls_data;
+        }
     }
 }
 
@@ -712,26 +734,22 @@ static DWORD WINABI ThreadWrapper(LPVOID lpParam) {
 
     run_tls_callbacks(DLL_THREAD_DETACH);
 
-    if (g_fTlsGetValue && g_vFree) {
-        LPVOID thread_tls_data = g_fTlsGetValue(g_tls_index);
-        if (thread_tls_data) {
-            g_fTlsSetValue(g_tls_index, NULL);
-            g_vFree(thread_tls_data, 0, MEM_RELEASE);
-        }
-    }
+    // DONT free TLS data here. It causes "global allocator may not use TLS with destructors" in Rust.
+    // System thread cleanup will eventually reclaim what it can, and modern allocators handle this better if we don't yank memory early.
 
-    if (g_vFree) g_vFree(args, 0, MEM_RELEASE);
+    if (g_fHeapFree && g_fGetProcessHeap) g_fHeapFree(g_fGetProcessHeap(), 0, args);
     return result;
 }
 
 static HANDLE WINABI HookedCreateThread(LPVOID lpThreadAttributes, SIZE_T dwStackSize, LPVOID lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId) {
-    PWRAPPER_ARGS args = (PWRAPPER_ARGS)g_vAlloc(NULL, sizeof(WRAPPER_ARGS), MEM_COMMIT, PAGE_READWRITE);
+    if (!g_fHeapAlloc || !g_fGetProcessHeap) return NULL;
+    PWRAPPER_ARGS args = (PWRAPPER_ARGS)g_fHeapAlloc(g_fGetProcessHeap(), 0, sizeof(WRAPPER_ARGS));
     if (!args) return NULL;
     args->func = lpStartAddress;
     args->param = lpParameter;
     HANDLE hThread = g_origCreateThread(lpThreadAttributes, dwStackSize, (LPVOID)ThreadWrapper, args, dwCreationFlags, lpThreadId);
-    if (!hThread && g_vFree) {
-        g_vFree(args, 0, MEM_RELEASE);
+    if (!hThread && g_fHeapFree) {
+        g_fHeapFree(g_fGetProcessHeap(), 0, args);
     }
     return hThread;
 }
@@ -768,6 +786,9 @@ void load_pe() {
     fTlsAlloc _TlsAlloc = (fTlsAlloc)get_export_address_manual(h_kernel32, "TlsAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
     g_fTlsGetValue = (fTlsGetValue)get_export_address_manual(h_kernel32, "TlsGetValue", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
     g_fTlsSetValue = (fTlsSetValue)get_export_address_manual(h_kernel32, "TlsSetValue", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    g_fGetProcessHeap = (fGetProcessHeap)get_export_address_manual(h_kernel32, "GetProcessHeap", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    g_fHeapAlloc = (fHeapAlloc)get_export_address_manual(h_kernel32, "HeapAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    g_fHeapFree = (fHeapFree)get_export_address_manual(h_kernel32, "HeapFree", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
     g_origGetProcAddress = (fGetProcAddress)get_export_address_manual(h_kernel32, "GetProcAddress", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
 
     PIMAGE_DOS_HEADER dos_header_raw = (PIMAGE_DOS_HEADER)pe_blob;
@@ -776,7 +797,7 @@ void load_pe() {
     if (!pe_buffer) return;
     g_pe_base = pe_buffer;
     g_is_dll = (nt_headers_raw->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
-    entry_point_rva = nt_headers_raw->OptionalHeader.AddressOfEntryPoint;
+    g_entry_point_rva = nt_headers_raw->OptionalHeader.AddressOfEntryPoint;
     my_memcpy(pe_buffer, pe_blob, nt_headers_raw->OptionalHeader.SizeOfHeaders);
     PIMAGE_SECTION_HEADER sections_raw = IMAGE_FIRST_SECTION(nt_headers_raw);
     for (int i = 0; i < nt_headers_raw->FileHeader.NumberOfSections; i++) {
@@ -912,7 +933,7 @@ void load_pe() {
 
     if (g_is_dll) {
         typedef BOOL (WINABI *fDllMain)(HINSTANCE, DWORD, LPVOID);
-        fDllMain dll_main = (fDllMain)((char*)pe_buffer + entry_point_rva);
+        fDllMain dll_main = (fDllMain)((char*)pe_buffer + g_entry_point_rva);
 #ifdef _WIN64
         call_aligned((PVOID)dll_main, (PVOID)pe_buffer, (PVOID)DLL_PROCESS_ATTACH, NULL, NULL);
 #else
@@ -920,7 +941,7 @@ void load_pe() {
 #endif
     } else {
         typedef void (*fExeEntry)();
-        fExeEntry exe_entry = (fExeEntry)((char*)pe_buffer + entry_point_rva);
+        fExeEntry exe_entry = (fExeEntry)((char*)pe_buffer + g_entry_point_rva);
 #ifdef _WIN64
         call_aligned((PVOID)exe_entry, NULL, NULL, NULL, NULL);
 #else
