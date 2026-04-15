@@ -1,8 +1,8 @@
 /**
- * loader_template.c - Enhanced Reflective Loader (No Dependencies, Advanced TLS support)
+ * loader_template.c - Advanced Reflective Loader (Zero Dependencies)
+ * Optimized for Rust and modern Windows environments.
  *
- * This template is used to wrap a payload EXE.
- * It provides better support for exceptions (x64) and TLS (including Rust runtimes).
+ * This version implements full TLS support for all threads via CreateThread hooking.
  */
 
 #define NULL ((void*)0)
@@ -24,7 +24,7 @@ typedef void* PVOID;
 typedef PVOID HANDLE;
 typedef PVOID HMODULE;
 typedef PVOID HINSTANCE;
-typedef unsigned long long SIZE_T;
+typedef QWORD SIZE_T;
 typedef int BOOL;
 typedef long LONG;
 typedef unsigned long ULONG;
@@ -40,19 +40,24 @@ typedef unsigned long long DWORD64;
 typedef DWORD* PDWORD;
 typedef WORD* PWORD;
 typedef LONG NTSTATUS;
+typedef DWORD* LPDWORD;
 
 #define TRUE 1
 #define FALSE 0
 
 #define DLL_PROCESS_ATTACH 1
+#define DLL_THREAD_ATTACH  2
+#define DLL_THREAD_DETACH  3
+#define DLL_PROCESS_DETACH 0
+
 #define MEM_COMMIT 0x00001000
 #define MEM_RESERVE 0x00002000
-#define PAGE_NOACCESS 0x01
-#define PAGE_READONLY 0x02
 #define PAGE_READWRITE 0x04
-#define PAGE_EXECUTE 0x10
-#define PAGE_EXECUTE_READ 0x20
 #define PAGE_EXECUTE_READWRITE 0x40
+#define PAGE_EXECUTE_READ 0x20
+#define PAGE_EXECUTE 0x10
+#define PAGE_READONLY 0x02
+#define PAGE_NOACCESS 0x01
 
 #define IMAGE_DIRECTORY_ENTRY_EXPORT 0
 #define IMAGE_DIRECTORY_ENTRY_IMPORT 1
@@ -79,6 +84,18 @@ typedef LONG NTSTATUS;
 #ifndef MAX_PATH
 #define MAX_PATH 260
 #endif
+
+#ifdef _WIN64
+#define WINABI
+#else
+#ifdef _MSC_VER
+#define WINABI __stdcall
+#else
+#define WINABI __attribute__((stdcall))
+#endif
+#endif
+
+// --- Structures ---
 
 typedef struct _UNICODE_STRING {
     USHORT Length;
@@ -357,63 +374,67 @@ typedef struct _API_SET_VALUE_ENTRY {
     ULONG ValueLength;
 } API_SET_VALUE_ENTRY, *PAPI_SET_VALUE_ENTRY;
 
-// Function pointers
-typedef NTSTATUS (*pLdrLoadDll)(PWSTR, PULONG, PUNICODE_STRING, PVOID*);
-typedef NTSTATUS (*pLdrGetProcedureAddress)(PVOID, PANSI_STRING, ULONG, PVOID*);
-typedef VOID (*pRtlInitAnsiString)(PANSI_STRING, const char*);
-typedef NTSTATUS (*pRtlAnsiStringToUnicodeString)(PUNICODE_STRING, PANSI_STRING, BOOLEAN);
-typedef VOID (*pRtlFreeUnicodeString)(PUNICODE_STRING);
-typedef LPVOID (*pVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
-typedef BOOL (*pVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
-typedef BOOL (*pRtlAddFunctionTable)(PRUNTIME_FUNCTION, DWORD, DWORD64);
-typedef VOID (*PIMAGE_TLS_CALLBACK)(PVOID, DWORD, PVOID);
-typedef DWORD (*pTlsAlloc)(VOID);
+// --- Function Pointer Types ---
+
+typedef NTSTATUS (WINABI *fLdrLoadDll)(PWSTR, PULONG, PUNICODE_STRING, PVOID*);
+typedef NTSTATUS (WINABI *fLdrGetProcedureAddress)(PVOID, PANSI_STRING, ULONG, PVOID*);
+typedef VOID (WINABI *fRtlInitAnsiString)(PANSI_STRING, const char*);
+typedef NTSTATUS (WINABI *fRtlAnsiStringToUnicodeString)(PUNICODE_STRING, PANSI_STRING, BOOLEAN);
+typedef VOID (WINABI *fRtlFreeUnicodeString)(PUNICODE_STRING);
+typedef LPVOID (WINABI *fVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
+typedef BOOL (WINABI *fVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
+typedef BOOL (WINABI *fRtlAddFunctionTable)(PRUNTIME_FUNCTION, DWORD, DWORD64);
+typedef VOID (WINABI *PIMAGE_TLS_CALLBACK)(PVOID, DWORD, PVOID);
+typedef DWORD (WINABI *fTlsAlloc)(VOID);
+typedef HANDLE (WINABI *fCreateThread)(LPVOID, SIZE_T, LPVOID, LPVOID, DWORD, LPDWORD);
+typedef HANDLE (WINABI *fGetStdHandle)(DWORD);
+typedef BOOL (WINABI *fWriteFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPVOID);
+typedef BOOL (WINABI *fReadFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPVOID);
+
+#define STD_INPUT_HANDLE  ((DWORD)-10)
+#define STD_OUTPUT_HANDLE ((DWORD)-11)
+
+// --- PEB / TEB Access ---
 
 #ifdef _MSC_VER
 #include <intrin.h>
-#ifdef _WIN64
-#define READ_PEB() (PVOID)__readgsqword(0x60)
-#define READ_TEB() (PVOID)__readgsqword(0x30)
+#define READ_PEB() (PVOID)(sizeof(PVOID) == 8 ? __readgsqword(0x60) : __readfsdword(0x30))
+#define READ_TEB() (PVOID)(sizeof(PVOID) == 8 ? __readgsqword(0x30) : __readfsdword(0x18))
 #else
-#define READ_PEB() (PVOID)__readfsdword(0x30)
-#define READ_TEB() (PVOID)__readfsdword(0x18)
-#endif
-#else
-#ifdef _WIN64
 static __inline__ PVOID READ_PEB() {
     PVOID peb;
-    __asm__("mov %%gs:0x60, %0" : "=r" (peb));
+    if (sizeof(PVOID) == 8) __asm__("mov %%gs:0x60, %0" : "=r" (peb));
+    else __asm__("mov %%fs:0x30, %0" : "=r" (peb));
     return peb;
 }
 static __inline__ PVOID READ_TEB() {
     PVOID teb;
-    __asm__("mov %%gs:0x30, %0" : "=r" (teb));
+    if (sizeof(PVOID) == 8) __asm__("mov %%gs:0x30, %0" : "=r" (teb));
+    else __asm__("mov %%fs:0x18, %0" : "=r" (teb));
     return teb;
 }
-#else
-static __inline__ PVOID READ_PEB() {
-    PVOID peb;
-    __asm__("mov %%fs:0x30, %0" : "=r" (peb));
-    return peb;
-}
-static __inline__ PVOID READ_TEB() {
-    PVOID teb;
-    __asm__("mov %%fs:0x18, %0" : "=r" (teb));
-    return teb;
-}
-#endif
 #endif
 
-// Helper functions
+// --- Global Variables ---
+static PIMAGE_TLS_DIRECTORY g_tls_dir = NULL;
+static DWORD g_tls_index = 0;
+static fVirtualAlloc g_vAlloc = NULL;
+static fCreateThread g_origCreateThread = NULL;
+static PVOID g_pe_base = NULL;
+
+// --- Helper Functions ---
+
 static void* my_memcpy(void* dest, const void* src, SIZE_T n) {
     char* d = (char*)dest;
     const char* s = (const char*)src;
+    if (!d || !s) return dest;
     while (n--) *d++ = *s++;
     return dest;
 }
 
 static void* my_memset(void* s, int c, SIZE_T n) {
     unsigned char* p = (unsigned char*)s;
+    if (!p) return s;
     while (n--) *p++ = (unsigned char)c;
     return s;
 }
@@ -437,7 +458,8 @@ static int my_strncmp(const char* s1, const char* s2, SIZE_T n) {
     return *(unsigned char*)s1 - *(unsigned char*)s2;
 }
 
-// Manual resolution
+// --- Manual Resolution Logic ---
+
 static PVOID get_module_handle_manual(const char* dll_name) {
     PPEB peb = (PPEB)READ_PEB();
     PLIST_ENTRY head = &peb->Ldr->InLoadOrderModuleList;
@@ -450,7 +472,7 @@ static PVOID get_module_handle_manual(const char* dll_name) {
         while (dll_name[i] && i < MAX_PATH - 1) { w_dll_name[i] = (WCHAR)dll_name[i]; i++; }
         w_dll_name[i] = 0;
         int match = 1;
-        if (entry->BaseDllName.Length / 2 >= i) {
+        if (entry->BaseDllName.Length / 2 >= (USHORT)i) {
             for (int j = 0; j < i; j++) {
                 WCHAR c1 = w_dll_name[j];
                 WCHAR c2 = entry->BaseDllName.Buffer[j];
@@ -458,16 +480,55 @@ static PVOID get_module_handle_manual(const char* dll_name) {
                 if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
                 if (c1 != c2) { match = 0; break; }
             }
-            if (match && (entry->BaseDllName.Length / 2 == i || entry->BaseDllName.Buffer[i] == 0)) return entry->DllBase;
+            if (match && (entry->BaseDllName.Length / 2 == (USHORT)i || entry->BaseDllName.Buffer[i] == 0)) return entry->DllBase;
         }
         curr = curr->Flink;
     }
     return NULL;
 }
 
-static void resolve_api_set(const char* dll_name, char* out_name);
+static void resolve_api_set(const char* dll_name, char* out_name) {
+    if (my_strncmp(dll_name, "api-", 4) != 0 && my_strncmp(dll_name, "ext-", 4) != 0) {
+        int i = 0; while (dll_name[i]) { out_name[i] = dll_name[i]; i++; } out_name[i] = '\0';
+        return;
+    }
+    PVOID peb = READ_PEB();
+    PAPI_SET_NAMESPACE api_set_map = *(PAPI_SET_NAMESPACE*)((char*)peb + (sizeof(PVOID) == 8 ? 0x68 : 0x38));
+    if (api_set_map->Version < 6) {
+        int i = 0; while (dll_name[i]) { out_name[i] = dll_name[i]; i++; } out_name[i] = '\0';
+        return;
+    }
+    PAPI_SET_NAMESPACE_ENTRY entries = (PAPI_SET_NAMESPACE_ENTRY)((char*)api_set_map + api_set_map->EntryOffset);
+    SIZE_T dll_name_len = my_strlen(dll_name);
+    if (dll_name_len > 4 && (dll_name[dll_name_len - 4] == '.')) dll_name_len -= 4;
+    for (ULONG i = 0; i < api_set_map->Count; i++) {
+        PAPI_SET_NAMESPACE_ENTRY entry = &entries[i];
+        PWSTR name = (PWSTR)((char*)api_set_map + entry->NameOffset);
+        if (dll_name_len == (SIZE_T)entry->NameLength / 2) {
+            int match = 1;
+            for (SIZE_T j = 0; j < dll_name_len; j++) {
+                WCHAR c1 = (WCHAR)dll_name[j]; WCHAR c2 = name[j];
+                if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
+                if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
+                if (c1 != c2) { match = 0; break; }
+            }
+            if (match) {
+                PAPI_SET_VALUE_ENTRY values = (PAPI_SET_VALUE_ENTRY)((char*)api_set_map + entry->ValueOffset);
+                if (entry->ValueCount > 0) {
+                    PAPI_SET_VALUE_ENTRY value = &values[0];
+                    PWSTR target_dll_wide = (PWSTR)((char*)api_set_map + value->ValueOffset);
+                    ULONG target_dll_len = value->ValueLength / 2;
+                    for (ULONG k = 0; k < target_dll_len; k++) out_name[k] = (char)target_dll_wide[k];
+                    out_name[target_dll_len] = '\0';
+                    return;
+                }
+            }
+        }
+    }
+    int k = 0; while (dll_name[k]) { out_name[k] = dll_name[k]; k++; } out_name[k] = '\0';
+}
 
-static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, pRtlInitAnsiString _RtlInitAnsiString, pLdrGetProcedureAddress _LdrGetProcedureAddress, pLdrLoadDll _LdrLoadDll, pRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString, pRtlFreeUnicodeString _RtlFreeUnicodeString) {
+static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, fRtlInitAnsiString _RtlInitAnsiString, fLdrGetProcedureAddress _LdrGetProcedureAddress, fLdrLoadDll _LdrLoadDll, fRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString, fRtlFreeUnicodeString _RtlFreeUnicodeString) {
     if (!h_module) return NULL;
     PIMAGE_DOS_HEADER dos_header = (PIMAGE_DOS_HEADER)h_module;
     PIMAGE_NT_HEADERS nt_headers = (PIMAGE_NT_HEADERS)((char*)h_module + dos_header->e_lfanew);
@@ -522,46 +583,61 @@ static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, 
     return addr;
 }
 
-static void resolve_api_set(const char* dll_name, char* out_name) {
-    if (my_strncmp(dll_name, "api-", 4) != 0 && my_strncmp(dll_name, "ext-", 4) != 0) {
-        int i = 0; while (dll_name[i]) { out_name[i] = dll_name[i]; i++; } out_name[i] = '\0';
-        return;
-    }
-    PVOID peb = READ_PEB();
-    PAPI_SET_NAMESPACE api_set_map = *(PAPI_SET_NAMESPACE*)((char*)peb + (sizeof(PVOID) == 8 ? 0x68 : 0x38));
-    if (api_set_map->Version < 6) {
-        int i = 0; while (dll_name[i]) { out_name[i] = dll_name[i]; i++; } out_name[i] = '\0';
-        return;
-    }
-    PAPI_SET_NAMESPACE_ENTRY entries = (PAPI_SET_NAMESPACE_ENTRY)((char*)api_set_map + api_set_map->EntryOffset);
-    SIZE_T dll_name_len = my_strlen(dll_name);
-    if (dll_name_len > 4 && (dll_name[dll_name_len - 4] == '.')) dll_name_len -= 4;
-    for (ULONG i = 0; i < api_set_map->Count; i++) {
-        PAPI_SET_NAMESPACE_ENTRY entry = &entries[i];
-        PWSTR name = (PWSTR)((char*)api_set_map + entry->NameOffset);
-        if (dll_name_len == (SIZE_T)entry->NameLength / 2) {
-            int match = 1;
-            for (SIZE_T j = 0; j < dll_name_len; j++) {
-                WCHAR c1 = (WCHAR)dll_name[j]; WCHAR c2 = name[j];
-                if (c1 >= 'A' && c1 <= 'Z') c1 += 32;
-                if (c2 >= 'A' && c2 <= 'Z') c2 += 32;
-                if (c1 != c2) { match = 0; break; }
-            }
-            if (match) {
-                PAPI_SET_VALUE_ENTRY values = (PAPI_SET_VALUE_ENTRY)((char*)api_set_map + entry->ValueOffset);
-                if (entry->ValueCount > 0) {
-                    PAPI_SET_VALUE_ENTRY value = &values[0];
-                    PWSTR target_dll_wide = (PWSTR)((char*)api_set_map + value->ValueOffset);
-                    ULONG target_dll_len = value->ValueLength / 2;
-                    for (ULONG k = 0; k < target_dll_len; k++) out_name[k] = (char)target_dll_wide[k];
-                    out_name[target_dll_len] = '\0';
-                    return;
-                }
-            }
+// --- TLS Initialization Helper ---
+
+static VOID init_thread_tls() {
+    if (!g_tls_dir) return;
+    SIZE_T tls_data_size = (SIZE_T)(g_tls_dir->EndAddressOfRawData - g_tls_dir->StartAddressOfRawData);
+    SIZE_T total_tls_size = tls_data_size + g_tls_dir->SizeOfZeroFill;
+    LPVOID thread_tls_data = g_vAlloc(NULL, total_tls_size, MEM_COMMIT, PAGE_READWRITE);
+    if (thread_tls_data) {
+        my_memcpy(thread_tls_data, (const void*)g_tls_dir->StartAddressOfRawData, tls_data_size);
+        my_memset((char*)thread_tls_data + tls_data_size, 0, g_tls_dir->SizeOfZeroFill);
+        void** tls_pointer_array = *(void***)((char*)READ_TEB() + (sizeof(PVOID) == 8 ? 0x58 : 0x2C));
+        if (tls_pointer_array) {
+            tls_pointer_array[g_tls_index] = thread_tls_data;
         }
     }
-    int k = 0; while (dll_name[k]) { out_name[k] = dll_name[k]; k++; } out_name[k] = '\0';
 }
+
+static VOID run_tls_callbacks(DWORD reason) {
+    if (!g_tls_dir) return;
+    PIMAGE_TLS_CALLBACK* callbacks = (PIMAGE_TLS_CALLBACK*)g_tls_dir->AddressOfCallBacks;
+    if (callbacks) {
+        while (*callbacks) {
+            (*callbacks)(g_pe_base, reason, NULL);
+            callbacks++;
+        }
+    }
+}
+
+// --- Thread Wrapper & Hook ---
+
+typedef struct _WRAPPER_ARGS {
+    LPVOID func;
+    LPVOID param;
+} WRAPPER_ARGS, *PWRAPPER_ARGS;
+
+static DWORD WINABI ThreadWrapper(LPVOID lpParam) {
+    PWRAPPER_ARGS args = (PWRAPPER_ARGS)lpParam;
+    LPVOID func = args->func;
+    LPVOID param = args->param;
+
+    init_thread_tls();
+    run_tls_callbacks(DLL_THREAD_ATTACH);
+    DWORD result = ((DWORD(WINABI*)(LPVOID))func)(param);
+    run_tls_callbacks(DLL_THREAD_DETACH);
+    return result;
+}
+
+static HANDLE WINABI HookedCreateThread(LPVOID lpThreadAttributes, SIZE_T dwStackSize, LPVOID lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId) {
+    PWRAPPER_ARGS args = (PWRAPPER_ARGS)g_vAlloc(NULL, sizeof(WRAPPER_ARGS), MEM_COMMIT, PAGE_READWRITE);
+    args->func = lpStartAddress;
+    args->param = lpParameter;
+    return g_origCreateThread(lpThreadAttributes, dwStackSize, (LPVOID)ThreadWrapper, args, dwCreationFlags, lpThreadId);
+}
+
+// --- Main loading logic ---
 
 // PE_BLOB_ARRAY
 unsigned char pe_blob[] = { 0 };
@@ -574,20 +650,22 @@ SIZE_T size_of_image = 0;
 
 void load_pe() {
     HMODULE h_ntdll = get_module_handle_manual("ntdll.dll");
-    pRtlInitAnsiString _RtlInitAnsiString = (pRtlInitAnsiString)get_export_address_manual(h_ntdll, "RtlInitAnsiString", NULL, NULL, NULL, NULL, NULL);
-    pLdrGetProcedureAddress _LdrGetProcedureAddress = (pLdrGetProcedureAddress)get_export_address_manual(h_ntdll, "LdrGetProcedureAddress", _RtlInitAnsiString, NULL, NULL, NULL, NULL);
-    pLdrLoadDll _LdrLoadDll = (pLdrLoadDll)get_export_address_manual(h_ntdll, "LdrLoadDll", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
-    pRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString = (pRtlAnsiStringToUnicodeString)get_export_address_manual(h_ntdll, "RtlAnsiStringToUnicodeString", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, NULL, NULL);
-    pRtlFreeUnicodeString _RtlFreeUnicodeString = (pRtlFreeUnicodeString)get_export_address_manual(h_ntdll, "RtlFreeUnicodeString", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, NULL);
+    fRtlInitAnsiString _RtlInitAnsiString = (fRtlInitAnsiString)get_export_address_manual(h_ntdll, "RtlInitAnsiString", NULL, NULL, NULL, NULL, NULL);
+    fLdrGetProcedureAddress _LdrGetProcedureAddress = (fLdrGetProcedureAddress)get_export_address_manual(h_ntdll, "LdrGetProcedureAddress", _RtlInitAnsiString, NULL, NULL, NULL, NULL);
+    fLdrLoadDll _LdrLoadDll = (fLdrLoadDll)get_export_address_manual(h_ntdll, "LdrLoadDll", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
+    fRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString = (fRtlAnsiStringToUnicodeString)get_export_address_manual(h_ntdll, "RtlAnsiStringToUnicodeString", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, NULL, NULL);
+    fRtlFreeUnicodeString _RtlFreeUnicodeString = (fRtlFreeUnicodeString)get_export_address_manual(h_ntdll, "RtlFreeUnicodeString", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, NULL);
+
     HMODULE h_kernel32 = get_module_handle_manual("kernel32.dll");
-    pVirtualAlloc _VirtualAlloc = (pVirtualAlloc)get_export_address_manual(h_kernel32, "VirtualAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
-    pVirtualProtect _VirtualProtect = (pVirtualProtect)get_export_address_manual(h_kernel32, "VirtualProtect", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
-    pTlsAlloc _TlsAlloc = (pTlsAlloc)get_export_address_manual(h_kernel32, "TlsAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    g_vAlloc = (fVirtualAlloc)get_export_address_manual(h_kernel32, "VirtualAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    fVirtualProtect _VirtualProtect = (fVirtualProtect)get_export_address_manual(h_kernel32, "VirtualProtect", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    fTlsAlloc _TlsAlloc = (fTlsAlloc)get_export_address_manual(h_kernel32, "TlsAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
 
     PIMAGE_DOS_HEADER dos_header_raw = (PIMAGE_DOS_HEADER)pe_blob;
     PIMAGE_NT_HEADERS nt_headers_raw = (PIMAGE_NT_HEADERS)((char*)pe_blob + dos_header_raw->e_lfanew);
-    LPVOID pe_buffer = _VirtualAlloc(NULL, nt_headers_raw->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    LPVOID pe_buffer = g_vAlloc(NULL, nt_headers_raw->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!pe_buffer) return;
+    g_pe_base = pe_buffer;
     my_memcpy(pe_buffer, pe_blob, nt_headers_raw->OptionalHeader.SizeOfHeaders);
     PIMAGE_SECTION_HEADER sections = IMAGE_FIRST_SECTION(nt_headers_raw);
     for (int i = 0; i < nt_headers_raw->FileHeader.NumberOfSections; i++) {
@@ -596,6 +674,14 @@ void load_pe() {
         }
     }
     PIMAGE_NT_HEADERS nt_headers = (PIMAGE_NT_HEADERS)((char*)pe_buffer + ((PIMAGE_DOS_HEADER)pe_buffer)->e_lfanew);
+
+    IMAGE_DATA_DIRECTORY tls_dir_info = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (tls_dir_info.Size > 0) {
+        g_tls_dir = (PIMAGE_TLS_DIRECTORY)((char*)pe_buffer + tls_dir_info.VirtualAddress);
+        g_tls_index = _TlsAlloc();
+        if (g_tls_dir->AddressOfIndex) *(DWORD*)(g_tls_dir->AddressOfIndex) = g_tls_index;
+    }
+
     IMAGE_DATA_DIRECTORY import_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (import_dir.Size > 0) {
         PIMAGE_IMPORT_DESCRIPTOR import_desc = (PIMAGE_IMPORT_DESCRIPTOR)((char*)pe_buffer + import_dir.VirtualAddress);
@@ -616,7 +702,12 @@ void load_pe() {
                         addr = get_export_address_manual((HMODULE)h_module, (char*)original_first_thunk->u1.Ordinal, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
                     } else {
                         PIMAGE_IMPORT_BY_NAME import_by_name = (PIMAGE_IMPORT_BY_NAME)((char*)pe_buffer + original_first_thunk->u1.AddressOfData);
-                        addr = get_export_address_manual((HMODULE)h_module, (char*)import_by_name->Name, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                        if (my_strcmp(import_by_name->Name, "CreateThread") == 0) {
+                            g_origCreateThread = (fCreateThread)get_export_address_manual((HMODULE)h_module, "CreateThread", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                            addr = (PVOID)HookedCreateThread;
+                        } else {
+                            addr = get_export_address_manual((HMODULE)h_module, (char*)import_by_name->Name, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                        }
                     }
                     first_thunk->u1.Function = (ULONG_PTR)addr; first_thunk++; original_first_thunk++;
                 }
@@ -644,47 +735,13 @@ void load_pe() {
 #ifdef _WIN64
     IMAGE_DATA_DIRECTORY exception_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (exception_dir.Size > 0) {
-        pRtlAddFunctionTable _RtlAddFunctionTable = (pRtlAddFunctionTable)get_export_address_manual(h_ntdll, "RtlAddFunctionTable", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+        fRtlAddFunctionTable _RtlAddFunctionTable = (fRtlAddFunctionTable)get_export_address_manual(h_ntdll, "RtlAddFunctionTable", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
         if (_RtlAddFunctionTable) _RtlAddFunctionTable((PRUNTIME_FUNCTION)((char*)pe_buffer + exception_dir.VirtualAddress), exception_dir.Size / sizeof(RUNTIME_FUNCTION), (ULONG_PTR)pe_buffer);
     }
 #endif
 
-    // --- Advanced TLS Initialization ---
-    IMAGE_DATA_DIRECTORY tls_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-    if (tls_dir.Size > 0) {
-        PIMAGE_TLS_DIRECTORY tls = (PIMAGE_TLS_DIRECTORY)((char*)pe_buffer + tls_dir.VirtualAddress);
-
-        // 1. Allocate TLS index
-        DWORD tls_index = _TlsAlloc();
-        if (tls->AddressOfIndex) {
-            *(DWORD*)(tls->AddressOfIndex) = tls_index;
-        }
-
-        // 2. Setup TLS data for the current thread
-        SIZE_T tls_data_size = (SIZE_T)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
-        SIZE_T total_tls_size = tls_data_size + tls->SizeOfZeroFill;
-        LPVOID thread_tls_data = _VirtualAlloc(NULL, total_tls_size, MEM_COMMIT, PAGE_READWRITE);
-
-        if (thread_tls_data) {
-            my_memcpy(thread_tls_data, (const void*)tls->StartAddressOfRawData, tls_data_size);
-            my_memset((char*)thread_tls_data + tls_data_size, 0, tls->SizeOfZeroFill);
-
-            // 3. Update TEB ThreadLocalStoragePointer
-            // On x64: TEB + 0x58 points to ThreadLocalStoragePointer array
-            // On x86: TEB + 0x2C points to ThreadLocalStoragePointer array
-            void** tls_pointer_array = *(void***)((char*)READ_TEB() + (sizeof(PVOID) == 8 ? 0x58 : 0x2C));
-
-            // If the array exists and index is within reasonable bounds, set it.
-            // Note: In a real loader, we'd ensure the array is large enough.
-            if (tls_pointer_array) {
-                tls_pointer_array[tls_index] = thread_tls_data;
-            }
-        }
-
-        // 4. Run TLS Callbacks
-        PIMAGE_TLS_CALLBACK* callbacks = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
-        if (callbacks) { while (*callbacks) { (*callbacks)(pe_buffer, DLL_PROCESS_ATTACH, NULL); callbacks++; } }
-    }
+    init_thread_tls();
+    run_tls_callbacks(DLL_PROCESS_ATTACH);
 
     sections = IMAGE_FIRST_SECTION(nt_headers);
     for (int i = 0; i < nt_headers->FileHeader.NumberOfSections; i++) {
@@ -703,6 +760,27 @@ void load_pe() {
     ((void(*)())((char*)pe_buffer + entry_point_rva))();
 }
 
-void main() {
+int main() {
     load_pe();
+
+    HMODULE h_kernel32 = get_module_handle_manual("kernel32.dll");
+    fRtlInitAnsiString _RtlInitAnsiString = (fRtlInitAnsiString)get_export_address_manual(get_module_handle_manual("ntdll.dll"), "RtlInitAnsiString", NULL, NULL, NULL, NULL, NULL);
+    fLdrGetProcedureAddress _LdrGetProcedureAddress = (fLdrGetProcedureAddress)get_export_address_manual(get_module_handle_manual("ntdll.dll"), "LdrGetProcedureAddress", _RtlInitAnsiString, NULL, NULL, NULL, NULL);
+    fGetStdHandle _GetStdHandle = (fGetStdHandle)get_export_address_manual(h_kernel32, "GetStdHandle", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
+    fWriteFile _WriteFile = (fWriteFile)get_export_address_manual(h_kernel32, "WriteFile", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
+    fReadFile _ReadFile = (fReadFile)get_export_address_manual(h_kernel32, "ReadFile", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
+
+    if (_GetStdHandle && _WriteFile && _ReadFile) {
+        HANDLE hOut = _GetStdHandle(STD_OUTPUT_HANDLE);
+        const char msg[] = "Press Enter to exit...";
+        DWORD written;
+        _WriteFile(hOut, (LPVOID)msg, sizeof(msg)-1, &written, NULL);
+
+        HANDLE hIn = _GetStdHandle(STD_INPUT_HANDLE);
+        char buf[2];
+        DWORD read;
+        _ReadFile(hIn, buf, 1, &read, NULL);
+    }
+
+    return 0;
 }
