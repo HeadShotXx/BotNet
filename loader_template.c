@@ -50,6 +50,7 @@ typedef DWORD* LPDWORD;
 
 #define MEM_COMMIT 0x00001000
 #define MEM_RESERVE 0x00002000
+#define MEM_RELEASE 0x00008000
 #define PAGE_READWRITE 0x04
 #define PAGE_EXECUTE_READWRITE 0x40
 #define PAGE_EXECUTE_READ 0x20
@@ -59,9 +60,12 @@ typedef DWORD* LPDWORD;
 
 #define IMAGE_DIRECTORY_ENTRY_EXPORT 0
 #define IMAGE_DIRECTORY_ENTRY_IMPORT 1
-#define IMAGE_DIRECTORY_ENTRY_BASERELOC 5
 #define IMAGE_DIRECTORY_ENTRY_EXCEPTION 3
+#define IMAGE_DIRECTORY_ENTRY_BASERELOC 5
 #define IMAGE_DIRECTORY_ENTRY_TLS 9
+#define IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT 13
+
+#define IMAGE_FILE_DLL 0x2000
 
 #define IMAGE_SCN_MEM_EXECUTE 0x20000000
 #define IMAGE_SCN_MEM_READ 0x40000000
@@ -87,6 +91,29 @@ typedef DWORD* LPDWORD;
 #define WINABI
 #else
 #define WINABI __attribute__((stdcall))
+#endif
+
+#ifdef _WIN64
+#ifndef _MSC_VER
+__asm__(
+    ".global call_aligned\n"
+    "call_aligned:\n"
+    "push %rbp\n"
+    "mov %rsp, %rbp\n"
+    "and $-16, %rsp\n"
+    "sub $32, %rsp\n"
+    "mov %rcx, %rax\n"        // RAX = func
+    "mov %rdx, %rcx\n"        // RCX = p1
+    "mov %r8, %rdx\n"         // RDX = p2
+    "mov %r9, %r8\n"          // R8  = p3
+    "mov 48(%rbp), %r9\n"     // R9  = p4
+    "call *%rax\n"
+    "mov %rbp, %rsp\n"
+    "pop %rbp\n"
+    "ret\n"
+);
+extern ULONG_PTR call_aligned(PVOID func, PVOID p1, PVOID p2, PVOID p3, PVOID p4);
+#endif
 #endif
 
 // --- Structures ---
@@ -307,6 +334,23 @@ typedef struct _IMAGE_IMPORT_DESCRIPTOR {
     DWORD FirstThunk;
 } IMAGE_IMPORT_DESCRIPTOR, *PIMAGE_IMPORT_DESCRIPTOR;
 
+typedef struct _IMAGE_DELAYLOAD_DESCRIPTOR {
+    union {
+        DWORD AllAttributes;
+        struct {
+            DWORD RvaBased : 1;
+            DWORD ReservedAttributes : 31;
+        } Attributes;
+    } Attributes;
+    DWORD DllNameRVA;
+    DWORD ModuleHandleRVA;
+    DWORD ImportAddressTableRVA;
+    DWORD ImportNameTableRVA;
+    DWORD BoundImportAddressTableRVA;
+    DWORD UnloadInformationTableRVA;
+    DWORD TimeDateStamp;
+} IMAGE_DELAYLOAD_DESCRIPTOR, *PIMAGE_DELAYLOAD_DESCRIPTOR;
+
 typedef struct _IMAGE_THUNK_DATA {
     union {
         ULONG_PTR ForwarderString;
@@ -376,10 +420,14 @@ typedef VOID (WINABI *fRtlInitAnsiString)(PANSI_STRING, const char*);
 typedef NTSTATUS (WINABI *fRtlAnsiStringToUnicodeString)(PUNICODE_STRING, PANSI_STRING, BOOLEAN);
 typedef VOID (WINABI *fRtlFreeUnicodeString)(PUNICODE_STRING);
 typedef LPVOID (WINABI *fVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
+typedef BOOL (WINABI *fVirtualFree)(LPVOID, SIZE_T, DWORD);
 typedef BOOL (WINABI *fVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
 typedef BOOL (WINABI *fRtlAddFunctionTable)(PRUNTIME_FUNCTION, DWORD, DWORD64);
 typedef VOID (WINABI *PIMAGE_TLS_CALLBACK)(PVOID, DWORD, PVOID);
 typedef DWORD (WINABI *fTlsAlloc)(VOID);
+typedef LPVOID (WINABI *fTlsGetValue)(DWORD);
+typedef BOOL (WINABI *fTlsSetValue)(DWORD, LPVOID);
+typedef LPVOID (WINABI *fGetProcAddress)(HMODULE, const char*);
 typedef HANDLE (WINABI *fCreateThread)(LPVOID, SIZE_T, LPVOID, LPVOID, DWORD, LPDWORD);
 typedef HANDLE (WINABI *fGetStdHandle)(DWORD);
 typedef BOOL (WINABI *fWriteFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPVOID);
@@ -415,12 +463,20 @@ static __inline__ PVOID GET_TEB() {
 }
 #endif
 
+// ENTRY_POINT_RVA
+static DWORD entry_point_rva = 0;
+
 // --- Global Variables ---
 static PIMAGE_TLS_DIRECTORY g_tls_dir = NULL;
 static DWORD g_tls_index = 0;
 static fVirtualAlloc g_vAlloc = NULL;
+static fVirtualFree g_vFree = NULL;
+static fTlsGetValue g_fTlsGetValue = NULL;
+static fTlsSetValue g_fTlsSetValue = NULL;
 static fCreateThread g_origCreateThread = NULL;
+static fGetProcAddress g_origGetProcAddress = NULL;
 static PVOID g_pe_base = NULL;
+static BOOL g_is_dll = FALSE;
 
 // --- Helper Functions ---
 
@@ -487,13 +543,15 @@ static PVOID get_module_handle_manual(const char* dll_name) {
     return NULL;
 }
 
+#define API_SET_NAMESPACE_OFFSET (sizeof(PVOID) == 8 ? 0x68 : 0x38)
+
 static void resolve_api_set(const char* dll_name, char* out_name) {
     if (my_strncmp(dll_name, "api-", 4) != 0 && my_strncmp(dll_name, "ext-", 4) != 0) {
         int i = 0; while (dll_name[i]) { out_name[i] = dll_name[i]; i++; } out_name[i] = '\0';
         return;
     }
     PVOID peb = GET_PEB();
-    PAPI_SET_NAMESPACE api_set_map = *(PAPI_SET_NAMESPACE*)((char*)peb + (sizeof(PVOID) == 8 ? 0x68 : 0x38));
+    PAPI_SET_NAMESPACE api_set_map = *(PAPI_SET_NAMESPACE*)((char*)peb + API_SET_NAMESPACE_OFFSET);
     if (api_set_map->Version < 6) {
         int i = 0; while (dll_name[i]) { out_name[i] = dll_name[i]; i++; } out_name[i] = '\0';
         return;
@@ -586,17 +644,14 @@ static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, 
 // --- TLS Initialization Helper ---
 
 static VOID init_thread_tls() {
-    if (!g_tls_dir) return;
+    if (!g_tls_dir || !g_fTlsSetValue) return;
     SIZE_T tls_data_size = (SIZE_T)(g_tls_dir->EndAddressOfRawData - g_tls_dir->StartAddressOfRawData);
     SIZE_T total_tls_size = tls_data_size + g_tls_dir->SizeOfZeroFill;
     LPVOID thread_tls_data = g_vAlloc(NULL, total_tls_size, MEM_COMMIT, PAGE_READWRITE);
     if (thread_tls_data) {
         my_memcpy(thread_tls_data, (const void*)g_tls_dir->StartAddressOfRawData, tls_data_size);
         my_memset((char*)thread_tls_data + tls_data_size, 0, g_tls_dir->SizeOfZeroFill);
-        void*** tls_pointer_array_ptr = (void***)((char*)GET_TEB() + (sizeof(PVOID) == 8 ? 0x58 : 0x2C));
-        if (*tls_pointer_array_ptr) {
-            (*tls_pointer_array_ptr)[g_tls_index] = thread_tls_data;
-        }
+        g_fTlsSetValue(g_tls_index, thread_tls_data);
     }
 }
 
@@ -625,24 +680,74 @@ static DWORD WINABI ThreadWrapper(LPVOID lpParam) {
 
     init_thread_tls();
     run_tls_callbacks(DLL_THREAD_ATTACH);
-    DWORD result = ((DWORD(WINABI*)(LPVOID))func)(param);
+
+    if (g_is_dll) {
+        typedef BOOL (WINABI *fDllMain)(HINSTANCE, DWORD, LPVOID);
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((char*)g_pe_base + ((PIMAGE_DOS_HEADER)g_pe_base)->e_lfanew);
+        fDllMain dll_main = (fDllMain)((char*)g_pe_base + nt->OptionalHeader.AddressOfEntryPoint);
+#ifdef _WIN64
+        call_aligned((PVOID)dll_main, (PVOID)g_pe_base, (PVOID)DLL_THREAD_ATTACH, NULL, NULL);
+#else
+        dll_main((HINSTANCE)g_pe_base, DLL_THREAD_ATTACH, NULL);
+#endif
+    }
+
+    DWORD result;
+#ifdef _WIN64
+    result = (DWORD)call_aligned((PVOID)func, (PVOID)param, NULL, NULL, NULL);
+#else
+    result = ((DWORD(WINABI*)(LPVOID))func)(param);
+#endif
+
+    if (g_is_dll) {
+        typedef BOOL (WINABI *fDllMain)(HINSTANCE, DWORD, LPVOID);
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((char*)g_pe_base + ((PIMAGE_DOS_HEADER)g_pe_base)->e_lfanew);
+        fDllMain dll_main = (fDllMain)((char*)g_pe_base + nt->OptionalHeader.AddressOfEntryPoint);
+#ifdef _WIN64
+        call_aligned((PVOID)dll_main, (PVOID)g_pe_base, (PVOID)DLL_THREAD_DETACH, NULL, NULL);
+#else
+        dll_main((HINSTANCE)g_pe_base, DLL_THREAD_DETACH, NULL);
+#endif
+    }
+
     run_tls_callbacks(DLL_THREAD_DETACH);
+
+    if (g_fTlsGetValue && g_vFree) {
+        LPVOID thread_tls_data = g_fTlsGetValue(g_tls_index);
+        if (thread_tls_data) {
+            g_fTlsSetValue(g_tls_index, NULL);
+            g_vFree(thread_tls_data, 0, MEM_RELEASE);
+        }
+    }
+
+    if (g_vFree) g_vFree(args, 0, MEM_RELEASE);
     return result;
 }
 
 static HANDLE WINABI HookedCreateThread(LPVOID lpThreadAttributes, SIZE_T dwStackSize, LPVOID lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId) {
     PWRAPPER_ARGS args = (PWRAPPER_ARGS)g_vAlloc(NULL, sizeof(WRAPPER_ARGS), MEM_COMMIT, PAGE_READWRITE);
+    if (!args) return NULL;
     args->func = lpStartAddress;
     args->param = lpParameter;
-    return g_origCreateThread(lpThreadAttributes, dwStackSize, (LPVOID)ThreadWrapper, args, dwCreationFlags, lpThreadId);
+    HANDLE hThread = g_origCreateThread(lpThreadAttributes, dwStackSize, (LPVOID)ThreadWrapper, args, dwCreationFlags, lpThreadId);
+    if (!hThread && g_vFree) {
+        g_vFree(args, 0, MEM_RELEASE);
+    }
+    return hThread;
+}
+
+static LPVOID WINABI HookedGetProcAddress(HMODULE hModule, const char* lpProcName) {
+    if (lpProcName && !IMAGE_SNAP_BY_ORDINAL((ULONG_PTR)lpProcName)) {
+        if (my_strcmp(lpProcName, "CreateThread") == 0) return (LPVOID)HookedCreateThread;
+        if (my_strcmp(lpProcName, "GetProcAddress") == 0) return (LPVOID)HookedGetProcAddress;
+    }
+    return g_origGetProcAddress(hModule, lpProcName);
 }
 
 // --- Main loading logic ---
 
 // PE_BLOB_ARRAY
 unsigned char pe_blob[] = { 0 };
-// ENTRY_POINT_RVA
-DWORD entry_point_rva = 0;
 // IMAGE_BASE
 ULONG_PTR image_base = 0;
 // SIZE_OF_IMAGE
@@ -658,14 +763,20 @@ void load_pe() {
 
     HMODULE h_kernel32 = get_module_handle_manual("kernel32.dll");
     g_vAlloc = (fVirtualAlloc)get_export_address_manual(h_kernel32, "VirtualAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    g_vFree = (fVirtualFree)get_export_address_manual(h_kernel32, "VirtualFree", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
     fVirtualProtect _VirtualProtect = (fVirtualProtect)get_export_address_manual(h_kernel32, "VirtualProtect", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
     fTlsAlloc _TlsAlloc = (fTlsAlloc)get_export_address_manual(h_kernel32, "TlsAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    g_fTlsGetValue = (fTlsGetValue)get_export_address_manual(h_kernel32, "TlsGetValue", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    g_fTlsSetValue = (fTlsSetValue)get_export_address_manual(h_kernel32, "TlsSetValue", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    g_origGetProcAddress = (fGetProcAddress)get_export_address_manual(h_kernel32, "GetProcAddress", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
 
     PIMAGE_DOS_HEADER dos_header_raw = (PIMAGE_DOS_HEADER)pe_blob;
     PIMAGE_NT_HEADERS nt_headers_raw = (PIMAGE_NT_HEADERS)((char*)pe_blob + dos_header_raw->e_lfanew);
     LPVOID pe_buffer = g_vAlloc(NULL, nt_headers_raw->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     if (!pe_buffer) return;
     g_pe_base = pe_buffer;
+    g_is_dll = (nt_headers_raw->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
+    entry_point_rva = nt_headers_raw->OptionalHeader.AddressOfEntryPoint;
     my_memcpy(pe_buffer, pe_blob, nt_headers_raw->OptionalHeader.SizeOfHeaders);
     PIMAGE_SECTION_HEADER sections_raw = IMAGE_FIRST_SECTION(nt_headers_raw);
     for (int i = 0; i < nt_headers_raw->FileHeader.NumberOfSections; i++) {
@@ -721,8 +832,11 @@ void load_pe() {
                     } else {
                         PIMAGE_IMPORT_BY_NAME import_by_name = (PIMAGE_IMPORT_BY_NAME)((char*)pe_buffer + original_first_thunk->u1.AddressOfData);
                         if (my_strcmp(import_by_name->Name, "CreateThread") == 0) {
-                            g_origCreateThread = (fCreateThread)get_export_address_manual((HMODULE)h_module, "CreateThread", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                            if (!g_origCreateThread) g_origCreateThread = (fCreateThread)get_export_address_manual((HMODULE)h_module, "CreateThread", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
                             addr = (PVOID)HookedCreateThread;
+                        } else if (my_strcmp(import_by_name->Name, "GetProcAddress") == 0) {
+                            if (!g_origGetProcAddress) g_origGetProcAddress = (fGetProcAddress)get_export_address_manual((HMODULE)h_module, "GetProcAddress", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                            addr = (PVOID)HookedGetProcAddress;
                         } else {
                             addr = get_export_address_manual((HMODULE)h_module, (char*)import_by_name->Name, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
                         }
@@ -731,6 +845,42 @@ void load_pe() {
                 }
             }
             import_desc++;
+        }
+    }
+
+    IMAGE_DATA_DIRECTORY delay_import_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (delay_import_dir.Size > 0) {
+        PIMAGE_DELAYLOAD_DESCRIPTOR delay_desc = (PIMAGE_DELAYLOAD_DESCRIPTOR)((char*)pe_buffer + delay_import_dir.VirtualAddress);
+        while (delay_desc->DllNameRVA) {
+            const char* dll_name = (char*)pe_buffer + delay_desc->DllNameRVA;
+            char resolved_dll[MAX_PATH]; resolve_api_set(dll_name, resolved_dll);
+            ANSI_STRING ansi_dll; UNICODE_STRING uni_dll;
+            _RtlInitAnsiString(&ansi_dll, resolved_dll);
+            _RtlAnsiStringToUnicodeString(&uni_dll, &ansi_dll, TRUE);
+            HANDLE h_module = NULL; _LdrLoadDll(NULL, NULL, &uni_dll, &h_module); _RtlFreeUnicodeString(&uni_dll);
+            if (h_module) {
+                PIMAGE_THUNK_DATA first_thunk = (PIMAGE_THUNK_DATA)((char*)pe_buffer + delay_desc->ImportAddressTableRVA);
+                PIMAGE_THUNK_DATA original_first_thunk = (PIMAGE_THUNK_DATA)((char*)pe_buffer + delay_desc->ImportNameTableRVA);
+                while (original_first_thunk->u1.AddressOfData) {
+                    PVOID addr = NULL;
+                    if (IMAGE_SNAP_BY_ORDINAL(original_first_thunk->u1.Ordinal)) {
+                        addr = get_export_address_manual((HMODULE)h_module, (char*)original_first_thunk->u1.Ordinal, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                    } else {
+                        PIMAGE_IMPORT_BY_NAME import_by_name = (PIMAGE_IMPORT_BY_NAME)((char*)pe_buffer + original_first_thunk->u1.AddressOfData);
+                        if (my_strcmp(import_by_name->Name, "CreateThread") == 0) {
+                            if (!g_origCreateThread) g_origCreateThread = (fCreateThread)get_export_address_manual((HMODULE)h_module, "CreateThread", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                            addr = (PVOID)HookedCreateThread;
+                        } else if (my_strcmp(import_by_name->Name, "GetProcAddress") == 0) {
+                            if (!g_origGetProcAddress) g_origGetProcAddress = (fGetProcAddress)get_export_address_manual((HMODULE)h_module, "GetProcAddress", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                            addr = (PVOID)HookedGetProcAddress;
+                        } else {
+                            addr = get_export_address_manual((HMODULE)h_module, (char*)import_by_name->Name, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                        }
+                    }
+                    first_thunk->u1.Function = (ULONG_PTR)addr; first_thunk++; original_first_thunk++;
+                }
+            }
+            delay_desc++;
         }
     }
 
@@ -759,7 +909,24 @@ void load_pe() {
         }
         DWORD old; _VirtualProtect((char*)pe_buffer + sections[i].VirtualAddress, sections[i].Misc.VirtualSize, protection, &old);
     }
-    ((void(*)())((char*)pe_buffer + entry_point_rva))();
+
+    if (g_is_dll) {
+        typedef BOOL (WINABI *fDllMain)(HINSTANCE, DWORD, LPVOID);
+        fDllMain dll_main = (fDllMain)((char*)pe_buffer + entry_point_rva);
+#ifdef _WIN64
+        call_aligned((PVOID)dll_main, (PVOID)pe_buffer, (PVOID)DLL_PROCESS_ATTACH, NULL, NULL);
+#else
+        dll_main((HINSTANCE)pe_buffer, DLL_PROCESS_ATTACH, NULL);
+#endif
+    } else {
+        typedef void (*fExeEntry)();
+        fExeEntry exe_entry = (fExeEntry)((char*)pe_buffer + entry_point_rva);
+#ifdef _WIN64
+        call_aligned((PVOID)exe_entry, NULL, NULL, NULL, NULL);
+#else
+        exe_entry();
+#endif
+    }
 }
 
 int main() {
