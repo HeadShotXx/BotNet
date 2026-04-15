@@ -831,12 +831,13 @@ static DWORD WINABI HookedGetModuleFileNameW(HMODULE hModule, WCHAR* lpFilename,
 
 // --- Main loading logic ---
 
-// PE_BLOB_ARRAY
-unsigned char pe_blob[] = { 0 };
+unsigned char pe_blob[] = {
+    0x4D, 0x5A, 0x0A
+};
 // IMAGE_BASE
-ULONG_PTR image_base = 0;
+ULONG_PTR image_base = 0x0;
 // SIZE_OF_IMAGE
-SIZE_T size_of_image = 0;
+SIZE_T size_of_image = 0x0;
 
 void load_pe() {
     HMODULE h_ntdll = get_module_handle_manual("ntdll.dll");
