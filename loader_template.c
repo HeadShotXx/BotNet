@@ -380,6 +380,11 @@ typedef BOOL (WINABI *fVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
 typedef BOOL (WINABI *fRtlAddFunctionTable)(PRUNTIME_FUNCTION, DWORD, DWORD64);
 typedef VOID (WINABI *PIMAGE_TLS_CALLBACK)(PVOID, DWORD, PVOID);
 typedef DWORD (WINABI *fTlsAlloc)(VOID);
+typedef LPVOID (WINABI *fTlsGetValue)(DWORD);
+typedef BOOL (WINABI *fTlsSetValue)(DWORD, LPVOID);
+typedef HANDLE (WINABI *fGetProcessHeap)(VOID);
+typedef LPVOID (WINABI *fHeapAlloc)(HANDLE, DWORD, SIZE_T);
+typedef BOOL (WINABI *fHeapFree)(HANDLE, DWORD, LPVOID);
 typedef HANDLE (WINABI *fCreateThread)(LPVOID, SIZE_T, LPVOID, LPVOID, DWORD, LPDWORD);
 typedef HANDLE (WINABI *fGetStdHandle)(DWORD);
 typedef BOOL (WINABI *fWriteFile)(HANDLE, LPVOID, DWORD, LPDWORD, LPVOID);
@@ -419,6 +424,11 @@ static __inline__ PVOID GET_TEB() {
 static PIMAGE_TLS_DIRECTORY g_tls_dir = NULL;
 static DWORD g_tls_index = 0;
 static fVirtualAlloc g_vAlloc = NULL;
+static fTlsGetValue g_TlsGetValue = NULL;
+static fTlsSetValue g_TlsSetValue = NULL;
+static HANDLE g_hHeap = NULL;
+static fHeapAlloc g_HeapAlloc = NULL;
+static fHeapFree g_HeapFree = NULL;
 static fCreateThread g_origCreateThread = NULL;
 static PVOID g_pe_base = NULL;
 
@@ -528,8 +538,8 @@ static void resolve_api_set(const char* dll_name, char* out_name) {
     int k = 0; while (dll_name[k]) { out_name[k] = dll_name[k]; k++; } out_name[k] = '\0';
 }
 
-static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, fRtlInitAnsiString _RtlInitAnsiString, fLdrGetProcedureAddress _LdrGetProcedureAddress, fLdrLoadDll _LdrLoadDll, fRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString, fRtlFreeUnicodeString _RtlFreeUnicodeString) {
-    if (!h_module) return NULL;
+static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, fRtlInitAnsiString _RtlInitAnsiString, fLdrGetProcedureAddress _LdrGetProcedureAddress, fLdrLoadDll _LdrLoadDll, fRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString, fRtlFreeUnicodeString _RtlFreeUnicodeString, int depth) {
+    if (!h_module || depth > 10) return NULL;
     PIMAGE_DOS_HEADER dos_header = (PIMAGE_DOS_HEADER)h_module;
     PIMAGE_NT_HEADERS nt_headers = (PIMAGE_NT_HEADERS)((char*)h_module + dos_header->e_lfanew);
     IMAGE_DATA_DIRECTORY export_dir_info = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
@@ -577,7 +587,7 @@ static PVOID get_export_address_manual(HMODULE h_module, const char* func_name, 
                 _LdrLoadDll(NULL, NULL, &u_dll, (PVOID*)&h_forward);
                 _RtlFreeUnicodeString(&u_dll);
             }
-            if (h_forward) return get_export_address_manual(h_forward, dot + 1, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+            if (h_forward) return get_export_address_manual(h_forward, dot + 1, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, depth + 1);
         }
     }
     return addr;
@@ -589,14 +599,11 @@ static VOID init_thread_tls() {
     if (!g_tls_dir) return;
     SIZE_T tls_data_size = (SIZE_T)(g_tls_dir->EndAddressOfRawData - g_tls_dir->StartAddressOfRawData);
     SIZE_T total_tls_size = tls_data_size + g_tls_dir->SizeOfZeroFill;
-    LPVOID thread_tls_data = g_vAlloc(NULL, total_tls_size, MEM_COMMIT, PAGE_READWRITE);
+    LPVOID thread_tls_data = g_HeapAlloc(g_hHeap, 0, total_tls_size);
     if (thread_tls_data) {
         my_memcpy(thread_tls_data, (const void*)g_tls_dir->StartAddressOfRawData, tls_data_size);
         my_memset((char*)thread_tls_data + tls_data_size, 0, g_tls_dir->SizeOfZeroFill);
-        void*** tls_pointer_array_ptr = (void***)((char*)GET_TEB() + (sizeof(PVOID) == 8 ? 0x58 : 0x2C));
-        if (*tls_pointer_array_ptr) {
-            (*tls_pointer_array_ptr)[g_tls_index] = thread_tls_data;
-        }
+        if (g_TlsSetValue) g_TlsSetValue(g_tls_index, thread_tls_data);
     }
 }
 
@@ -627,11 +634,18 @@ static DWORD WINABI ThreadWrapper(LPVOID lpParam) {
     run_tls_callbacks(DLL_THREAD_ATTACH);
     DWORD result = ((DWORD(WINABI*)(LPVOID))func)(param);
     run_tls_callbacks(DLL_THREAD_DETACH);
+
+    if (g_tls_dir && g_TlsGetValue && g_HeapFree) {
+        LPVOID tls_data = g_TlsGetValue(g_tls_index);
+        if (tls_data) g_HeapFree(g_hHeap, 0, tls_data);
+    }
+    if (g_HeapFree) g_HeapFree(g_hHeap, 0, args);
+
     return result;
 }
 
 static HANDLE WINABI HookedCreateThread(LPVOID lpThreadAttributes, SIZE_T dwStackSize, LPVOID lpStartAddress, LPVOID lpParameter, DWORD dwCreationFlags, LPDWORD lpThreadId) {
-    PWRAPPER_ARGS args = (PWRAPPER_ARGS)g_vAlloc(NULL, sizeof(WRAPPER_ARGS), MEM_COMMIT, PAGE_READWRITE);
+    PWRAPPER_ARGS args = (PWRAPPER_ARGS)g_HeapAlloc(g_hHeap, 0, sizeof(WRAPPER_ARGS));
     args->func = lpStartAddress;
     args->param = lpParameter;
     return g_origCreateThread(lpThreadAttributes, dwStackSize, (LPVOID)ThreadWrapper, args, dwCreationFlags, lpThreadId);
@@ -650,16 +664,22 @@ SIZE_T size_of_image = 0;
 
 void load_pe() {
     HMODULE h_ntdll = get_module_handle_manual("ntdll.dll");
-    fRtlInitAnsiString _RtlInitAnsiString = (fRtlInitAnsiString)get_export_address_manual(h_ntdll, "RtlInitAnsiString", NULL, NULL, NULL, NULL, NULL);
-    fLdrGetProcedureAddress _LdrGetProcedureAddress = (fLdrGetProcedureAddress)get_export_address_manual(h_ntdll, "LdrGetProcedureAddress", _RtlInitAnsiString, NULL, NULL, NULL, NULL);
-    fLdrLoadDll _LdrLoadDll = (fLdrLoadDll)get_export_address_manual(h_ntdll, "LdrLoadDll", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
-    fRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString = (fRtlAnsiStringToUnicodeString)get_export_address_manual(h_ntdll, "RtlAnsiStringToUnicodeString", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, NULL, NULL);
-    fRtlFreeUnicodeString _RtlFreeUnicodeString = (fRtlFreeUnicodeString)get_export_address_manual(h_ntdll, "RtlFreeUnicodeString", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, NULL);
+    fRtlInitAnsiString _RtlInitAnsiString = (fRtlInitAnsiString)get_export_address_manual(h_ntdll, "RtlInitAnsiString", NULL, NULL, NULL, NULL, NULL, 0);
+    fLdrGetProcedureAddress _LdrGetProcedureAddress = (fLdrGetProcedureAddress)get_export_address_manual(h_ntdll, "LdrGetProcedureAddress", _RtlInitAnsiString, NULL, NULL, NULL, NULL, 0);
+    fLdrLoadDll _LdrLoadDll = (fLdrLoadDll)get_export_address_manual(h_ntdll, "LdrLoadDll", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL, 0);
+    fRtlAnsiStringToUnicodeString _RtlAnsiStringToUnicodeString = (fRtlAnsiStringToUnicodeString)get_export_address_manual(h_ntdll, "RtlAnsiStringToUnicodeString", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, NULL, NULL, 0);
+    fRtlFreeUnicodeString _RtlFreeUnicodeString = (fRtlFreeUnicodeString)get_export_address_manual(h_ntdll, "RtlFreeUnicodeString", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, NULL, 0);
 
     HMODULE h_kernel32 = get_module_handle_manual("kernel32.dll");
-    g_vAlloc = (fVirtualAlloc)get_export_address_manual(h_kernel32, "VirtualAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
-    fVirtualProtect _VirtualProtect = (fVirtualProtect)get_export_address_manual(h_kernel32, "VirtualProtect", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
-    fTlsAlloc _TlsAlloc = (fTlsAlloc)get_export_address_manual(h_kernel32, "TlsAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    g_vAlloc = (fVirtualAlloc)get_export_address_manual(h_kernel32, "VirtualAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
+    fVirtualProtect _VirtualProtect = (fVirtualProtect)get_export_address_manual(h_kernel32, "VirtualProtect", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
+    fTlsAlloc _TlsAlloc = (fTlsAlloc)get_export_address_manual(h_kernel32, "TlsAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
+    g_TlsGetValue = (fTlsGetValue)get_export_address_manual(h_kernel32, "TlsGetValue", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
+    g_TlsSetValue = (fTlsSetValue)get_export_address_manual(h_kernel32, "TlsSetValue", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
+    fGetProcessHeap _GetProcessHeap = (fGetProcessHeap)get_export_address_manual(h_kernel32, "GetProcessHeap", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
+    g_HeapAlloc = (fHeapAlloc)get_export_address_manual(h_kernel32, "HeapAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
+    g_HeapFree = (fHeapFree)get_export_address_manual(h_kernel32, "HeapFree", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
+    if (_GetProcessHeap) g_hHeap = _GetProcessHeap();
 
     PIMAGE_DOS_HEADER dos_header_raw = (PIMAGE_DOS_HEADER)pe_blob;
     PIMAGE_NT_HEADERS nt_headers_raw = (PIMAGE_NT_HEADERS)((char*)pe_blob + dos_header_raw->e_lfanew);
@@ -717,14 +737,14 @@ void load_pe() {
                 while (original_first_thunk->u1.AddressOfData) {
                     PVOID addr = NULL;
                     if (IMAGE_SNAP_BY_ORDINAL(original_first_thunk->u1.Ordinal)) {
-                        addr = get_export_address_manual((HMODULE)h_module, (char*)original_first_thunk->u1.Ordinal, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                        addr = get_export_address_manual((HMODULE)h_module, (char*)original_first_thunk->u1.Ordinal, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
                     } else {
                         PIMAGE_IMPORT_BY_NAME import_by_name = (PIMAGE_IMPORT_BY_NAME)((char*)pe_buffer + original_first_thunk->u1.AddressOfData);
                         if (my_strcmp(import_by_name->Name, "CreateThread") == 0) {
-                            g_origCreateThread = (fCreateThread)get_export_address_manual((HMODULE)h_module, "CreateThread", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                            g_origCreateThread = (fCreateThread)get_export_address_manual((HMODULE)h_module, "CreateThread", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
                             addr = (PVOID)HookedCreateThread;
                         } else {
-                            addr = get_export_address_manual((HMODULE)h_module, (char*)import_by_name->Name, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+                            addr = get_export_address_manual((HMODULE)h_module, (char*)import_by_name->Name, _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
                         }
                     }
                     first_thunk->u1.Function = (ULONG_PTR)addr; first_thunk++; original_first_thunk++;
@@ -737,7 +757,7 @@ void load_pe() {
 #ifdef _WIN64
     IMAGE_DATA_DIRECTORY exception_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (exception_dir.Size > 0) {
-        fRtlAddFunctionTable _RtlAddFunctionTable = (fRtlAddFunctionTable)get_export_address_manual(h_ntdll, "RtlAddFunctionTable", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+        fRtlAddFunctionTable _RtlAddFunctionTable = (fRtlAddFunctionTable)get_export_address_manual(h_ntdll, "RtlAddFunctionTable", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString, 0);
         if (_RtlAddFunctionTable) _RtlAddFunctionTable((PRUNTIME_FUNCTION)((char*)pe_buffer + exception_dir.VirtualAddress), exception_dir.Size / sizeof(RUNTIME_FUNCTION), (ULONG_PTR)pe_buffer);
     }
 #endif
@@ -767,11 +787,11 @@ int main() {
 
     HMODULE h_kernel32 = get_module_handle_manual("kernel32.dll");
     HMODULE h_ntdll = get_module_handle_manual("ntdll.dll");
-    fRtlInitAnsiString _RtlInitAnsiString = (fRtlInitAnsiString)get_export_address_manual(h_ntdll, "RtlInitAnsiString", NULL, NULL, NULL, NULL, NULL);
-    fLdrGetProcedureAddress _LdrGetProcedureAddress = (fLdrGetProcedureAddress)get_export_address_manual(h_ntdll, "LdrGetProcedureAddress", _RtlInitAnsiString, NULL, NULL, NULL, NULL);
-    fGetStdHandle _GetStdHandle = (fGetStdHandle)get_export_address_manual(h_kernel32, "GetStdHandle", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
-    fWriteFile _WriteFile = (fWriteFile)get_export_address_manual(h_kernel32, "WriteFile", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
-    fReadFile _ReadFile = (fReadFile)get_export_address_manual(h_kernel32, "ReadFile", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL);
+    fRtlInitAnsiString _RtlInitAnsiString = (fRtlInitAnsiString)get_export_address_manual(h_ntdll, "RtlInitAnsiString", NULL, NULL, NULL, NULL, NULL, 0);
+    fLdrGetProcedureAddress _LdrGetProcedureAddress = (fLdrGetProcedureAddress)get_export_address_manual(h_ntdll, "LdrGetProcedureAddress", _RtlInitAnsiString, NULL, NULL, NULL, NULL, 0);
+    fGetStdHandle _GetStdHandle = (fGetStdHandle)get_export_address_manual(h_kernel32, "GetStdHandle", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL, 0);
+    fWriteFile _WriteFile = (fWriteFile)get_export_address_manual(h_kernel32, "WriteFile", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL, 0);
+    fReadFile _ReadFile = (fReadFile)get_export_address_manual(h_kernel32, "ReadFile", _RtlInitAnsiString, _LdrGetProcedureAddress, NULL, NULL, NULL, 0);
 
     if (_GetStdHandle && _WriteFile && _ReadFile) {
         HANDLE hOut = _GetStdHandle(STD_OUTPUT_HANDLE);
@@ -783,6 +803,13 @@ int main() {
         char buf[2];
         DWORD read;
         _ReadFile(hIn, buf, 1, &read, NULL);
+    }
+
+    run_tls_callbacks(DLL_PROCESS_DETACH);
+
+    if (g_tls_dir && g_TlsGetValue && g_HeapFree) {
+        LPVOID tls_data = g_TlsGetValue(g_tls_index);
+        if (tls_data) g_HeapFree(g_hHeap, 0, tls_data);
     }
 
     return 0;
