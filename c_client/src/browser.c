@@ -436,7 +436,7 @@ static void extract_autofill(const char* profile_path, const char* out_dir, cons
     DeleteFileA(temp_path);
 }
 
-static void dump_sqlite_table(sqlite3* db, const char* query, FILE* out, const char* label, const BYTE* v10, const BYTE* v20) {
+static void dump_sqlite_table(sqlite3* db, const char* query, FILE* out, const char* label, const BYTE* v10, const BYTE* v20, int is_opera) {
     sqlite3_stmt* stmt;
     if (sqlite3_prepare_v2(db, query, -1, &stmt, NULL) == SQLITE_OK) {
         int cols = sqlite3_column_count(stmt);
@@ -447,7 +447,7 @@ static void dump_sqlite_table(sqlite3* db, const char* query, FILE* out, const c
                 if (sqlite3_column_type(stmt, i) == SQLITE_BLOB) {
                     int len = sqlite3_column_bytes(stmt, i);
                     const BYTE* blob = sqlite3_column_blob(stmt, i);
-                    BYTE* dec = decrypt_blob(blob, len, v10, v20);
+                    BYTE* dec = decrypt_blob(blob, len, v10, v20, is_opera);
                     if (dec) {
                         fprintf(out, "%s: %s\n", name, dec);
                         free(dec);
