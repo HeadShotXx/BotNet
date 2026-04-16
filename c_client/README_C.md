@@ -3,8 +3,8 @@
 This directory contains the C translation of the client application.
 
 ## Prerequisites
-- **Windows:** GCC (MinGW-w64) installed and in your PATH.
-- **Linux (Cross-compilation):** `x86_64-w64-mingw32-gcc` installed.
+- **Windows:** GCC (MinGW-w64) installed and in your PATH. We recommend the MSYS2 or WinLibs distributions.
+- **Linux (Cross-compilation):** `x86_64-w64-mingw32-gcc` installed (usually part of the `mingw-w64` package).
 
 ## Building
 
@@ -34,3 +34,8 @@ Update these values before building if necessary.
 - **sqlite3:** Database access for browser data.
 - **stbi_image_write:** JPEG encoding for screen/camera captures.
 - **Win32 API:** Core system functionality (Networking, GDI, Media Foundation, Debugging).
+
+## Troubleshooting
+- **Missing Headers:** Ensure your MinGW installation includes Media Foundation headers (`mfapi.h`, `mfidl.h`, etc.).
+- **GUID Errors:** We use the standard `MFMediaType_Video` and `MFVideoFormat_RGB24` GUIDs. If your compiler fails to find them, verify that `mfplat.lib` is being linked.
+- **SQLite Warnings:** Warnings about `strlen` in `sqlite3.c` are common in the amalgamated version and can generally be ignored.

@@ -60,11 +60,15 @@ void handle_rfe_exe(SOCKET sock, HANDLE mutex, const char* payload) {
     char url[512], args[512];
     const char* sep = strchr(payload, '|');
     if (sep) {
-        strncpy(url, payload, sep - payload);
-        url[sep - payload] = 0;
-        strcpy(args, sep + 1);
+        size_t url_len = sep - payload;
+        if (url_len >= sizeof(url)) url_len = sizeof(url) - 1;
+        strncpy(url, payload, url_len);
+        url[url_len] = 0;
+        strncpy(args, sep + 1, sizeof(args) - 1);
+        args[sizeof(args) - 1] = 0;
     } else {
-        strcpy(url, payload);
+        strncpy(url, payload, sizeof(url) - 1);
+        url[sizeof(url) - 1] = 0;
         args[0] = 0;
     }
 

