@@ -62,6 +62,7 @@ typedef DWORD* LPDWORD;
 #define IMAGE_DIRECTORY_ENTRY_IMPORT 1
 #define IMAGE_DIRECTORY_ENTRY_EXCEPTION 3
 #define IMAGE_DIRECTORY_ENTRY_BASERELOC 5
+#define IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG 10
 #define IMAGE_DIRECTORY_ENTRY_TLS 9
 #define IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT 13
 
@@ -385,6 +386,113 @@ typedef struct _RUNTIME_FUNCTION {
     DWORD UnwindData;
 } RUNTIME_FUNCTION, *PRUNTIME_FUNCTION;
 
+typedef struct _IMAGE_LOAD_CONFIG_CODE_INTEGRITY {
+    WORD    Flags;
+    WORD    Catalog;
+    DWORD   CatalogOffset;
+    DWORD   Reserved;
+} IMAGE_LOAD_CONFIG_CODE_INTEGRITY, *PIMAGE_LOAD_CONFIG_CODE_INTEGRITY;
+
+#ifdef _WIN64
+typedef struct _IMAGE_LOAD_CONFIG_DIRECTORY64 {
+    DWORD      Size;
+    DWORD      TimeDateStamp;
+    WORD       MajorVersion;
+    WORD       MinorVersion;
+    DWORD      GlobalFlagsClear;
+    DWORD      GlobalFlagsSet;
+    DWORD      CriticalSectionDefaultTimeout;
+    DWORD64    DeCommitFreeBlockThreshold;
+    DWORD64    DeCommitTotalFreeThreshold;
+    DWORD64    LockPrefixTable;                // VA
+    DWORD64    MaximumAllocationSize;
+    DWORD64    VirtualMemoryThreshold;
+    DWORD64    ProcessAffinityMask;
+    DWORD      ProcessHeapFlags;
+    WORD       CSDVersion;
+    WORD       DependentLoadFlags;
+    DWORD64    EditList;                       // VA
+    DWORD64    SecurityCookie;                 // VA
+    DWORD64    SEHandlerTable;                 // VA
+    DWORD64    SEHandlerCount;
+    DWORD64    GuardCFCheckFunctionPointer;    // VA
+    DWORD64    GuardCFDispatchFunctionPointer; // VA
+    DWORD64    GuardCFFunctionTable;           // VA
+    DWORD64    GuardCFFunctionCount;
+    DWORD      GuardFlags;
+    IMAGE_LOAD_CONFIG_CODE_INTEGRITY CodeIntegrity;
+    DWORD64    GuardAddressTakenIatEntryTable; // VA
+    DWORD64    GuardAddressTakenIatEntryCount;
+    DWORD64    GuardLongJumpTargetTable;       // VA
+    DWORD64    GuardLongJumpTargetCount;
+    DWORD64    DynamicValueRelocTable;         // VA
+    DWORD64    CHPEMetadataPointer;            // VA
+    DWORD64    GuardVerifyStackPointerFunctionPointer; // VA
+    DWORD      HotPatchTableOffset;
+    DWORD      Reserved3;
+    DWORD64    EnclaveConfigurationPointer;     // VA
+    DWORD64    VolatileMetadataPointer;         // VA
+    DWORD64    GuardEHContinuationTable;        // VA
+    DWORD64    GuardEHContinuationCount;
+    DWORD64    GuardXfgCheckFunctionPointer;    // VA
+    DWORD64    GuardXfgDispatchFunctionPointer; // VA
+    DWORD64    GuardXfgTableDispatchFunctionPointer; // VA
+    DWORD      CastGuardOsDeterminedFailureMode;
+    DWORD      GuardFlags2;
+} IMAGE_LOAD_CONFIG_DIRECTORY64, *PIMAGE_LOAD_CONFIG_DIRECTORY64;
+typedef IMAGE_LOAD_CONFIG_DIRECTORY64 IMAGE_LOAD_CONFIG_DIRECTORY;
+typedef IMAGE_LOAD_CONFIG_DIRECTORY64* PIMAGE_LOAD_CONFIG_DIRECTORY;
+#else
+typedef struct _IMAGE_LOAD_CONFIG_DIRECTORY32 {
+    DWORD   Size;
+    DWORD   TimeDateStamp;
+    WORD    MajorVersion;
+    WORD    MinorVersion;
+    DWORD   GlobalFlagsClear;
+    DWORD   GlobalFlagsSet;
+    DWORD   CriticalSectionDefaultTimeout;
+    DWORD   DeCommitFreeBlockThreshold;
+    DWORD   DeCommitTotalFreeThreshold;
+    DWORD   LockPrefixTable;                // VA
+    DWORD   MaximumAllocationSize;
+    DWORD   VirtualMemoryThreshold;
+    DWORD   ProcessAffinityMask;
+    DWORD   ProcessHeapFlags;
+    WORD    CSDVersion;
+    WORD    DependentLoadFlags;
+    DWORD   EditList;                       // VA
+    DWORD   SecurityCookie;                 // VA
+    DWORD   SEHandlerTable;                 // VA
+    DWORD   SEHandlerCount;
+    DWORD   GuardCFCheckFunctionPointer;    // VA
+    DWORD   GuardCFDispatchFunctionPointer; // VA
+    DWORD   GuardCFFunctionTable;           // VA
+    DWORD   GuardCFFunctionCount;
+    DWORD   GuardFlags;
+    IMAGE_LOAD_CONFIG_CODE_INTEGRITY CodeIntegrity;
+    DWORD   GuardAddressTakenIatEntryTable; // VA
+    DWORD   GuardAddressTakenIatEntryCount;
+    DWORD   GuardLongJumpTargetTable;       // VA
+    DWORD   GuardLongJumpTargetCount;
+    DWORD   DynamicValueRelocTable;         // VA
+    DWORD   CHPEMetadataPointer;            // VA
+    DWORD   GuardVerifyStackPointerFunctionPointer; // VA
+    DWORD   HotPatchTableOffset;
+    DWORD   Reserved3;
+    DWORD   EnclaveConfigurationPointer;     // VA
+    DWORD   VolatileMetadataPointer;         // VA
+    DWORD   GuardEHContinuationTable;        // VA
+    DWORD   GuardEHContinuationCount;
+    DWORD   GuardXfgCheckFunctionPointer;    // VA
+    DWORD   GuardXfgDispatchFunctionPointer; // VA
+    DWORD   GuardXfgTableDispatchFunctionPointer; // VA
+    DWORD   CastGuardOsDeterminedFailureMode;
+    DWORD   GuardFlags2;
+} IMAGE_LOAD_CONFIG_DIRECTORY32, *PIMAGE_LOAD_CONFIG_DIRECTORY32;
+typedef IMAGE_LOAD_CONFIG_DIRECTORY32 IMAGE_LOAD_CONFIG_DIRECTORY;
+typedef IMAGE_LOAD_CONFIG_DIRECTORY32* PIMAGE_LOAD_CONFIG_DIRECTORY;
+#endif
+
 typedef struct _API_SET_NAMESPACE {
     ULONG Version;
     ULONG Size;
@@ -439,6 +547,11 @@ typedef HMODULE (WINABI *fGetModuleHandleA)(const char*);
 typedef HMODULE (WINABI *fGetModuleHandleW)(const WCHAR*);
 typedef DWORD (WINABI *fGetModuleFileNameA)(HMODULE, char*, DWORD);
 typedef DWORD (WINABI *fGetModuleFileNameW)(HMODULE, WCHAR*, DWORD);
+typedef BOOL (WINABI *fGetModuleHandleExA)(DWORD, const char*, HMODULE*);
+typedef BOOL (WINABI *fGetModuleHandleExW)(DWORD, const WCHAR*, HMODULE*);
+
+#define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 0x00000004
+#define GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT 0x00000002
 
 #define STD_INPUT_HANDLE  ((DWORD)-10)
 #define STD_OUTPUT_HANDLE ((DWORD)-11)
@@ -486,6 +599,8 @@ static fGetModuleHandleA g_origGetModuleHandleA = NULL;
 static fGetModuleHandleW g_origGetModuleHandleW = NULL;
 static fGetModuleFileNameA g_origGetModuleFileNameA = NULL;
 static fGetModuleFileNameW g_origGetModuleFileNameW = NULL;
+static fGetModuleHandleExA g_origGetModuleHandleExA = NULL;
+static fGetModuleHandleExW g_origGetModuleHandleExW = NULL;
 static fRtlInitAnsiString g_RtlInitAnsiString = NULL;
 static fLdrGetProcedureAddress g_LdrGetProcedureAddress = NULL;
 static fLdrLoadDll g_LdrLoadDll = NULL;
@@ -699,6 +814,27 @@ static VOID init_thread_tls() {
     }
 }
 
+static VOID init_security_cookie() {
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((char*)g_pe_base + ((PIMAGE_DOS_HEADER)g_pe_base)->e_lfanew);
+    IMAGE_DATA_DIRECTORY load_config_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    if (load_config_dir.Size > 0) {
+        PIMAGE_LOAD_CONFIG_DIRECTORY load_config = (PIMAGE_LOAD_CONFIG_DIRECTORY)((char*)g_pe_base + load_config_dir.VirtualAddress);
+        if (load_config->SecurityCookie) {
+            ULONG_PTR cookie = (ULONG_PTR)load_config->SecurityCookie;
+            // Only initialize if the cookie is the default one (0xBB40E64E or 0x00002B992DDFA232)
+#ifdef _WIN64
+            if (*(ULONG_PTR*)cookie == 0x00002B992DDFA232 || *(ULONG_PTR*)cookie == 0) {
+                *(ULONG_PTR*)cookie = (ULONG_PTR)GET_TEB() ^ (ULONG_PTR)g_pe_base;
+            }
+#else
+            if (*(DWORD*)cookie == 0xBB40E64E || *(DWORD*)cookie == 0) {
+                *(DWORD*)cookie = (DWORD)GET_TEB() ^ (DWORD)g_pe_base;
+            }
+#endif
+        }
+    }
+}
+
 static VOID run_tls_callbacks(DWORD reason) {
     if (!g_tls_dir) return;
     PIMAGE_TLS_CALLBACK* callbacks = (PIMAGE_TLS_CALLBACK*)g_tls_dir->AddressOfCallBacks;
@@ -793,18 +929,6 @@ static LPVOID WINABI HookedTlsGetValue(DWORD dwTlsIndex) {
     return g_fTlsGetValue(dwTlsIndex);
 }
 
-static LPVOID WINABI HookedGetProcAddress(HMODULE hModule, const char* lpProcName) {
-    if (hModule == (HMODULE)g_pe_base) {
-        return get_export_address_manual((HMODULE)g_pe_base, lpProcName, g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
-    }
-    if (lpProcName && !IMAGE_SNAP_BY_ORDINAL((ULONG_PTR)lpProcName)) {
-        if (my_strcmp(lpProcName, "CreateThread") == 0) return (LPVOID)HookedCreateThread;
-        if (my_strcmp(lpProcName, "GetProcAddress") == 0) return (LPVOID)HookedGetProcAddress;
-        if (my_strcmp(lpProcName, "TlsGetValue") == 0) return (LPVOID)HookedTlsGetValue;
-    }
-    return g_origGetProcAddress(hModule, lpProcName);
-}
-
 static HMODULE WINABI HookedGetModuleHandleA(const char* lpModuleName) {
     if (lpModuleName == NULL) return (HMODULE)g_pe_base;
     return g_origGetModuleHandleA(lpModuleName);
@@ -822,11 +946,55 @@ static DWORD WINABI HookedGetModuleFileNameA(HMODULE hModule, char* lpFilename, 
     return g_origGetModuleFileNameA(hModule, lpFilename, nSize);
 }
 
+static BOOL WINABI HookedGetModuleHandleExA(DWORD dwFlags, const char* lpModuleName, HMODULE* phModule) {
+    if (dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
+        ULONG_PTR addr = (ULONG_PTR)lpModuleName;
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((char*)g_pe_base + ((PIMAGE_DOS_HEADER)g_pe_base)->e_lfanew);
+        if (addr >= (ULONG_PTR)g_pe_base && addr < (ULONG_PTR)g_pe_base + nt->OptionalHeader.SizeOfImage) {
+            *phModule = (HMODULE)g_pe_base;
+            return TRUE;
+        }
+    } else if (lpModuleName == NULL) {
+        *phModule = (HMODULE)g_pe_base;
+        return TRUE;
+    }
+    return g_origGetModuleHandleExA(dwFlags, lpModuleName, phModule);
+}
+
 static DWORD WINABI HookedGetModuleFileNameW(HMODULE hModule, WCHAR* lpFilename, DWORD nSize) {
     if (hModule == NULL || hModule == (HMODULE)g_pe_base) {
         return g_origGetModuleFileNameW(NULL, lpFilename, nSize);
     }
     return g_origGetModuleFileNameW(hModule, lpFilename, nSize);
+}
+
+static BOOL WINABI HookedGetModuleHandleExW(DWORD dwFlags, const WCHAR* lpModuleName, HMODULE* phModule) {
+    if (dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
+        ULONG_PTR addr = (ULONG_PTR)lpModuleName;
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((char*)g_pe_base + ((PIMAGE_DOS_HEADER)g_pe_base)->e_lfanew);
+        if (addr >= (ULONG_PTR)g_pe_base && addr < (ULONG_PTR)g_pe_base + nt->OptionalHeader.SizeOfImage) {
+            *phModule = (HMODULE)g_pe_base;
+            return TRUE;
+        }
+    } else if (lpModuleName == NULL) {
+        *phModule = (HMODULE)g_pe_base;
+        return TRUE;
+    }
+    return g_origGetModuleHandleExW(dwFlags, lpModuleName, phModule);
+}
+
+static LPVOID WINABI HookedGetProcAddress(HMODULE hModule, const char* lpProcName) {
+    if (hModule == (HMODULE)g_pe_base) {
+        return get_export_address_manual((HMODULE)g_pe_base, lpProcName, g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
+    }
+    if (lpProcName && !IMAGE_SNAP_BY_ORDINAL((ULONG_PTR)lpProcName)) {
+        if (my_strcmp(lpProcName, "CreateThread") == 0) return (LPVOID)HookedCreateThread;
+        if (my_strcmp(lpProcName, "GetProcAddress") == 0) return (LPVOID)HookedGetProcAddress;
+        if (my_strcmp(lpProcName, "TlsGetValue") == 0) return (LPVOID)HookedTlsGetValue;
+        if (my_strcmp(lpProcName, "GetModuleHandleExA") == 0) return (LPVOID)HookedGetModuleHandleExA;
+        if (my_strcmp(lpProcName, "GetModuleHandleExW") == 0) return (LPVOID)HookedGetModuleHandleExW;
+    }
+    return g_origGetProcAddress(hModule, lpProcName);
 }
 
 // --- Main loading logic ---
@@ -861,6 +1029,8 @@ void load_pe() {
     g_origGetModuleHandleW = (fGetModuleHandleW)get_export_address_manual(h_kernel32, "GetModuleHandleW", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
     g_origGetModuleFileNameA = (fGetModuleFileNameA)get_export_address_manual(h_kernel32, "GetModuleFileNameA", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
     g_origGetModuleFileNameW = (fGetModuleFileNameW)get_export_address_manual(h_kernel32, "GetModuleFileNameW", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
+    g_origGetModuleHandleExA = (fGetModuleHandleExA)get_export_address_manual(h_kernel32, "GetModuleHandleExA", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
+    g_origGetModuleHandleExW = (fGetModuleHandleExW)get_export_address_manual(h_kernel32, "GetModuleHandleExW", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
 
     PIMAGE_DOS_HEADER dos_header_raw = (PIMAGE_DOS_HEADER)pe_blob;
     PIMAGE_NT_HEADERS nt_headers_raw = (PIMAGE_NT_HEADERS)((char*)pe_blob + dos_header_raw->e_lfanew);
@@ -945,6 +1115,12 @@ void load_pe() {
                         } else if (my_strcmp(import_by_name->Name, "GetModuleFileNameW") == 0) {
                             if (!g_origGetModuleFileNameW) g_origGetModuleFileNameW = (fGetModuleFileNameW)get_export_address_manual((HMODULE)h_module, "GetModuleFileNameW", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
                             addr = (PVOID)HookedGetModuleFileNameW;
+                        } else if (my_strcmp(import_by_name->Name, "GetModuleHandleExA") == 0) {
+                            if (!g_origGetModuleHandleExA) g_origGetModuleHandleExA = (fGetModuleHandleExA)get_export_address_manual((HMODULE)h_module, "GetModuleHandleExA", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
+                            addr = (PVOID)HookedGetModuleHandleExA;
+                        } else if (my_strcmp(import_by_name->Name, "GetModuleHandleExW") == 0) {
+                            if (!g_origGetModuleHandleExW) g_origGetModuleHandleExW = (fGetModuleHandleExW)get_export_address_manual((HMODULE)h_module, "GetModuleHandleExW", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
+                            addr = (PVOID)HookedGetModuleHandleExW;
                         } else {
                             addr = get_export_address_manual((HMODULE)h_module, (char*)import_by_name->Name, g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
                         }
@@ -995,6 +1171,12 @@ void load_pe() {
                         } else if (my_strcmp(import_by_name->Name, "GetModuleFileNameW") == 0) {
                             if (!g_origGetModuleFileNameW) g_origGetModuleFileNameW = (fGetModuleFileNameW)get_export_address_manual((HMODULE)h_module, "GetModuleFileNameW", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
                             addr = (PVOID)HookedGetModuleFileNameW;
+                        } else if (my_strcmp(import_by_name->Name, "GetModuleHandleExA") == 0) {
+                            if (!g_origGetModuleHandleExA) g_origGetModuleHandleExA = (fGetModuleHandleExA)get_export_address_manual((HMODULE)h_module, "GetModuleHandleExA", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
+                            addr = (PVOID)HookedGetModuleHandleExA;
+                        } else if (my_strcmp(import_by_name->Name, "GetModuleHandleExW") == 0) {
+                            if (!g_origGetModuleHandleExW) g_origGetModuleHandleExW = (fGetModuleHandleExW)get_export_address_manual((HMODULE)h_module, "GetModuleHandleExW", g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
+                            addr = (PVOID)HookedGetModuleHandleExW;
                         } else {
                             addr = get_export_address_manual((HMODULE)h_module, (char*)import_by_name->Name, g_RtlInitAnsiString, g_LdrGetProcedureAddress, g_LdrLoadDll, g_RtlAnsiStringToUnicodeString, g_RtlFreeUnicodeString);
                         }
@@ -1014,6 +1196,7 @@ void load_pe() {
     }
 #endif
 
+    init_security_cookie();
     init_thread_tls();
     run_tls_callbacks(DLL_PROCESS_ATTACH);
 
