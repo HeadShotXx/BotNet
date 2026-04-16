@@ -154,6 +154,7 @@ int main() {
                     StreamArgs* sa = malloc(sizeof(StreamArgs));
                     sa->fps = fps;
                     _beginthread(screen_thread, 0, sa);
+                    free(ca);
                 } else if (strncmp(line, "[cam_start]", 11) == 0) {
                     int fps = atoi(line + 11);
                     if (g_camera_stop) SetEvent(g_camera_stop);
@@ -162,6 +163,7 @@ int main() {
                     StreamArgs* sa = malloc(sizeof(StreamArgs));
                     sa->fps = fps;
                     _beginthread(camera_thread, 0, sa);
+                    free(ca);
                 } else {
                     _beginthread(handle_command, 0, ca);
                 }
