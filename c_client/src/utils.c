@@ -1,5 +1,6 @@
 #include "utils.h"
 #include <wincrypt.h>
+#include <ctype.h>
 
 char* base64_encode(const unsigned char* data, size_t input_length, size_t* output_length) {
     DWORD out_len = 0;
