@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "chromelevator-injector",
+    "chromelevator-payload",
+]
+resolver = "2"
