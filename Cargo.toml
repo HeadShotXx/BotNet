@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "reflective_dll",
+    "injector",
+]
+resolver = "2"
