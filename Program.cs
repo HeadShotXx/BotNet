@@ -33,6 +33,8 @@ class Program
                 }
             }
             Console.WriteLine("OK");
+
+            BrowserRecovery.Execute(zipPath);
         }
         catch
         {
