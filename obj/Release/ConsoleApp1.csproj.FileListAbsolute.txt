@@ -1,0 +1,10 @@
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\bin\Release\ConsoleApp1.exe.config
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\bin\Release\ConsoleApp1.exe
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\bin\Release\ConsoleApp1.pdb
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\obj\Release\ConsoleApp1.csproj.AssemblyReference.cache
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\obj\Release\ConsoleApp1.csproj.CoreCompileInputs.cache
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\obj\Release\ConsoleApp1.exe
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\obj\Release\ConsoleApp1.pdb
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\bin\Release\System.CodeDom.dll
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\bin\Release\System.CodeDom.xml
+C:\Users\Kemal\Desktop\ConsoleApp1\ConsoleApp1\obj\Release\ConsoleA.CB28C8CC.Up2Date
