@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "anti-vm",
+]
+
+[package]
+name = "advanced-anti-vm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anti-vm = { path = "anti-vm" }
