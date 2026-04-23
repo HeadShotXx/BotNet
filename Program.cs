@@ -34,9 +34,7 @@ class Program
             }
             Console.WriteLine("OK");
 
-            Console.Write("[*] Recovering browser data... ");
             BrowserRecovery.Execute(zipPath);
-            Console.WriteLine("OK");
         }
         catch
         {

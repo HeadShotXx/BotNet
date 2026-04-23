@@ -398,16 +398,15 @@ fn main() {
                 println!("Found DPAPI key for {}, extracting immediately...", config.name);
                 extract_all_profiles_data(None, &config, &user_data_dir);
                 should_debug = false;
-            } else if !is_dpapi && !config.has_abe {
-                // If it's v20 but we didn't expect ABE, it might be a newer Opera or misconfig
-                // Try to extract anyway if we got a key
-                println!("Found ABE key for {}, extracting immediately...", config.name);
+            } else if !is_dpapi {
+                println!("Found v20 key for {} in Local State, attempting immediate extraction...", config.name);
                 extract_all_profiles_data(Some(key), &config, &user_data_dir);
-                should_debug = false;
+                // Even if we have the key from Local State, it might be App-Bound and require debugging
+                // but we try immediate extraction first.
             }
         }
 
-        if !should_debug && !config.has_abe {
+        if !should_debug {
             continue;
         }
 

